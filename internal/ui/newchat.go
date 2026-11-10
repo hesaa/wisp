@@ -56,6 +56,9 @@ func RunNewChat(owner walk.Form, p theme.Palette, chats []store.Chat, contacts [
 	search.edit.TextChanged().Attach(show)
 	picked := ""
 	pick := func(jid string) {
+		if jid == "" {
+			return // the country-code hint
+		}
 		picked = jid
 		dlg.Accept()
 	}
@@ -123,8 +126,11 @@ func newChatRows(cands []store.Chat, query string) []store.Chat {
 			out = append(out, c)
 		}
 	}
-	if isPhone && !known {
+	switch {
+	case isPhone && !known:
 		out = append([]store.Chat{{JID: jid, Snippet: "Start a new chat"}}, out...) // unnamed: shows as +number
+	case numeric && len(digits) >= 7 && digits[0] == '0': // no JID: nothing to pick
+		out = append([]store.Chat{{Name: strings.TrimSpace(query), Snippet: "Include the country code, e.g. 62812…"}}, out...)
 	}
 	return out
 }
@@ -145,10 +151,11 @@ func phoneDigits(s string) (digits string, numeric bool) {
 	return b.String(), true
 }
 
-// phoneJID turns a typed phone number into a user JID: 7 to 15 digits once separators are dropped.
+// phoneJID turns a typed phone number into a user JID: 7 to 15 digits once separators are dropped,
+// country code first (a leading 0 is a local number, which WhatsApp cannot deliver to).
 func phoneJID(s string) (string, bool) {
 	d, ok := phoneDigits(s)
-	if !ok || len(d) < 7 || len(d) > 15 {
+	if !ok || len(d) < 7 || len(d) > 15 || d[0] == '0' {
 		return "", false
 	}
 	return d + "@s.whatsapp.net", true

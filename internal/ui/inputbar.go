@@ -127,6 +127,10 @@ func (b *InputBar) Reset() {
 	logErr("clear input", b.edit.SetText(""))
 }
 
+// Restore puts back text that failed to send, unless the box holds a new draft; no typing signal
+// fires.
+func (b *InputBar) Restore(text string) { b.composer.restore(text) }
+
 // SetFocus puts the keyboard focus in the message box.
 func (b *InputBar) SetFocus() error { return b.edit.SetFocus() }
 
@@ -301,6 +305,20 @@ func (c *composer) send() bool {
 	if c.onSend != nil {
 		c.onSend(text)
 	}
+	return true
+}
+
+// restore puts text back in the box when it is blank (a new draft wins), without a typing signal,
+// and reports whether it did.
+func (c *composer) restore(text string) bool {
+	if _, typed := outgoingText(c.box.Text()); typed {
+		return false
+	}
+	fire := c.typing.fire
+	c.typing.fire = nil // the box reports the change as an edit
+	logErr("restore input", c.box.SetText(text))
+	c.typing.stop()
+	c.typing.fire = fire
 	return true
 }
 

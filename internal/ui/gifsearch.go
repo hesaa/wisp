@@ -13,8 +13,11 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
+
+	"wa-go/internal/whatsapp"
 )
 
 const (
@@ -40,9 +43,43 @@ type giphy struct {
 	base string // search endpoint
 }
 
+// GIFTransport carries every GIPHY request (searches, previews, picked GIFs) through the proxy set
+// with SetGIFProxy, as WhatsApp's own traffic goes; environment proxies are not used.
+var GIFTransport = func() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.Proxy = func(*http.Request) (*url.URL, error) {
+		if p := gifProxy.Load(); p != nil {
+			return p.url, p.err
+		}
+		return nil, nil
+	}
+	return t
+}()
+
+// gifProxy is GIF traffic's proxy: url nil for a direct connection, err for an unusable address.
+var gifProxy atomic.Pointer[struct {
+	url *url.URL
+	err error
+}]
+
+// SetGIFProxy routes GIF traffic through the proxy at addr, the net.proxy setting ("" for a direct
+// connection). An address whatsapp.ValidateProxy refuses fails every GIF request instead of going
+// direct.
+func SetGIFProxy(addr string) {
+	p := &struct {
+		url *url.URL
+		err error
+	}{}
+	if p.err = whatsapp.ValidateProxy(addr); p.err == nil && addr != "" {
+		p.url, p.err = url.Parse(addr)
+	}
+	gifProxy.Store(p)
+}
+
 func newGiphy() *giphy {
 	return &giphy{base: giphySearch, http: &http.Client{
-		Timeout: 15 * time.Second,
+		Transport: GIFTransport,
+		Timeout:   15 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 3 || !AllowedGIFURL(req.URL.String()) {
 				// the host only: the target's query may repeat the API key

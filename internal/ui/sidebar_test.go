@@ -2,6 +2,7 @@ package ui
 
 import (
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -134,7 +135,7 @@ func TestAccountSwitchFiresActiveChanged(t *testing.T) {
 func TestPhoneJID(t *testing.T) {
 	for in, want := range map[string]string{
 		"+62 812-3456-7890": "6281234567890@s.whatsapp.net",
-		"(021) 555 0123":    "0215550123@s.whatsapp.net",
+		"62 21 555 0123":    "62215550123@s.whatsapp.net",
 		"1234567":           "1234567@s.whatsapp.net",
 		"123456789012345":   "123456789012345@s.whatsapp.net",
 	} {
@@ -142,7 +143,8 @@ func TestPhoneJID(t *testing.T) {
 			t.Errorf("phoneJID(%q) = %q, %v; want %q", in, got, ok, want)
 		}
 	}
-	for _, in := range []string{"", "123456", "1234567890123456", "Alice", "62812x4567", "+", "62.812.3456"} {
+	// a leading 0 is a local number without its country code: undeliverable as a WhatsApp JID
+	for _, in := range []string{"", "123456", "1234567890123456", "Alice", "62812x4567", "+", "62.812.3456", "(021) 555 0123", "0812-3456-7890", "+0812345678"} {
 		if got, ok := phoneJID(in); ok {
 			t.Errorf("phoneJID(%q) = %q, want invalid", in, got)
 		}
@@ -171,6 +173,10 @@ func TestNewChatRows(t *testing.T) {
 	}
 	if got := jids(newChatRows(cands, "+62 833 3333 3333")); !slices.Equal(got, []string{alice}) {
 		t.Fatalf("typed number of a known chat must not add a second row: %v", got)
+	}
+	local := newChatRows(cands, "0812 3456 7890")
+	if len(local) != 1 || local[0].JID != "" || !strings.Contains(local[0].Snippet, "Include the country code, e.g. 62812") {
+		t.Fatalf("local number: %+v, want only the country-code hint (no JID to pick)", local)
 	}
 }
 

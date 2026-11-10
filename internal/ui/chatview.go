@@ -289,6 +289,14 @@ func (v *ChatView) Upsert(msg store.Message) {
 	v.settle()
 }
 
+// Rename shows a new name for accountID's chat chatJID (a group was named) when it is open.
+func (v *ChatView) Rename(accountID, chatJID, name string) {
+	if v.is(accountID, chatJID) && name != v.name {
+		v.name = name
+		logErr("chat header repaint", v.header.Invalidate())
+	}
+}
+
 // SetMediaPath records that message id's media was downloaded to path.
 func (v *ChatView) SetMediaPath(id, path string) {
 	i := v.index(id)
@@ -615,11 +623,12 @@ func (v *ChatView) mouseDown(x, y int, b walk.MouseButton) {
 	v.activate(m, double)
 }
 
-// activate acts on a media message: asks for its download when it has none, else opens it when open.
+// activate acts on a media message: asks for its download when it has none (or its file is gone),
+// else opens it when open.
 func (v *ChatView) activate(m store.Message, open bool) {
 	switch {
 	case v.lay.cache[m.ID].kind == kindText:
-	case m.MediaPath == "":
+	case m.MediaPath == "" || media.Missing(m.MediaPath):
 		if v.onNeedMedia != nil {
 			v.onNeedMedia(m)
 		}

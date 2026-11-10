@@ -35,6 +35,7 @@ type SettingsDeps struct {
 	OnThemeChanged    func(theme.ThemeMode) // a theme was picked: apply it now (it is saved after)
 	OnSettingsChanged func(key string)      // an app-global setting (a Key* constant) was saved: re-read and apply it
 	OnAddAccount      func()                // Add account was chosen; the dialog has closed
+	OnCacheCleared    func()                // the media cache was cleared (fully or not): forget the downloads
 }
 
 // Sizes in 1/96 inch.
@@ -604,6 +605,9 @@ func (d *settingsDialog) clearCache() {
 	go func() {
 		err := d.deps.Media.ClearMediaCache()
 		d.owner.Synchronize(func() {
+			if d.deps.OnCacheCleared != nil {
+				d.deps.OnCacheCleared()
+			}
 			if d.closed {
 				return
 			}

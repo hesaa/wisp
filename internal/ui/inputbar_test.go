@@ -203,3 +203,35 @@ func TestEmojiGridHasAHundredDistinctEmoji(t *testing.T) {
 		t.Errorf("%d emoji, want 100 (a 10 x 10 grid)", len(emojis))
 	}
 }
+
+// echoBox reports its changes as the edit control does: from inside SetText.
+type echoBox struct {
+	fakeBox
+	onSet func()
+}
+
+func (b *echoBox) SetText(s string) error {
+	b.text = s
+	if b.onSet != nil {
+		b.onSet()
+	}
+	return nil
+}
+
+func TestRestorePutsAFailedMessageBackOnlyIntoABlankBox(t *testing.T) {
+	ft := &fakeTimers{}
+	var typing []bool
+	box := &echoBox{fakeBox: fakeBox{text: "  "}}
+	c := &composer{box: box, typing: typingSignal{after: ft.after, fire: func(on bool) { typing = append(typing, on) }}}
+	box.onSet = c.edited
+	if !c.restore("hello") || box.Text() != "hello" {
+		t.Fatalf("blank box: text %q", box.Text())
+	}
+	if len(typing) != 0 || ft.live() != 0 {
+		t.Fatalf("restoring signalled typing %v (%d timers)", typing, ft.live())
+	}
+	box.SetText("new draft")
+	if c.restore("hello") || box.Text() != "new draft" {
+		t.Fatalf("a new draft was replaced: %q", box.Text())
+	}
+}

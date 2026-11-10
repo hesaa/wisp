@@ -288,3 +288,26 @@ func TestGiphyPreviewDecodesTheFirstFrameOfAllowedURLsOnly(t *testing.T) {
 		t.Errorf("%d requests for disallowed URLs", hits.Load()-before)
 	}
 }
+
+func TestGIFTrafficFollowsTheProxySetting(t *testing.T) {
+	t.Cleanup(func() { SetGIFProxy("") })
+	req := httptest.NewRequest(http.MethodGet, "https://api.giphy.com/v1/gifs/search", nil)
+	if newGiphy().http.Transport != GIFTransport {
+		t.Fatal("GIF search does not use the proxy-aware transport")
+	}
+	for addr, want := range map[string]string{
+		"socks5://user:pw@127.0.0.1:1080": "socks5://user:pw@127.0.0.1:1080",
+		"http://proxy.lan:3128/":          "http://proxy.lan:3128/",
+		"":                                "",
+	} {
+		SetGIFProxy(addr)
+		u, err := GIFTransport.Proxy(req)
+		if err != nil || (u == nil) != (want == "") || (u != nil && u.String() != want) {
+			t.Errorf("proxy for %q = %v, %v; want %q", addr, u, err, want)
+		}
+	}
+	SetGIFProxy("ftp://nope:21") // never saved, but never a silent direct connection either
+	if u, err := GIFTransport.Proxy(req); err == nil {
+		t.Fatalf("a bad proxy went direct (%v)", u)
+	}
+}
