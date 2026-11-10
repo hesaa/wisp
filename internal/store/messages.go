@@ -116,14 +116,20 @@ func (d *DB) GetChatMessages(accountID, chatJID string, page int) ([]Message, er
 	if page < 0 {
 		page = 0
 	}
-	rows, err := d.sql.Query(`SELECT id, chat_jid, account_id, sender_jid, timestamp, message_type, body, media_path, status, from_me, media_meta,
-		wire_chat_jid, wire_sender_jid
+	rows, err := d.sql.Query(`SELECT `+messageCols+`
 		FROM messages WHERE account_id = ? AND chat_jid = ?
 		ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?`, accountID, chatJID, PageSize, page*PageSize)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	return scanMessages(rows)
+}
+
+const messageCols = `id, chat_jid, account_id, sender_jid, timestamp, message_type, body, media_path, status, from_me, media_meta,
+		wire_chat_jid, wire_sender_jid`
+
+func scanMessages(rows *sql.Rows) ([]Message, error) {
 	out := []Message{}
 	for rows.Next() {
 		var m Message
@@ -254,6 +260,23 @@ func (d *DB) RecentStories(accountID string, since int64) ([]Story, error) {
 		out = append(out, s)
 	}
 	return out, rows.Err()
+}
+
+// maxStatusMessages caps one sender's stories returned by StatusMessages.
+const maxStatusMessages = 50
+
+// StatusMessages returns one sender's status updates in the account at or after since (unix
+// seconds), oldest first; when there are more than maxStatusMessages, the newest ones.
+func (d *DB) StatusMessages(accountID, senderJID string, since int64) ([]Message, error) {
+	rows, err := d.sql.Query(`SELECT * FROM (SELECT `+messageCols+` FROM messages
+		WHERE account_id = ? AND chat_jid = ? AND sender_jid = ? AND timestamp >= ?
+		ORDER BY timestamp DESC, id DESC LIMIT ?) ORDER BY timestamp, id`,
+		accountID, statusBroadcastJID, senderJID, since, maxStatusMessages)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanMessages(rows)
 }
 
 // ListChats returns the account's chats newest first, with snippet and derived unread count.

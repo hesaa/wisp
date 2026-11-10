@@ -477,20 +477,27 @@ func (v *ChatView) decodeThumb(m *store.Message, src string, w, h int) (*image.R
 	return coverImage(bytes.NewReader(info.preview), w, h)
 }
 
-// coverImage decodes a small JPEG or PNG and scales it to cover w x h, centre-cropped, so only a
-// box-sized image outlives the call.
-func coverImage(r io.ReadSeeker, w, h int) (*image.RGBA, error) {
+// decodeCapped decodes a JPEG or PNG after reading its size: one of more than limit pixels is
+// refused undecoded, so a hostile file cannot make the decoder allocate gigabytes.
+func decodeCapped(r io.ReadSeeker, limit int) (image.Image, error) {
 	cfg, _, err := image.DecodeConfig(r)
 	if err != nil {
 		return nil, err
 	}
-	if cfg.Width <= 0 || cfg.Height <= 0 || cfg.Width*cfg.Height > maxPreviewPixels {
-		return nil, fmt.Errorf("ui: refusing to decode a %dx%d preview", cfg.Width, cfg.Height)
+	if cfg.Width <= 0 || cfg.Height <= 0 || cfg.Width > limit/cfg.Height {
+		return nil, fmt.Errorf("ui: refusing to decode a %dx%d image", cfg.Width, cfg.Height)
 	}
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
 	src, _, err := image.Decode(r)
+	return src, err
+}
+
+// coverImage decodes a small JPEG or PNG and scales it to cover w x h, centre-cropped, so only a
+// box-sized image outlives the call.
+func coverImage(r io.ReadSeeker, w, h int) (*image.RGBA, error) {
+	src, err := decodeCapped(r, maxPreviewPixels)
 	if err != nil {
 		return nil, err
 	}

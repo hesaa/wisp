@@ -34,6 +34,11 @@ const (
 	IconVideo
 	IconAudio
 	IconGIF // "GIF" in a frame: the GIF search button
+	IconPlay
+	IconPause
+	IconChevronLeft
+	IconChevronRight
+	IconClose
 )
 
 const (
@@ -130,6 +135,11 @@ var definitions = map[Icon][]op{
 		poly(12.25, 8.5, 12.25, 15.5),                                                                                   // I
 		poly(18.75, 8.5, 15, 8.5, 15, 15.5), poly(15, 12, 17.75, 12),                                                    // F
 	},
+	IconPlay:         {poly(8, 5, 19, 12, 8, 19, 8, 5)},
+	IconPause:        {poly(8.5, 5, 8.5, 19), poly(15.5, 5, 15.5, 19)},
+	IconChevronLeft:  {poly(15, 5, 8, 12, 15, 19)},
+	IconChevronRight: {poly(9, 5, 16, 12, 9, 19)},
+	IconClose:        {poly(6, 6, 18, 18), poly(18, 6, 6, 18)},
 }
 
 func argb(c walk.Color) uint32 {

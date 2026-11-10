@@ -217,6 +217,53 @@ func TestRecentStories(t *testing.T) {
 	}
 }
 
+func TestStatusMessages(t *testing.T) {
+	db := openTest(t)
+	story := func(account, id, sender string, ts int64) Message {
+		return Message{ID: id, ChatJID: statusBroadcastJID, AccountID: account, SenderJID: sender, Timestamp: ts, Status: StatusReceived}
+	}
+	in := []Message{
+		story(acct, "b", "alice", 200), story(acct, "a", "alice", 200), // same second: ordered by id
+		story(acct, "c", "alice", 300), story(acct, "old", "alice", 99), // just before since
+		story(acct, "x", "bob", 250), story("other", "y", "alice", 250),
+		{ID: "chat", ChatJID: "alice", AccountID: acct, SenderJID: "alice", Timestamp: 250, Status: StatusReceived}, // not a status
+	}
+	if err := db.InsertMessagesBatch(in); err != nil {
+		t.Fatal(err)
+	}
+	ids := func(ms []Message) string {
+		s := ""
+		for _, m := range ms {
+			s += m.ID + ","
+		}
+		return s
+	}
+	got, err := db.StatusMessages(acct, "alice", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids(got) != "a,b,c," {
+		t.Fatalf("got %s, want a,b,c, (oldest first, own account and sender only, since is inclusive)", ids(got))
+	}
+	if got, _ = db.StatusMessages(acct, "alice", 99); ids(got) != "old,a,b,c," {
+		t.Fatalf("since 99: got %s", ids(got))
+	}
+	if got, _ = db.StatusMessages(acct, "alice", 301); len(got) != 0 {
+		t.Fatalf("since 301: got %s", ids(got))
+	}
+	var many []Message
+	for i := range maxStatusMessages + 5 {
+		many = append(many, story(acct, fmt.Sprintf("m%03d", i), "carol", int64(1000+i)))
+	}
+	if err := db.InsertMessagesBatch(many); err != nil {
+		t.Fatal(err)
+	}
+	got, err = db.StatusMessages(acct, "carol", 0)
+	if err != nil || len(got) != maxStatusMessages || got[0].ID != "m005" || got[len(got)-1].ID != fmt.Sprintf("m%03d", maxStatusMessages+4) {
+		t.Fatalf("cap: %d messages from %s (err %v), want the newest %d, oldest first", len(got), got[0].ID, err, maxStatusMessages)
+	}
+}
+
 func TestMediaMetaRoundTrip(t *testing.T) {
 	db := openTest(t)
 	ms := msgs(acct, "c1", 2, false)
