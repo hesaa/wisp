@@ -276,3 +276,25 @@ func TestMediaMetaRoundTrip(t *testing.T) {
 		t.Fatalf("meta %v / %v", page[0].MediaMeta, page[1].MediaMeta)
 	}
 }
+
+func TestGetMessageIsAccountScoped(t *testing.T) {
+	db := openTest(t)
+	mine, other := msgs(acct, "c1", 1, false)[0], msgs("6289999999999", "c1", 1, true)[0]
+	other.Body, other.Status = "other account", StatusRead
+	mine.WireSenderJID = "123@lid"
+	if err := db.InsertMessagesBatch([]Message{mine, other}); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := db.GetMessage(acct, "c1", "m0")
+	if err != nil || !ok || got.Body != "body 0" || got.FromMe || got.Status != StatusReceived || got.WireSenderJID != "123@lid" {
+		t.Fatalf("GetMessage = %+v, %v, %v", got, ok, err)
+	}
+	if got, ok, _ := db.GetMessage("6289999999999", "c1", "m0"); !ok || got.Body != "other account" {
+		t.Fatalf("other account's copy = %+v, %v", got, ok)
+	}
+	for _, k := range [][3]string{{acct, "c2", "m0"}, {acct, "c1", "m1"}, {"6280000000000", "c1", "m0"}} {
+		if got, ok, err := db.GetMessage(k[0], k[1], k[2]); ok || err != nil || got.ID != "" {
+			t.Fatalf("GetMessage%v = %+v, %v, %v; want not found", k, got, ok, err)
+		}
+	}
+}

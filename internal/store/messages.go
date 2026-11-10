@@ -126,6 +126,21 @@ func (d *DB) GetChatMessages(accountID, chatJID string, page int) ([]Message, er
 	return scanMessages(rows)
 }
 
+// GetMessage returns one stored message of accountID; ok is false when it is not stored.
+func (d *DB) GetMessage(accountID, chatJID, id string) (m Message, ok bool, err error) {
+	rows, err := d.sql.Query(`SELECT `+messageCols+` FROM messages WHERE account_id = ? AND chat_jid = ? AND id = ?`,
+		accountID, chatJID, id)
+	if err != nil {
+		return m, false, err
+	}
+	defer rows.Close()
+	ms, err := scanMessages(rows)
+	if err != nil || len(ms) == 0 {
+		return m, false, err
+	}
+	return ms[0], true, nil
+}
+
 const messageCols = `id, chat_jid, account_id, sender_jid, timestamp, message_type, body, media_path, status, from_me, media_meta,
 		wire_chat_jid, wire_sender_jid`
 

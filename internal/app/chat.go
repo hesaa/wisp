@@ -1,0 +1,287 @@
+package app
+
+import (
+	"context"
+	"log"
+	"os"
+	"time"
+
+	"wa-go/internal/store"
+	"wa-go/internal/ui"
+	"wa-go/internal/whatsapp"
+)
+
+// gifHTTP downloads picked GIFs.
+var gifHTTP = newGIFClient(nil, time.Minute)
+
+// showChatPane shows the chat and the input bar, or the empty state.
+func (a *App) showChatPane(open bool) {
+	a.empty.SetVisible(!open)
+	a.chat.SetVisible(open)
+	a.bar.SetVisible(open)
+}
+
+// openChat opens acct's chat jid (named name, or as the chat list names it): its newest page loads
+// off the UI thread, and it is marked read. Opening the open chat again only reads it and focuses
+// the input box, so a draft survives.
+func (a *App) openChat(acct, jid, name string) {
+	c := chatRef{acct, jid}
+	if acct == "" || jid == "" || acct != a.v.active {
+		return
+	}
+	a.side.Model().Select(jid)
+	if c == a.v.open {
+		if a.chatUnread(jid) > 0 {
+			a.markChatRead(c)
+		}
+		logErr("focus", a.bar.SetFocus())
+		return
+	}
+	if name == "" {
+		name = a.chatName(acct, jid)
+	}
+	a.bar.Reset() // before the switch: it may still tell the chat being left that typing stopped
+	a.v.openChat(c)
+	a.showChatPane(true)
+	logErr("focus", a.bar.SetFocus())
+	go func() {
+		page, err := a.db.GetChatMessages(acct, jid, 0)
+		a.mw.Synchronize(func() {
+			if a.v.open != c {
+				return // another chat was opened meanwhile
+			}
+			logErr("open chat", err) // shown empty then
+			a.chat.SetChat(acct, jid, name, isGroup(jid), page)
+			a.v.loaded = true
+			for _, m := range a.v.pending {
+				a.chat.Upsert(m)
+			}
+			a.v.pending = nil
+			a.markChatRead(c)
+		})
+	}()
+}
+
+// loadPrevious answers the chat view's request for the open chat's next older page.
+func (a *App) loadPrevious() {
+	c := a.v.open
+	if c.jid == "" {
+		return
+	}
+	a.v.page++
+	page := a.v.page
+	go func() {
+		msgs, err := a.db.GetChatMessages(c.acct, c.jid, page)
+		a.mw.Synchronize(func() {
+			logErr("older messages", err) // answered as the end of the history: no retry loop
+			if len(msgs) == 0 {
+				a.chat.NoMoreHistory(c.acct, c.jid)
+			} else {
+				a.chat.PrependPage(c.acct, c.jid, msgs)
+			}
+		})
+	}()
+}
+
+// markChatRead marks c read: on screen at once, then in the store, then on WhatsApp for its newest
+// unread messages unless the account's read receipts are off.
+func (a *App) markChatRead(c chatRef) {
+	if a.side.Model().Account() == c.acct {
+		a.side.Model().MarkRead(c.jid)
+		a.v.unread[c.acct] = a.side.Model().Unread()
+		a.showUnread()
+	}
+	go func() {
+		// shortcut: receipts cover the newest page only; read the unread rows by query if >50 unread matters
+		page, err := a.db.GetChatMessages(c.acct, c.jid, 0)
+		if err == nil {
+			err = a.db.MarkChatRead(c.acct, c.jid)
+		}
+		if err != nil {
+			logErr("mark read", err)
+			return
+		}
+		a.sendReceipts(c.acct, unreadIncoming(page))
+	}()
+}
+
+// markMessageRead marks one message read (a message arriving in the chat being looked at, or a
+// status that was viewed), with a read receipt unless the account's are off.
+func (a *App) markMessageRead(m store.Message) {
+	go func() {
+		if err := a.db.UpdateMessageStatus(m.AccountID, m.ChatJID, []string{m.ID}, store.StatusRead); err != nil {
+			logErr("mark read", err)
+			return
+		}
+		a.sendReceipts(m.AccountID, []store.Message{m})
+	}()
+}
+
+// sendReceipts sends read receipts for msgs of acct unless acct's read receipts are off; when that
+// setting cannot be read, none are sent. Off the UI thread.
+func (a *App) sendReceipts(acct string, msgs []store.Message) {
+	if len(msgs) == 0 {
+		return
+	}
+	v, err := ui.Setting(a.db, acct, ui.KeyReadReceipts)
+	if err != nil {
+		logErr("read receipts withheld", err)
+		return
+	}
+	if !receiptsOn(v) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), netTimeout)
+	defer cancel()
+	logErr("read receipts", a.mgr.MarkRead(ctx, msgs))
+}
+
+// needMedia downloads a message's media for the chat view or the status viewer, once at a time per
+// message, and hands the file to whichever of them still shows it.
+func (a *App) needMedia(m store.Message) {
+	k := mediaKey{m.AccountID, m.ChatJID, m.ID}
+	if !a.inflight.start(k) {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), mediaTimeout)
+		path, err := a.mgr.DownloadMedia(ctx, m)
+		cancel()
+		a.mw.Synchronize(func() {
+			a.inflight.done(k)
+			if err != nil {
+				logErr("download "+m.ID, err)
+				return
+			}
+			if a.v.loaded && a.v.open == (chatRef{m.AccountID, m.ChatJID}) { // IDs repeat across accounts
+				a.chat.SetMediaPath(m.ID, path)
+			}
+			if a.statusSet != nil && a.statusAcct == m.AccountID && m.ChatJID == statusBroadcast {
+				a.statusSet(m.ID, path)
+			}
+		})
+	}()
+}
+
+// openMedia opens a downloaded file with its Windows program; a file the cache refuses to open is
+// reported.
+func (a *App) openMedia(path string) {
+	if err := a.cache.OpenInDefaultApp(path); err != nil {
+		logErr("open media", err)
+		a.alert("This file was not opened: " + err.Error())
+	}
+}
+
+// send sends text to the open chat; the stored message comes back as a MessageEvent.
+func (a *App) send(text string) {
+	c := a.v.open
+	a.sendOff("Message not sent", func(ctx context.Context) error {
+		_, err := a.mgr.SendText(ctx, c.acct, c.jid, text)
+		return err
+	}, netTimeout)
+}
+
+// attach sends a picked file to the open chat.
+func (a *App) attach(path string) {
+	c := a.v.open
+	a.sendOff("File not sent", func(ctx context.Context) error {
+		_, err := a.mgr.SendMedia(ctx, c.acct, c.jid, path, "")
+		return err
+	}, mediaTimeout)
+}
+
+// sendGIF downloads a picked GIPHY MP4 (allowlist checked again, size capped) and sends it to the
+// open chat as a GIF.
+func (a *App) sendGIF(mp4URL string) {
+	c := a.v.open
+	a.sendOff("GIF not sent", func(ctx context.Context) error {
+		tmp, err := fetchGIF(ctx, gifHTTP, mp4URL, maxGIFBytes)
+		if err != nil {
+			return err
+		}
+		defer func() { logErr("remove GIF", os.Remove(tmp)) }()
+		_, err = a.mgr.SendGIF(ctx, c.acct, c.jid, tmp)
+		return err
+	}, mediaTimeout)
+}
+
+// sendOff runs send off the UI thread and reports its failure to the user as what.
+func (a *App) sendOff(what string, send func(ctx context.Context) error, timeout time.Duration) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		err := send(ctx)
+		cancel()
+		if err != nil {
+			log.Printf("app: %s: %v", what, err)
+			a.mw.Synchronize(func() { a.alert(what + ": " + err.Error()) })
+		}
+	}()
+}
+
+// typing tells the open chat the user is typing (or stopped), unless ghost typing is on.
+func (a *App) typing(composing bool) {
+	c := a.v.open
+	if c.jid == "" || !typingOn(a.cfg[ui.KeyGhostTyping]) {
+		return
+	}
+	a.signal("typing", func(ctx context.Context) error { return a.mgr.SetTyping(ctx, c.acct, c.jid, composing) })
+}
+
+// newChat fetches the active account's contacts off the UI thread, then shows the New Chat picker.
+func (a *App) newChat() {
+	acct := a.v.active
+	if acct == "" {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), netTimeout)
+		contacts, err := a.mgr.Contacts(ctx, acct)
+		cancel()
+		a.mw.Synchronize(func() {
+			logErr("contacts", err) // the picker still lists the chats
+			if acct != a.v.active {
+				return
+			}
+			logErr("new chat", ui.RunNewChat(a.mw, a.pal, a.side.Model().Chats(), contacts, func(jid string) {
+				a.openChat(acct, jid, contactName(contacts, jid))
+			}))
+		})
+	}()
+}
+
+func contactName(contacts []whatsapp.Contact, jid string) string {
+	for _, c := range contacts {
+		if c.JID == jid {
+			return c.Name
+		}
+	}
+	return ""
+}
+
+// openStory shows sender's status updates of the last 24 hours in the status viewer.
+func (a *App) openStory(sender string) {
+	acct, name := a.v.active, ""
+	for _, s := range a.stories {
+		if s.SenderJID == sender {
+			name = s.Name
+		}
+	}
+	go func() {
+		msgs, err := a.db.StatusMessages(acct, sender, time.Now().Add(-24*time.Hour).Unix())
+		a.mw.Synchronize(func() {
+			logErr("status updates", err)
+			if acct != a.v.active || len(msgs) == 0 || a.statusSet != nil {
+				return
+			}
+			a.statusAcct = acct
+			logErr("status viewer", ui.RunStatusView(a.mw, a.pal, sender, name, msgs, ui.StatusCallbacks{
+				OnNeedMedia: a.needMedia, OnOpenMedia: a.openMedia, OnViewed: a.markMessageRead,
+				Opened: func(set func(id, path string)) { a.statusSet = set },
+			}))
+			a.statusSet = nil
+		})
+	}()
+}
+
+// senderName names a group member in the chat view.
+func (a *App) senderName(jid string) string { return a.chatName(a.v.active, jid) }

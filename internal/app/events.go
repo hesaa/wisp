@@ -1,0 +1,272 @@
+package app
+
+import (
+	"log"
+	"slices"
+	"strings"
+	"time"
+
+	"wa-go/internal/notify"
+	"wa-go/internal/store"
+	"wa-go/internal/ui"
+	"wa-go/internal/whatsapp"
+)
+
+// listen receives the manager's events on whatsmeow's goroutines and hands them to the UI thread;
+// it never blocks and never touches a widget itself.
+func (a *App) listen(evt any) {
+	a.mw.Synchronize(func() { a.handle(evt) })
+}
+
+// handle applies one manager event. UI thread.
+func (a *App) handle(evt any) {
+	switch e := evt.(type) {
+	case whatsapp.MessageEvent:
+		a.onMessage(e.Message)
+	case whatsapp.ReceiptEvent:
+		a.reload(chatRef{e.AccountID, e.ChatJID}, e.IDs)
+	case whatsapp.RevisedEvent:
+		a.reload(chatRef{e.AccountID, e.ChatJID}, []string{e.ID})
+	case whatsapp.HistorySyncEvent:
+		a.loadChats(e.AccountID)
+	case whatsapp.ConnectionEvent:
+		a.onConnection(e)
+	case whatsapp.ErrorEvent:
+		logErr("+"+e.AccountID, e.Err)
+	}
+}
+
+// onMessage folds a just-stored message into the screen (see routeMessage).
+func (a *App) onMessage(m store.Message) {
+	r := routeMessage(m, a.v.active, a.v.open, a.foreground(), a.cfg[ui.KeyNotify] == "true")
+	if r.stories {
+		a.loadStories(m.AccountID)
+		return
+	}
+	if r.markRead {
+		a.markMessageRead(m)
+		m.Status = store.StatusRead
+	}
+	if r.upsert {
+		if a.v.loaded {
+			a.chat.Upsert(m)
+		} else {
+			a.v.pending = append(a.v.pending, m) // its chat's first page is still loading
+		}
+	}
+	if r.sidebar && a.side.Model().ApplyMessage(m) {
+		a.v.unread[m.AccountID] = a.side.Model().Unread()
+	} else if r.unread {
+		a.v.unread[m.AccountID]++
+	}
+	a.showUnread()
+	if r.notify {
+		a.toast(m)
+	}
+}
+
+// reload re-reads changed messages of c (receipts, edits, deletions) into the chat view when c is open.
+func (a *App) reload(c chatRef, ids []string) {
+	if a.v.open != c {
+		return
+	}
+	go func() {
+		var msgs []store.Message
+		for _, id := range ids {
+			m, ok, err := a.db.GetMessage(c.acct, c.jid, id)
+			logErr("reload message", err)
+			if ok {
+				msgs = append(msgs, m)
+			}
+		}
+		a.mw.Synchronize(func() {
+			if a.v.open != c {
+				return
+			}
+			for _, m := range msgs {
+				if a.v.loaded {
+					a.chat.Upsert(m)
+				} else {
+					a.v.pending = append(a.v.pending, m)
+				}
+			}
+		})
+	}()
+}
+
+func (a *App) onConnection(e whatsapp.ConnectionEvent) {
+	switch e.State {
+	case whatsapp.StateConnected:
+		a.refreshAccounts() // it may have connected before Start returned
+		a.rail.Model().SetConnected(e.AccountID, true)
+		a.sendPresence(true) // a new connection starts unavailable
+	case whatsapp.StatePaired:
+		a.refreshAccounts()
+		a.rail.Model().SetActive(e.AccountID)
+	case whatsapp.StateLoggedOut:
+		log.Printf("app: +%s logged out (%s)", e.AccountID, e.Detail)
+		a.refreshAccounts() // the rail drops it and picks another active account
+	default:
+		a.rail.Model().SetConnected(e.AccountID, false)
+		log.Printf("app: +%s %s (%s)", e.AccountID, e.State, e.Detail)
+	}
+}
+
+// refreshAccounts shows the manager's accounts on the rail and counts the unread messages of new ones.
+func (a *App) refreshAccounts() {
+	ids := a.mgr.Accounts()
+	a.rail.Model().SetAccounts(ids) // may switch the active account
+	for id := range a.v.unread {
+		if !slices.Contains(ids, id) {
+			delete(a.v.unread, id)
+		}
+	}
+	for _, id := range ids {
+		if _, known := a.v.unread[id]; !known {
+			a.v.unread[id] = 0
+			if id != a.v.active { // the active one was loaded by the switch
+				a.loadChats(id)
+			}
+		}
+	}
+	a.showUnread()
+	hint := "Choose a chat, or start a new one."
+	if len(ids) == 0 {
+		hint = "Link your phone with the + button on the left to start."
+	}
+	a.empty.SetHint(hint)
+}
+
+// accountChanged switches the window to acct ("" when no account is left): the chat pane empties
+// and acct's chats and stories load.
+func (a *App) accountChanged(acct string) {
+	a.bar.Reset() // before the switch: it may still tell the chat being left that typing stopped
+	a.v.switchAccount(acct)
+	a.showChatPane(false)
+	a.side.Model().SetChats(acct, nil)
+	a.stories = nil
+	a.side.SetStories(nil)
+	if acct != "" {
+		a.loadChats(acct)
+	}
+}
+
+// loadChats reads acct's chat list off the UI thread: its unread total, and the sidebar and stories
+// when it is the active account.
+func (a *App) loadChats(acct string) {
+	if acct == a.v.active {
+		a.loadStories(acct)
+	}
+	go func() {
+		chats, err := a.db.ListChats(acct)
+		a.mw.Synchronize(func() {
+			if err != nil {
+				logErr("chats of +"+acct, err)
+				return
+			}
+			if !slices.Contains(a.rail.Model().Accounts(), acct) {
+				return // logged out meanwhile
+			}
+			n := 0
+			for _, c := range chats {
+				n += c.Unread
+			}
+			a.v.unread[acct] = n
+			if acct == a.v.active {
+				a.side.Model().SetChats(acct, chats)
+				if jid, ok := a.v.takeOpenNext(acct); ok {
+					a.openChat(acct, jid, "")
+				}
+			}
+			a.showUnread()
+		})
+	}()
+}
+
+// loadStories refreshes the stories strip of acct, the active account, from the last 24 hours.
+func (a *App) loadStories(acct string) {
+	go func() {
+		st, err := a.db.RecentStories(acct, time.Now().Add(-24*time.Hour).Unix())
+		a.mw.Synchronize(func() {
+			logErr("stories of +"+acct, err)
+			if err == nil && acct == a.v.active {
+				a.stories = st
+				a.side.SetStories(st)
+			}
+		})
+	}()
+}
+
+// showUnread puts every account's unread total on the rail and their sum on the tray icon.
+func (a *App) showUnread() {
+	ids := a.rail.Model().Accounts()
+	for _, id := range ids {
+		a.rail.Model().SetUnread(id, a.v.unread[id])
+	}
+	if a.tray != nil {
+		logErr("tray badge", a.tray.SetUnread(totalUnread(a.v.unread, ids)))
+	}
+}
+
+// toast alerts the user to m through the tray, honouring the notification settings.
+func (a *App) toast(m store.Message) {
+	in := notify.Input{AccountID: m.AccountID, AccountLabel: "+" + m.AccountID, ChatJID: m.ChatJID,
+		SenderName: a.label(m.AccountID, m.SenderJID), ChatName: a.label(m.AccountID, m.ChatJID), IsGroup: isGroup(m.ChatJID),
+		Type: m.Type, Body: m.Body, FromMe: m.FromMe}
+	if m.Type == whatsapp.TypeDocument {
+		in.FileName = m.Body // a document's body is its caption, else its file name
+	}
+	s := notify.Settings{Enabled: true, PrivateMode: a.cfg[ui.KeyNotifyPrivate] == "true", Sound: a.cfg[ui.KeyNotifySound] == "true",
+		MultiAccount: len(a.rail.Model().Accounts()) > 1}
+	if a.tray != nil {
+		logErr("toast", a.tray.Notify(in, s))
+	}
+}
+
+// toastClicked brings the window back on the toast's chat, switching account first if needed.
+func (a *App) toastClicked(acct, jid string) {
+	a.restore()
+	if acct == a.v.active {
+		a.openChat(acct, jid, "")
+		return
+	}
+	a.v.openNext = chatRef{acct, jid}
+	a.rail.Model().SetActive(acct) // its chats load, then the chat opens
+}
+
+// chatName is jid's name in the active account's chat list, "" when it has none.
+func (a *App) chatName(acct, jid string) string {
+	if a.side.Model().Account() != acct {
+		return ""
+	}
+	for _, c := range a.side.Model().Chats() {
+		if c.JID == jid {
+			return c.Name
+		}
+	}
+	return ""
+}
+
+// label is jid's name, else its phone number.
+func (a *App) label(acct, jid string) string {
+	if n := a.chatName(acct, jid); n != "" {
+		return n
+	}
+	user, server, _ := strings.Cut(jid, "@")
+	if server == "s.whatsapp.net" {
+		return "+" + user
+	}
+	return user
+}
+
+// chatUnread is the open account's unread count of jid.
+func (a *App) chatUnread(jid string) int {
+	for _, c := range a.side.Model().Chats() {
+		if c.JID == jid {
+			return c.Unread
+		}
+	}
+	return 0
+}
+
+func isGroup(jid string) bool { return strings.HasSuffix(jid, "@g.us") }

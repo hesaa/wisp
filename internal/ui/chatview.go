@@ -62,6 +62,7 @@ type ChatView struct {
 	cdpi        int               // DPI of the paint canvas; text is measured with its fonts
 	focus       string            // keyboard-focused message ID
 	requested   map[string]bool   // images whose download was requested on sight
+	autoFetch   bool              // request images as they come into view (media.autodownload_images)
 	thumbFiles  map[string]string // Cache.Thumbnail of a downloaded image; "" when it has none
 	thumbBusy   map[string]bool
 	bitmaps     *lru[thumbBitmap]
@@ -166,7 +167,7 @@ func NewChatView(parent walk.Container, p theme.Palette, cache *media.Cache, sen
 	if err != nil {
 		return nil, err
 	}
-	v := &ChatView{Composite: comp, pal: p, cache: cache, cdpi: canvasDPI(),
+	v := &ChatView{Composite: comp, pal: p, cache: cache, cdpi: canvasDPI(), autoFetch: true,
 		requested: map[string]bool{}, thumbFiles: map[string]string{}, thumbBusy: map[string]bool{},
 		bitmaps: newLRU(thumbCacheSize, func(t thumbBitmap) {
 			if t.bmp != nil {
@@ -303,6 +304,25 @@ func (v *ChatView) SetMediaPath(id, path string) {
 	v.settle()
 }
 
+// SetAutoDownload turns requesting images as they come into view on or off (on at first); a click
+// on undownloaded media requests it either way.
+func (v *ChatView) SetAutoDownload(on bool) {
+	v.autoFetch = on
+	if on {
+		v.settle() // the images already in view
+	}
+}
+
+// fetchOnSight reports whether an undownloaded image that came into view is requested now: only
+// with auto-download on, and once per chat (recorded in requested).
+func fetchOnSight(id string, auto bool, requested map[string]bool) bool {
+	if !auto || requested[id] {
+		return false
+	}
+	requested[id] = true
+	return true
+}
+
 // SetPalette recolours the pane.
 func (v *ChatView) SetPalette(p theme.Palette) error {
 	v.pal = p
@@ -401,8 +421,7 @@ func (v *ChatView) settle() {
 		switch {
 		case m.Type != "image":
 		case m.MediaPath == "":
-			if v.onNeedMedia != nil && !v.requested[m.ID] {
-				v.requested[m.ID] = true
+			if v.onNeedMedia != nil && fetchOnSight(m.ID, v.autoFetch, v.requested) {
 				v.onNeedMedia(m)
 			}
 		default:

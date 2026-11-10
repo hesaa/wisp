@@ -562,3 +562,16 @@ func TestUpsertKeepsTheDownloadedMediaPath(t *testing.T) {
 		t.Errorf("a new path was not taken: %q", m.msgs[0].MediaPath)
 	}
 }
+
+func TestImagesAreFetchedOnSightOnlyWithAutoDownload(t *testing.T) {
+	requested := map[string]bool{}
+	if fetchOnSight("a", false, requested) || requested["a"] {
+		t.Fatal("auto-download off: an image in view was requested")
+	}
+	if !fetchOnSight("a", true, requested) {
+		t.Fatal("auto-download on: the image in view was not requested")
+	}
+	if fetchOnSight("a", true, requested) {
+		t.Fatal("the same image was requested twice on sight")
+	}
+}

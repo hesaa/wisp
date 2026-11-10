@@ -62,8 +62,8 @@ func TestOnlyGiphyHTTPSURLsAreFetched(t *testing.T) {
 		"https://gİphy.com/x":                         false,
 		"https://media0.xn--giphy-8fd.com/x.gif":      false, // that punycode spelled out
 	} {
-		if got := allowedGIFURL(raw); got != want {
-			t.Errorf("allowedGIFURL(%q) = %v", raw, got)
+		if got := AllowedGIFURL(raw); got != want {
+			t.Errorf("AllowedGIFURL(%q) = %v", raw, got)
 		}
 	}
 }

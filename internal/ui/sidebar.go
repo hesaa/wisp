@@ -238,6 +238,9 @@ func (s *Sidebar) SetStories(st []store.Story) {
 	logErr("stories repaint", s.stories.Invalidate())
 }
 
+// FocusSearch puts the keyboard focus in the search box.
+func (s *Sidebar) FocusSearch() error { return s.search.edit.SetFocus() }
+
 // OnChatSelected sets the handler of a click on a chat row (the row is selected first).
 func (s *Sidebar) OnChatSelected(fn func(jid string)) { s.onChat = fn }
 

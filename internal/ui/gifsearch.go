@@ -26,7 +26,7 @@ const (
 
 var errNoGIFKey = errors.New("ui: GIF search needs a GIPHY API key")
 
-// gifResult is one GIF found on GIPHY; both URLs passed allowedGIFURL.
+// gifResult is one GIF found on GIPHY; both URLs passed AllowedGIFURL.
 type gifResult struct {
 	desc    string // GIPHY's title, for screen readers and tooltips; may be ""
 	preview string // a still: a small single-frame GIF
@@ -44,7 +44,7 @@ func newGiphy() *giphy {
 	return &giphy{base: giphySearch, http: &http.Client{
 		Timeout: 15 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 3 || !allowedGIFURL(req.URL.String()) {
+			if len(via) >= 3 || !AllowedGIFURL(req.URL.String()) {
 				// the host only: the target's query may repeat the API key
 				return fmt.Errorf("ui: refusing a GIF redirect to host %q", req.URL.Hostname())
 			}
@@ -60,9 +60,9 @@ func giphyURL(base, query, key string) string {
 	}.Encode()
 }
 
-// allowedGIFURL reports whether raw is an https URL on giphy.com or a subdomain of it (the API,
+// AllowedGIFURL reports whether raw is an https URL on giphy.com or a subdomain of it (the API,
 // media0-4, i), on the default port and without user info.
-func allowedGIFURL(raw string) bool {
+func AllowedGIFURL(raw string) bool {
 	u, err := url.Parse(raw)
 	// ASCII hosts only: a non-ASCII letter can lower-case to ASCII (U+0130 to i) while net/http
 	// dials the host's punycode, a different domain
@@ -89,7 +89,7 @@ func (g *giphy) search(ctx context.Context, key, query string) ([]gifResult, err
 
 // preview fetches a result's still and returns its first frame scaled to cover w x h.
 func (g *giphy) preview(ctx context.Context, u string, w, h int) (*image.RGBA, error) {
-	if !allowedGIFURL(u) {
+	if !AllowedGIFURL(u) {
 		return nil, fmt.Errorf("ui: refusing to fetch GIF preview %q", u)
 	}
 	body, err := g.get(ctx, u, maxGIFPreview)
@@ -152,7 +152,7 @@ func parseGiphy(b []byte) ([]gifResult, error) {
 		g := gifResult{desc: oneLine(res.Title),
 			preview: cmp.Or(rendition("fixed_width_still").URL, rendition("fixed_width_small_still").URL),
 			mp4:     cmp.Or(rendition("downsized_small").MP4, rendition("fixed_width").MP4)}
-		if allowedGIFURL(g.preview) && allowedGIFURL(g.mp4) {
+		if AllowedGIFURL(g.preview) && AllowedGIFURL(g.mp4) {
 			out = append(out, g)
 		}
 		if len(out) == gifResults {
