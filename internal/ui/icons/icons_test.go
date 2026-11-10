@@ -7,7 +7,7 @@ import (
 )
 
 var allIcons = []Icon{IconChat, IconStatus, IconSettings, IconSearch, IconAttach, IconEmoji, IconSend, IconDoubleCheck,
-	IconAdd, IconNewChat}
+	IconAdd, IconNewChat, IconCheck, IconDocument, IconDownload, IconVideo, IconAudio}
 
 func TestFillCapsule(t *testing.T) {
 	bmp, err := walk.NewBitmapForDPI(walk.Size{Width: 40, Height: 20}, 96)
@@ -94,5 +94,38 @@ func TestBitmapRendersSomethingButNotEverything(t *testing.T) {
 func TestUnknownIcon(t *testing.T) {
 	if _, err := Bitmap(Icon(999), 24, 0); err == nil {
 		t.Fatal("expected error for unknown icon")
+	}
+}
+
+func TestFillRounded(t *testing.T) {
+	bmp, err := walk.NewBitmapForDPI(walk.Size{Width: 60, Height: 30}, 96)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bmp.Dispose()
+	c, err := walk.NewCanvasFromImage(bmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = FillRounded(c, walk.Rectangle{Width: 60, Height: 30}, 8, walk.RGB(0, 200, 0))
+	c.Dispose()
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := bmp.ToImage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	green := func(x, y int) bool { p := img.RGBAAt(x, y); return p.R == 0 && p.G == 200 && p.B == 0 }
+	// straight edges reach the bounds (unlike a capsule's), corners are cut
+	for _, p := range [][2]int{{30, 0}, {30, 29}, {0, 15}, {59, 15}, {8, 2}, {3, 8}, {56, 26}} {
+		if !green(p[0], p[1]) {
+			t.Errorf("(%d,%d) not filled", p[0], p[1])
+		}
+	}
+	for _, p := range [][2]int{{0, 0}, {59, 0}, {0, 29}, {59, 29}} {
+		if green(p[0], p[1]) {
+			t.Errorf("corner (%d,%d) filled: not rounded", p[0], p[1])
+		}
 	}
 }

@@ -1,0 +1,716 @@
+package ui
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"image"
+	_ "image/jpeg" // embedded previews and cached thumbnails
+	_ "image/png"  // sticker previews
+	"io"
+	"os"
+	"slices"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/lxn/walk"
+	"github.com/lxn/win"
+	"golang.org/x/image/draw"
+	"golang.org/x/sys/windows"
+
+	"wa-go/internal/media"
+	"wa-go/internal/store"
+	"wa-go/internal/theme"
+	"wa-go/internal/ui/icons"
+)
+
+const (
+	chatHeaderH    = 60  // 1/96 inch
+	loadAheadPx    = 120 // ask for older messages this close to the top (1/96 inch)
+	thumbCacheSize = 24  // decoded thumbnails kept
+	// maxPreviewPixels bounds what is decoded for painting: embedded previews and cached thumbnails
+	// are at most a few hundred pixels square; anything bigger is refused, not decoded.
+	maxPreviewPixels = 1 << 20
+	// msgFormat wraps message text; measuring uses the same flags so lines break identically.
+	msgFormat = walk.TextWordbreak | walk.TextNoPrefix
+)
+
+var (
+	getDoubleClickTime = windows.NewLazySystemDLL("user32.dll").NewProc("GetDoubleClickTime")
+	thumbSlot          = make(chan struct{}, 1) // one full-size image decoded at a time
+)
+
+// ChatView is the chat pane: a header with the chat's avatar, name and number over a custom-painted,
+// scrolling canvas of message bubbles. Feed it with SetChat, PrependPage, Upsert and SetMediaPath;
+// it asks for older pages and media through its callbacks. The canvas is a tab stop:
+// Up/Down/PgUp/PgDn/Home/End move the focused message, Enter or Space download or open its media.
+// UI-thread only.
+type ChatView struct {
+	*walk.Composite
+	header *walk.CustomWidget
+	canvas *walk.CustomWidget
+	scroll vscroll
+	pal    theme.Palette
+	cache  *media.Cache
+
+	account, chat, name string          // name: the chat's own name, "" when it has none
+	msgs                []store.Message // oldest first
+	lay                 chatLayout
+	stale               bool // msgs changed since the last layout
+	view                int  // canvas height the scroll offset was last fitted to
+	cdpi                int  // DPI of the paint canvas; text is measured with its fonts
+	loading, exhausted  bool
+	focus               string            // keyboard-focused message ID
+	requested           map[string]bool   // images whose download was requested on sight
+	thumbFiles          map[string]string // Cache.Thumbnail of a downloaded image; "" when it has none
+	thumbBusy           map[string]bool
+	bitmaps             *lru[thumbBitmap]
+	gen                 int // bumped per chat: thumbnails finished for an older chat are dropped
+	lastClickID         string
+	lastClickAt         time.Time
+
+	onLoadPrevious func()
+	onNeedMedia    func(store.Message)
+	onOpenMedia    func(path string)
+}
+
+// thumbBitmap is a thumbnail decoded and scaled for its box.
+type thumbBitmap struct {
+	bmp  *walk.Bitmap // nil: the source could not be decoded
+	src  string       // thumbnail file, "" for the embedded preview
+	w, h int
+}
+
+// NewChatView creates the chat pane in parent. cache makes thumbnails of downloaded images;
+// senderName gives a group member's display name ("" when unknown; the number is shown then).
+func NewChatView(parent walk.Container, p theme.Palette, cache *media.Cache, senderName func(jid string) string) (*ChatView, error) {
+	comp, err := walk.NewComposite(parent)
+	if err != nil {
+		return nil, err
+	}
+	v := &ChatView{Composite: comp, pal: p, cache: cache, cdpi: canvasDPI(),
+		requested: map[string]bool{}, thumbFiles: map[string]string{}, thumbBusy: map[string]bool{},
+		bitmaps: newLRU(thumbCacheSize, func(t thumbBitmap) {
+			if t.bmp != nil {
+				t.bmp.Dispose()
+			}
+		}),
+	}
+	v.lay.senderName = senderName
+	if err := v.build(); err != nil {
+		comp.Dispose()
+		return nil, err
+	}
+	return v, nil
+}
+
+func (v *ChatView) build() error {
+	var err error
+	if err = setBox(v.Composite, walk.NewVBoxLayout(), walk.Margins{}); err != nil {
+		return err
+	}
+	if v.header, err = newCanvas(v.Composite, v.paintHeader); err != nil {
+		return err
+	}
+	if v.canvas, err = newCanvas(v.Composite, v.paint); err != nil {
+		return err
+	}
+	cw := v.canvas
+	if err := errors.Join(v.header.SetMinMaxSize(walk.Size{Height: chatHeaderH}, walk.Size{Height: chatHeaderH}),
+		fillRest(v.Composite, cw), focusable(cw, walk.AccRoleList, "Messages", v.key)); err != nil {
+		return err
+	}
+	cw.MouseDown().Attach(v.mouseDown)
+	v.scroll.attach(cw, func() int { return v.lay.total }, func() int { return cw.IntFrom96DPI(100) })
+	v.scroll.moved = v.settle
+	cw.SizeChanged().Attach(func() {
+		logErr("chat layout", v.relayout(false))
+		v.settle()
+	})
+	cw.FocusedChanged().Attach(func() {
+		if cw.Focused() && v.focusIndex() < 0 {
+			if i := v.lastFull(); i >= 0 {
+				v.setFocus(i) // no scrolling: a click may be resolving its message against this offset
+			}
+		}
+	})
+	cw.Disposing().Attach(v.bitmaps.clear)
+	return v.SetPalette(v.pal)
+}
+
+// OnLoadPrevious sets the handler called when the view nears the top of the loaded messages; it
+// fires once until PrependPage or NoMoreHistory answers it.
+func (v *ChatView) OnLoadPrevious(fn func()) { v.onLoadPrevious = fn }
+
+// OnNeedMedia sets the handler that downloads a message's media and then calls SetMediaPath. It
+// fires once when an image comes into view and again on each click of undownloaded media, so it
+// may come for a download already under way.
+func (v *ChatView) OnNeedMedia(fn func(store.Message)) { v.onNeedMedia = fn }
+
+// OnOpenMedia sets the handler of a double-click or Enter on downloaded media (path is
+// Message.MediaPath), typically media.Cache.OpenInDefaultApp.
+func (v *ChatView) OnOpenMedia(fn func(path string)) { v.onOpenMedia = fn }
+
+// SetChat shows a chat from its newest page (store.GetChatMessages page 0, newest first), scrolled
+// to the end. name is the chat's own name ("" for none).
+func (v *ChatView) SetChat(accountID, chatJID, name string, isGroup bool, firstPage []store.Message) {
+	v.account, v.chat, v.name = accountID, chatJID, name
+	v.msgs = slices.Clone(firstPage)
+	slices.Reverse(v.msgs)
+	v.lay.reset()
+	v.lay.group = isGroup
+	v.bitmaps.clear()
+	clear(v.requested)
+	clear(v.thumbFiles)
+	clear(v.thumbBusy)
+	v.gen++
+	v.loading, v.exhausted = false, len(firstPage) < store.PageSize
+	v.focus, v.view, v.scroll.off, v.stale = "", 0, 0, true
+	logErr("chat layout", v.relayout(false))
+	logErr("chat repaint", errors.Join(v.header.Invalidate(), v.canvas.Invalidate()))
+	v.settle()
+}
+
+// PrependPage adds the next older page (newest first, as store.GetChatMessages returns it) above
+// the loaded messages, keeping the messages on screen where they are. A short page ends the history.
+func (v *ChatView) PrependPage(page []store.Message) {
+	if len(page) > 0 && (page[0].AccountID != v.account || page[0].ChatJID != v.chat) {
+		return // a late answer for a chat no longer open
+	}
+	v.loading = false
+	if len(page) < store.PageSize {
+		v.exhausted = true
+	}
+	var older []store.Message
+	for i := len(page) - 1; i >= 0; i-- { // oldest first; skip what is loaded (pages shift as messages arrive)
+		if m := page[i]; v.index(m.ID) < 0 {
+			older = append(older, m)
+		}
+	}
+	if len(older) > 0 {
+		logErr("chat layout", v.relayout(false)) // the total to anchor against
+		v.msgs = append(older, v.msgs...)
+		v.stale = true
+		logErr("chat layout", v.relayout(true))
+		logErr("chat repaint", v.canvas.Invalidate())
+	}
+	v.settle()
+}
+
+// NoMoreHistory answers OnLoadPrevious when there is nothing older.
+func (v *ChatView) NoMoreHistory() { v.loading, v.exhausted = false, true }
+
+// Upsert adds a new message of the open chat or replaces a changed one (status, edit, deletion).
+// The view follows new messages only when it was showing the end. Other chats' messages are ignored.
+func (v *ChatView) Upsert(msg store.Message) {
+	if msg.AccountID != v.account || msg.ChatJID != v.chat {
+		return
+	}
+	if i := v.index(msg.ID); i >= 0 {
+		if v.msgs[i].MediaPath != msg.MediaPath {
+			delete(v.thumbFiles, msg.ID)
+		}
+		v.msgs[i] = msg
+	} else {
+		at := len(v.msgs)
+		for at > 0 && v.msgs[at-1].Timestamp > msg.Timestamp {
+			at--
+		}
+		v.msgs = slices.Insert(v.msgs, at, msg)
+	}
+	v.lay.forget(msg.ID)
+	v.stale = true
+	logErr("chat layout", v.relayout(false))
+	logErr("chat repaint", v.canvas.Invalidate())
+	v.settle()
+}
+
+// SetMediaPath records that message id's media was downloaded to path.
+func (v *ChatView) SetMediaPath(id, path string) {
+	i := v.index(id)
+	if i < 0 {
+		return
+	}
+	v.msgs[i].MediaPath = path
+	delete(v.thumbFiles, id)
+	v.lay.forget(id)
+	v.stale = true
+	logErr("chat layout", v.relayout(false))
+	logErr("chat repaint", v.canvas.Invalidate())
+	v.settle()
+}
+
+// SetPalette recolours the pane.
+func (v *ChatView) SetPalette(p theme.Palette) error {
+	v.pal = p
+	return errors.Join(setBg(v.Composite, p.ChatBg), v.header.Invalidate(), v.canvas.Invalidate())
+}
+
+func (v *ChatView) index(id string) int {
+	return slices.IndexFunc(v.msgs, func(m store.Message) bool { return m.ID == id })
+}
+
+func (v *ChatView) focusIndex() int {
+	if v.focus == "" {
+		return -1
+	}
+	return v.index(v.focus)
+}
+
+// title is the chat's name, else its number.
+func (v *ChatView) title() string { return displayName(store.Chat{JID: v.chat, Name: v.name}) }
+
+// relayout brings the layout up to date with the messages and the canvas size. The view stays on
+// the end when it showed the end; prepended (older messages added) keeps the messages on screen.
+func (v *ChatView) relayout(prepended bool) error {
+	b, dpi := v.canvas.ClientBoundsPixels(), v.canvas.DPI()
+	if b.Width <= 0 || b.Height <= 0 ||
+		!v.stale && v.lay.cache != nil && b.Width == v.lay.width && dpi == v.lay.dpi && b.Height == v.view {
+		return nil
+	}
+	oldTotal, oldView := v.lay.total, v.view
+	ms := &gdiMeasurer{dpi: dpi, cdpi: v.cdpi}
+	v.lay.update(v.msgs, b.Width, dpi, ms)
+	if err := ms.close(); err != nil {
+		v.lay.cache = nil // measure again next time
+		return err
+	}
+	off := followBottom(v.scroll.off, oldTotal, oldView, v.lay.total, b.Height)
+	if prepended {
+		off = anchorAfterPrepend(v.scroll.off, oldTotal, v.lay.total, b.Height)
+	}
+	v.stale, v.view = false, b.Height
+	v.scroll.off = v.scroll.clamp(off)
+	return nil
+}
+
+// pad is the space above the messages when they don't fill the view: they sit at its bottom.
+func (v *ChatView) pad() int { return max(0, v.view-v.lay.total) }
+
+// screenY is message i's top in canvas pixels.
+func (v *ChatView) screenY(i int) int { return v.pad() + v.lay.tops[i] - v.scroll.off }
+
+// visible is the range [first, last) of messages at least partly on screen.
+func (v *ChatView) visible() (first, last int) {
+	tops := v.lay.tops
+	if len(tops) != len(v.msgs) { // not laid out yet
+		return 0, 0
+	}
+	top := v.scroll.off - v.pad()
+	first = sort.Search(len(tops), func(i int) bool { return tops[i]+v.lay.cache[v.msgs[i].ID].box.Height > top })
+	last = sort.Search(len(tops), func(i int) bool { return tops[i] >= top+v.view })
+	return first, last
+}
+
+// lastFull is the newest message wholly on screen (else the newest partly on screen; -1 for none):
+// where focus rests when the canvas gains it with nothing focused, so gaining focus never scrolls.
+func (v *ChatView) lastFull() int {
+	first, last := v.visible()
+	for i := last - 1; i >= first; i-- {
+		if y := v.screenY(i); y >= 0 && y+v.lay.cache[v.msgs[i].ID].box.Height <= v.view {
+			return i
+		}
+	}
+	return last - 1
+}
+
+// hit is the message whose bubble is at canvas point (x, y), -1 for none.
+func (v *ChatView) hit(x, y int) int {
+	first, last := v.visible()
+	for i := first; i < last; i++ {
+		b := v.lay.cache[v.msgs[i].ID].box
+		if top := v.screenY(i); y >= top && y < top+b.Height && x >= b.X && x < b.X+b.Width {
+			return i
+		}
+	}
+	return -1
+}
+
+// settle acts on what the view now shows: asks for the previous page near the top, for the media of
+// images in sight, and makes thumbnails of downloaded images in sight. Never called while painting:
+// the handlers may change the messages.
+func (v *ChatView) settle() {
+	if v.chat == "" || len(v.lay.tops) != len(v.msgs) {
+		return
+	}
+	if v.onLoadPrevious != nil && shouldLoadPrevious(v.scroll.off, v.canvas.IntFrom96DPI(loadAheadPx), v.loading, v.exhausted) {
+		v.loading = true
+		v.onLoadPrevious() // may prepend a page right away
+	}
+	first, last := v.visible()
+	for _, m := range slices.Clone(v.msgs[first:last]) {
+		switch {
+		case m.Type != "image":
+		case m.MediaPath == "":
+			if v.onNeedMedia != nil && !v.requested[m.ID] {
+				v.requested[m.ID] = true
+				v.onNeedMedia(m)
+			}
+		default:
+			if _, done := v.thumbFiles[m.ID]; !done && !v.thumbBusy[m.ID] {
+				v.makeThumb(m.ID, m.MediaPath)
+			}
+		}
+	}
+}
+
+// makeThumb has the cache make a downloaded image's thumbnail off the UI thread (it decodes the
+// full image) and repaints with it.
+func (v *ChatView) makeThumb(id, path string) {
+	if v.cache == nil {
+		v.thumbFiles[id] = ""
+		return
+	}
+	v.thumbBusy[id] = true
+	gen := v.gen
+	go func() {
+		thumbSlot <- struct{}{}
+		thumb, err := v.cache.Thumbnail(path)
+		<-thumbSlot
+		v.canvas.Synchronize(func() {
+			if gen != v.gen || v.canvas.IsDisposed() {
+				return
+			}
+			delete(v.thumbBusy, id)
+			if err != nil && !errors.Is(err, media.ErrNoThumbnail) {
+				logErr("thumbnail of message "+id, err)
+			}
+			v.thumbFiles[id] = thumb // "" on failure: the embedded preview stays
+			logErr("chat repaint", v.canvas.Invalidate())
+		})
+	}()
+}
+
+// thumbFor is message m's thumbnail scaled to w x h: the cached thumbnail of its download, else its
+// embedded preview; nil when there is neither. Only visible bubbles ask, and the decoded bitmaps are
+// kept in a small LRU.
+func (v *ChatView) thumbFor(m *store.Message, preview bool, w, h int) *walk.Bitmap {
+	src := v.thumbFiles[m.ID]
+	if t, ok := v.bitmaps.get(m.ID); ok && t.src == src && t.w == w && t.h == h {
+		return t.bmp
+	}
+	if src == "" && !preview {
+		return nil
+	}
+	img, err := v.decodeThumb(m, src, w, h)
+	var bmp *walk.Bitmap
+	if err == nil {
+		bmp, err = walk.NewBitmapFromImageForDPI(img, v.canvas.DPI())
+	}
+	logErr("thumbnail of message "+m.ID, err)
+	v.bitmaps.put(m.ID, thumbBitmap{bmp: bmp, src: src, w: w, h: h})
+	return bmp
+}
+
+func (v *ChatView) decodeThumb(m *store.Message, src string, w, h int) (*image.RGBA, error) {
+	if src != "" {
+		f, err := os.Open(src)
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+		return coverImage(f, w, h)
+	}
+	info, err := parseMedia(m)
+	if err != nil {
+		return nil, err
+	}
+	return coverImage(bytes.NewReader(info.preview), w, h)
+}
+
+// coverImage decodes a small JPEG or PNG and scales it to cover w x h, centre-cropped, so only a
+// box-sized image outlives the call.
+func coverImage(r io.ReadSeeker, w, h int) (*image.RGBA, error) {
+	cfg, _, err := image.DecodeConfig(r)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 || cfg.Width*cfg.Height > maxPreviewPixels {
+		return nil, fmt.Errorf("ui: refusing to decode a %dx%d preview", cfg.Width, cfg.Height)
+	}
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	src, _, err := image.Decode(r)
+	if err != nil {
+		return nil, err
+	}
+	sb := src.Bounds()
+	if sw, sh := sb.Dx(), sb.Dy(); sw*h > sh*w {
+		cw := max(1, sh*w/h)
+		sb.Min.X += (sw - cw) / 2
+		sb.Max.X = sb.Min.X + cw
+	} else {
+		ch := max(1, sw*h/w)
+		sb.Min.Y += (sh - ch) / 2
+		sb.Max.Y = sb.Min.Y + ch
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, w, h))
+	draw.ApproxBiLinear.Scale(dst, dst.Bounds(), src, sb, draw.Src, nil)
+	return dst, nil
+}
+
+func (v *ChatView) setFocus(i int) {
+	v.focus = v.msgs[i].ID
+	logErr("chat repaint", v.canvas.Invalidate())
+	announce(v.canvas, "Messages with "+v.title(), v.describe(i))
+}
+
+// focusOn moves the focus to message i and scrolls it into view.
+func (v *ChatView) focusOn(i int) {
+	v.setFocus(i)
+	v.scroll.scrollTo(scrollIntoView(v.scroll.off, v.lay.tops[i], v.lay.cache[v.msgs[i].ID].box.Height, v.view))
+}
+
+// describe is message i for screen readers: sender, content, time and delivery state.
+func (v *ChatView) describe(i int) string {
+	m, b := &v.msgs[i], v.lay.cache[v.msgs[i].ID]
+	who := v.title()
+	switch {
+	case m.FromMe:
+		who = "You"
+	case v.lay.group:
+		who = v.lay.sender(m.SenderJID)
+	}
+	text, _ := bubbleText(m, b.info)
+	switch b.kind {
+	case kindImage:
+		what := "Photo"
+		if m.Type == "sticker" {
+			what = "Sticker"
+		}
+		text = strings.TrimSpace(what + " " + text)
+	case kindCard:
+		title, sub := cardLabels(m, b.info)
+		text = strings.Join(slices.DeleteFunc([]string{title, sub, text}, func(s string) bool { return s == "" }), ", ")
+	}
+	item := who + ": " + text + ", " + clock(m.Timestamp)
+	if m.FromMe && m.Status != "" {
+		item += ", " + m.Status
+	}
+	return item
+}
+
+func (v *ChatView) key(k walk.Key) bool {
+	i := v.focusIndex()
+	if k == walk.KeyReturn || k == walk.KeySpace {
+		if i >= 0 {
+			v.activate(v.msgs[i], true)
+		}
+		return true
+	}
+	first, last := v.visible()
+	next, ok := navigate(i, len(v.lay.tops), max(1, last-first-1), k, false)
+	if ok && next >= 0 {
+		v.focusOn(next)
+	}
+	return ok
+}
+
+func (v *ChatView) mouseDown(x, y int, b walk.MouseButton) {
+	if b != walk.LeftButton || v.scroll.press(x, y) {
+		return
+	}
+	// resolve the message against the view the user saw, then take focus, then act on it
+	i := v.hit(x, y)
+	if i >= 0 {
+		v.setFocus(i)
+	}
+	logErr("focus", v.canvas.SetFocus())
+	if i < 0 {
+		return
+	}
+	m, now := v.msgs[i], time.Now()
+	ms, _, _ := getDoubleClickTime.Call()
+	double := m.ID == v.lastClickID && now.Sub(v.lastClickAt) <= time.Duration(ms)*time.Millisecond
+	v.lastClickID, v.lastClickAt = m.ID, now
+	if double {
+		v.lastClickID = "" // a third click starts over
+	}
+	v.activate(m, double)
+}
+
+// activate acts on a media message: asks for its download when it has none, else opens it when open.
+func (v *ChatView) activate(m store.Message, open bool) {
+	switch {
+	case v.lay.cache[m.ID].kind == kindText:
+	case m.MediaPath == "":
+		if v.onNeedMedia != nil {
+			v.onNeedMedia(m)
+		}
+	case open && v.onOpenMedia != nil:
+		v.onOpenMedia(m.MediaPath)
+	}
+}
+
+func (v *ChatView) paintHeader(c *walk.Canvas, _ walk.Rectangle) error {
+	dpi, b, p := v.header.DPI(), v.header.ClientBoundsPixels(), v.pal
+	s := scaler(dpi)
+	bg, err := brushFor(p.Header)
+	if err != nil {
+		return err
+	}
+	if err := c.FillRectanglePixels(bg, b); err != nil || v.chat == "" {
+		return err
+	}
+	av := walk.Rectangle{X: s(16), Y: (b.Height - s(40)) / 2, Width: s(40), Height: s(40)}
+	x := av.X + av.Width + s(14)
+	name := walk.Rectangle{X: x, Width: b.Width - x - s(16), Height: b.Height}
+	var sub string
+	if user, server, _ := strings.Cut(v.chat, "@"); v.name != "" && server == "s.whatsapp.net" {
+		sub = "+" + user
+		name.Y, name.Height = b.Height/2-s(22), s(24)
+	}
+	return errors.Join(
+		drawAvatar(c, dpi, av, v.name, v.chat, 13),
+		drawText(c, dpi, v.title(), 12, 0, theme.Color(p.Text), name, leftText),
+		drawText(c, dpi, sub, 9, 0, theme.Color(p.TextSecondary), walk.Rectangle{X: x, Y: b.Height / 2, Width: name.Width, Height: s(20)}, leftText),
+	)
+}
+
+func (v *ChatView) paint(c *walk.Canvas, ub walk.Rectangle) error {
+	if cd := c.DPI(); cd != v.cdpi { // measured with other fonts than this canvas draws with
+		v.cdpi, v.lay.cache = cd, nil
+	}
+	err := v.relayout(false)
+	p, s := v.pal, scaler(v.canvas.DPI())
+	bg, berr := brushFor(p.ChatBg)
+	if err = errors.Join(err, berr); err != nil {
+		return err
+	}
+	if err := c.FillRectanglePixels(bg, ub); err != nil {
+		return err
+	}
+	focused := focusCues(v.canvas)
+	first, last := v.visible()
+	for i := first; i < last; i++ {
+		m, b, dy := &v.msgs[i], v.lay.cache[v.msgs[i].ID], v.screenY(i)
+		if dy+b.box.Height+s(3) <= ub.Y || dy-s(3) >= ub.Y+ub.Height {
+			continue
+		}
+		if err := v.paintBubble(c, m, b, dy); err != nil {
+			return err
+		}
+		if focused && m.ID == v.focus {
+			r := b.box
+			r = walk.Rectangle{X: r.X - s(3), Y: dy - s(3), Width: r.Width + s(6), Height: r.Height + s(6)}
+			if err := focusRect(c, r, s(2), p.Text); err != nil {
+				return err
+			}
+		}
+	}
+	if t := v.scroll.thumb(); t.Height > 0 {
+		return icons.Fill(c, t, theme.Color(p.TextSecondary))
+	}
+	return nil
+}
+
+var cardIcons = map[string]icons.Icon{"document": icons.IconDocument, "video": icons.IconVideo, "audio": icons.IconAudio, "sticker": icons.IconEmoji}
+
+// paintBubble paints message m's bubble b with its top at canvas y dy.
+func (v *ChatView) paintBubble(c *walk.Canvas, m *store.Message, b bubble, dy int) error {
+	dpi, p := v.canvas.DPI(), v.pal
+	s := scaler(dpi)
+	at := func(r walk.Rectangle) walk.Rectangle { r.Y += dy; return r }
+	secondary := theme.Color(p.TextSecondary)
+	if err := icons.FillRounded(c, at(b.box), s(bubbleRadius), theme.Color(bubbleColor(p, b.out))); err != nil {
+		return err
+	}
+	var errs []error
+	if b.named {
+		errs = append(errs, drawText(c, dpi, v.lay.sender(m.SenderJID), namePt, walk.FontBold, avatarColor(m.SenderJID), at(b.name), leftText))
+	}
+	if b.thumb.Width > 0 {
+		r := at(b.thumb)
+		if bmp := v.thumbFor(m, b.preview, r.Width, r.Height); bmp != nil {
+			errs = append(errs, c.DrawImageStretchedPixels(bmp, r))
+		} else {
+			errs = append(errs, icons.FillRounded(c, r, s(4), theme.Color(p.ChatBg)))
+			if m.MediaPath == "" {
+				errs = append(errs, icons.Draw(c, icons.IconDownload, square(r.X+r.Width/2, r.Y+r.Height/2, s(36)), secondary))
+			}
+		}
+	}
+	if b.card.Width > 0 {
+		card := at(b.card)
+		icon, title, sub, dl := cardParts(card, dpi)
+		if m.MediaPath != "" { // no download button: the labels take its room
+			title.Width = card.X + card.Width - s(12) - title.X
+			sub.Width = title.Width
+		}
+		name, size := cardLabels(m, b.info)
+		errs = append(errs,
+			icons.FillRounded(c, card, s(6), theme.Color(p.ChatBg)),
+			icons.Draw(c, cardIcons[m.Type], icon, secondary),
+			drawText(c, dpi, name, bodyPt, 0, theme.Color(p.Text), title, leftText),
+			drawText(c, dpi, size, metaPt, 0, secondary, sub, leftText))
+		if m.MediaPath == "" {
+			errs = append(errs, icons.Draw(c, icons.IconDownload, dl, secondary))
+		}
+	}
+	if b.text.Width > 0 {
+		text, muted := bubbleText(m, b.info)
+		color, style := theme.Color(p.Text), walk.FontStyle(0)
+		if muted {
+			color, style = secondary, walk.FontItalic
+		}
+		errs = append(errs, drawText(c, dpi, text, bodyPt, style, color, at(b.text), msgFormat))
+	}
+	errs = append(errs, drawText(c, dpi, clock(m.Timestamp), metaPt, 0, secondary, at(b.time), rightText))
+	if icon, color, ok := tickFor(p, m.Status); ok && b.ticks.Width > 0 {
+		errs = append(errs, icons.Draw(c, icon, at(b.ticks), theme.Color(color)))
+	}
+	return errors.Join(errs...)
+}
+
+// gdiMeasurer measures text with the fonts drawText draws it with (pt scaled from the widget's DPI to
+// the paint canvas's), on a memory canvas made on first use; close releases it. The first failure
+// sticks and is returned by close.
+type gdiMeasurer struct {
+	dpi, cdpi int
+	bmp       *walk.Bitmap
+	c         *walk.Canvas
+	err       error
+}
+
+func (g *gdiMeasurer) measure(text string, pt int, style walk.FontStyle, maxW int) (int, int) {
+	if g.err != nil || text == "" {
+		return 0, 0
+	}
+	if g.c == nil {
+		if g.bmp, g.err = walk.NewBitmapForDPI(walk.Size{Width: 1, Height: 1}, g.cdpi); g.err != nil {
+			return 0, 0
+		}
+		if g.c, g.err = walk.NewCanvasFromImage(g.bmp); g.err != nil {
+			return 0, 0
+		}
+	}
+	r, _, err := g.c.MeasureTextPixels(text, textFont(pt, style, g.dpi, g.cdpi), walk.Rectangle{Width: maxW, Height: 1 << 20}, msgFormat|walk.TextCalcRect)
+	if err != nil {
+		g.err = err
+		return 0, 0
+	}
+	return r.Width, r.Height
+}
+
+func (g *gdiMeasurer) close() error {
+	if g.c != nil {
+		g.c.Dispose()
+	}
+	if g.bmp != nil {
+		g.bmp.Dispose()
+	}
+	return g.err
+}
+
+// canvasDPI is the DPI walk's buffered paint canvas reports: a memory DC's (the system DPI). paint
+// corrects it should the canvas report another.
+func canvasDPI() int {
+	hdc := win.CreateCompatibleDC(0)
+	if hdc == 0 {
+		return 96
+	}
+	defer win.DeleteDC(hdc)
+	return int(win.GetDeviceCaps(hdc, win.LOGPIXELSX))
+}

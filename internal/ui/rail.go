@@ -534,8 +534,12 @@ func drawText(c *walk.Canvas, dpi int, text string, pt int, style walk.FontStyle
 	if text == "" || r.Width <= 0 || r.Height <= 0 {
 		return nil
 	}
-	cdpi := c.DPI()
-	return c.DrawTextPixels(text, font(max(1, (pt*dpi+cdpi/2)/cdpi), style), color, r, format)
+	return c.DrawTextPixels(text, textFont(pt, style, dpi, c.DPI()), color, r, format)
+}
+
+// textFont is the font drawText uses for pt points in a widget at dpi on a canvas that reports cdpi.
+func textFont(pt int, style walk.FontStyle, dpi, cdpi int) *walk.Font {
+	return font(max(1, (pt*dpi+cdpi/2)/cdpi), style)
 }
 
 // badgeWidth estimates the pill width from the digit count: measuring text on walk's buffered

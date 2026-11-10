@@ -28,6 +28,11 @@ const (
 	IconDoubleCheck
 	IconAdd
 	IconNewChat
+	IconCheck // single tick: sent
+	IconDocument
+	IconDownload
+	IconVideo
+	IconAudio
 )
 
 const (
@@ -103,6 +108,21 @@ var definitions = map[Icon][]op{
 		poly(12, 6.5, 12, 13.5),
 		poly(8.5, 10, 15.5, 10),
 	},
+	IconCheck: {poly(5, 12.5, 9.5, 17, 19, 7)},
+	IconDocument: {
+		poly(14, 3, 6, 3, 6, 21, 18, 21, 18, 7, 14, 3, 14, 7, 18, 7),
+		poly(9, 12.5, 15, 12.5),
+		poly(9, 16.5, 15, 16.5),
+	},
+	IconDownload: {poly(12, 4, 12, 15.5), poly(7.5, 11, 12, 15.5, 16.5, 11), poly(5, 20, 19, 20)},
+	IconVideo: {
+		poly(3, 6.5, 15, 6.5, 15, 17.5, 3, 17.5, 3, 6.5),
+		poly(15, 10.5, 21, 7, 21, 17, 15, 13.5),
+	},
+	IconAudio: {
+		ellipse(4, 14.5, 7, 6),
+		poly(11, 17.5, 11, 3.5, 18.5, 6.5, 18.5, 10, 11, 7),
+	},
 }
 
 func argb(c walk.Color) uint32 {
@@ -174,6 +194,52 @@ func Draw(c *walk.Canvas, id Icon, bounds walk.Rectangle, color walk.Color) erro
 // Fill paints an anti-aliased capsule in color filling bounds (pixels): a circle when bounds is
 // square, a pill along the longer side otherwise. For avatars, status dots, badges and scroll thumbs.
 func Fill(c *walk.Canvas, bounds walk.Rectangle, color walk.Color) error {
+	return withBrush(c, bounds, color, func(g, brush uintptr) error {
+		b := bounds
+		d := min(b.Width, b.Height)
+		rect := walk.Rectangle{X: b.X + d/2, Y: b.Y, Width: b.Width - d, Height: b.Height}
+		if b.Height > b.Width {
+			rect = walk.Rectangle{X: b.X, Y: b.Y + d/2, Width: b.Width, Height: b.Height - d}
+		}
+		if err := call(pFillEllipseI, g, brush, uintptr(b.X), uintptr(b.Y), uintptr(d), uintptr(d)); err != nil {
+			return err
+		}
+		if err := call(pFillEllipseI, g, brush, uintptr(b.X+b.Width-d), uintptr(b.Y+b.Height-d), uintptr(d), uintptr(d)); err != nil {
+			return err
+		}
+		return fillRect(g, brush, rect)
+	})
+}
+
+// FillRounded paints an anti-aliased rectangle in color filling bounds (pixels), its corners
+// rounded with radius r. For message bubbles and cards.
+func FillRounded(c *walk.Canvas, bounds walk.Rectangle, r int, color walk.Color) error {
+	return withBrush(c, bounds, color, func(g, brush uintptr) error {
+		b := bounds
+		r := max(1, min(r, b.Width/2, b.Height/2))
+		d := 2 * r
+		for _, p := range [][2]int{{b.X, b.Y}, {b.X + b.Width - d, b.Y}, {b.X, b.Y + b.Height - d}, {b.X + b.Width - d, b.Y + b.Height - d}} {
+			if err := call(pFillEllipseI, g, brush, uintptr(p[0]), uintptr(p[1]), uintptr(d), uintptr(d)); err != nil {
+				return err
+			}
+		}
+		if err := fillRect(g, brush, walk.Rectangle{X: b.X + r, Y: b.Y, Width: b.Width - d, Height: b.Height}); err != nil {
+			return err
+		}
+		return fillRect(g, brush, walk.Rectangle{X: b.X, Y: b.Y + r, Width: b.Width, Height: b.Height - d})
+	})
+}
+
+// fillRect fills r unless it is empty.
+func fillRect(g, brush uintptr, r walk.Rectangle) error {
+	if r.Width <= 0 || r.Height <= 0 {
+		return nil
+	}
+	return call(pFillRectangleI, g, brush, uintptr(r.X), uintptr(r.Y), uintptr(r.Width), uintptr(r.Height))
+}
+
+// withBrush runs fill with anti-aliased GDI+ graphics on c and a solid brush in color.
+func withBrush(c *walk.Canvas, bounds walk.Rectangle, color walk.Color, fill func(g, brush uintptr) error) error {
 	if bounds.Width <= 0 || bounds.Height <= 0 {
 		return fmt.Errorf("icons: empty bounds")
 	}
@@ -196,23 +262,7 @@ func Fill(c *walk.Canvas, bounds walk.Rectangle, color walk.Color) error {
 		return err
 	}
 	defer call(pDeleteBrush, brush)
-
-	b := bounds
-	d := min(b.Width, b.Height)
-	rect := walk.Rectangle{X: b.X + d/2, Y: b.Y, Width: b.Width - d, Height: b.Height}
-	if b.Height > b.Width {
-		rect = walk.Rectangle{X: b.X, Y: b.Y + d/2, Width: b.Width, Height: b.Height - d}
-	}
-	if err := call(pFillEllipseI, g, brush, uintptr(b.X), uintptr(b.Y), uintptr(d), uintptr(d)); err != nil {
-		return err
-	}
-	if err := call(pFillEllipseI, g, brush, uintptr(b.X+b.Width-d), uintptr(b.Y+b.Height-d), uintptr(d), uintptr(d)); err != nil {
-		return err
-	}
-	if rect.Width <= 0 || rect.Height <= 0 {
-		return nil
-	}
-	return call(pFillRectangleI, g, brush, uintptr(rect.X), uintptr(rect.Y), uintptr(rect.Width), uintptr(rect.Height))
+	return fill(g, brush)
 }
 
 // Bitmap returns a sizePx x sizePx bitmap of the icon on a transparent background.

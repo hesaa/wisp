@@ -15,7 +15,7 @@ func TestPalettesHaveValidHex(t *testing.T) {
 		for name, c := range map[string]string{
 			"ChatBg": p.ChatBg, "Rail": p.Rail, "Sidebar": p.Sidebar, "Header": p.Header,
 			"OutgoingBubble": p.OutgoingBubble, "IncomingBubble": p.IncomingBubble,
-			"Text": p.Text, "TextSecondary": p.TextSecondary, "Accent": p.Accent,
+			"Text": p.Text, "TextSecondary": p.TextSecondary, "Accent": p.Accent, "TickRead": p.TickRead,
 		} {
 			if !hexRe.MatchString(c) {
 				t.Errorf("mode %v %s = %q, not #rrggbb", mode, name, c)
@@ -34,6 +34,9 @@ func TestDarkAndLightValues(t *testing.T) {
 	if l.Rail != "#111b21" || l.Sidebar != "#ffffff" || l.ChatBg != "#efeae2" ||
 		l.Header != "#f0f2f5" || l.OutgoingBubble != "#d9fdd3" || l.IncomingBubble != "#ffffff" {
 		t.Errorf("light palette wrong: %+v", l)
+	}
+	if d.TickRead != "#53bdeb" || l.TickRead != "#53bdeb" {
+		t.Errorf("read tick colour: dark %q light %q, want #53bdeb", d.TickRead, l.TickRead)
 	}
 }
 

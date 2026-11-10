@@ -544,19 +544,17 @@ func noBorder(le *walk.LineEdit) error {
 // stop: Up/Down/PgUp/PgDn/Home/End move the focused row, Enter or Space open it like a click.
 type chatList struct {
 	*walk.CustomWidget
+	vscroll
 	pal      *theme.Palette
 	name     string // accessible name
 	rows     []store.Chat
 	selected string
 	focus    string // JID of the keyboard-focused row, so it survives reordering
-	offset   int    // scroll position, pixels
-	dragY    int    // mouse y where a thumb drag started; -1 when not dragging
-	dragFrom int    // offset when the drag started
 	onClick  func(jid string)
 }
 
 func newChatList(parent walk.Container, pal *theme.Palette, name string) (*chatList, error) {
-	l := &chatList{pal: pal, name: name, dragY: -1}
+	l := &chatList{pal: pal, name: name}
 	cw, err := newCanvas(parent, l.paint)
 	if err != nil {
 		return nil, err
@@ -571,11 +569,7 @@ func newChatList(parent walk.Container, pal *theme.Palette, name string) (*chatL
 		}
 	})
 	cw.MouseDown().Attach(l.mouseDown)
-	cw.MouseMove().Attach(l.mouseMove)
-	cw.MouseUp().Attach(func(int, int, walk.MouseButton) { l.dragY = -1 })
-	cw.MouseWheel().Attach(func(_, _ int, b walk.MouseButton) {
-		l.scrollTo(l.offset - walk.MouseWheelEventDelta(b)*l.rowH()*3/2/120)
-	})
+	l.attach(cw, func() int { return len(l.rows) * l.rowH() }, func() int { return l.rowH() * 3 / 2 })
 	return l, nil
 }
 
@@ -588,7 +582,7 @@ func (l *chatList) focusIndex() int {
 	return slices.IndexFunc(l.rows, func(c store.Chat) bool { return c.JID == l.focus })
 }
 
-func (l *chatList) span() span { return span{off: l.offset, size: l.rowH(), n: len(l.rows)} }
+func (l *chatList) span() span { return span{off: l.off, size: l.rowH(), n: len(l.rows)} }
 
 // setFocus moves the keyboard focus to row i, without scrolling.
 func (l *chatList) setFocus(i int) {
@@ -606,7 +600,7 @@ func (l *chatList) setFocus(i int) {
 func (l *chatList) focusRow(i int) {
 	l.setFocus(i)
 	rowH := l.rowH()
-	l.scrollTo(scrollIntoView(l.offset, i*rowH, rowH, l.ClientBoundsPixels().Height))
+	l.scrollTo(scrollIntoView(l.off, i*rowH, rowH, l.ClientBoundsPixels().Height))
 }
 
 func (l *chatList) open(i int) {
@@ -651,56 +645,21 @@ func searchKeys(edit *walk.LineEdit, l *chatList) {
 	})
 }
 
-func (l *chatList) clamp(off int) int {
-	return max(0, min(off, len(l.rows)*l.rowH()-l.ClientBoundsPixels().Height))
-}
-
-func (l *chatList) scrollTo(off int) {
-	if off = l.clamp(off); off != l.offset {
-		l.offset = off
-		logErr("chat list repaint", l.Invalidate())
-	}
-}
-
 // setRows shows rows (top: from the first row) with selected highlighted.
 func (l *chatList) setRows(rows []store.Chat, selected string, top bool) {
 	l.rows, l.selected = rows, selected
 	if top {
-		l.offset = 0
+		l.off = 0
 	}
-	l.offset = l.clamp(l.offset)
+	l.off = l.clamp(l.off)
 	logErr("chat list repaint", l.Invalidate())
-}
-
-// thumb is the scroll thumb, a zero rectangle when every row fits.
-func (l *chatList) thumb() walk.Rectangle {
-	b := l.ClientBoundsPixels()
-	total := len(l.rows) * l.rowH()
-	if total <= b.Height {
-		return walk.Rectangle{}
-	}
-	th := max(l.IntFrom96DPI(32), b.Height*b.Height/total)
-	return walk.Rectangle{X: b.Width - l.IntFrom96DPI(8), Y: l.offset * (b.Height - th) / (total - b.Height), Width: l.IntFrom96DPI(5), Height: th}
-}
-
-// thumbToOffset converts a thumb movement to a scroll movement.
-func (l *chatList) thumbToOffset(dy int) int {
-	h, th := l.ClientBoundsPixels().Height, l.thumb().Height
-	if h <= th {
-		return 0
-	}
-	return dy * (len(l.rows)*l.rowH() - h) / (h - th)
 }
 
 func (l *chatList) mouseDown(x, y int, b walk.MouseButton) {
 	if b != walk.LeftButton {
 		return
 	}
-	if t := l.thumb(); t.Height > 0 && x >= t.X-l.IntFrom96DPI(4) {
-		if y < t.Y || y >= t.Y+t.Height { // track click: centre the thumb there
-			l.scrollTo(l.offset + l.thumbToOffset(y-t.Y-t.Height/2))
-		}
-		l.dragY, l.dragFrom = y, l.offset
+	if l.press(x, y) {
 		return
 	}
 	// resolve the row against the offset the user saw, then take focus, then open it
@@ -714,15 +673,9 @@ func (l *chatList) mouseDown(x, y int, b walk.MouseButton) {
 	}
 }
 
-func (l *chatList) mouseMove(_, y int, b walk.MouseButton) {
-	if l.dragY >= 0 && b&walk.LeftButton != 0 {
-		l.scrollTo(l.dragFrom + l.thumbToOffset(y-l.dragY))
-	}
-}
-
 func (l *chatList) paint(c *walk.Canvas, ub walk.Rectangle) error {
 	p, b, rowH := l.pal, l.ClientBoundsPixels(), l.rowH()
-	l.offset = l.clamp(l.offset)
+	l.off = l.clamp(l.off)
 	bg, err := brushFor(p.Sidebar)
 	if err != nil {
 		return err
@@ -731,9 +684,9 @@ func (l *chatList) paint(c *walk.Canvas, ub walk.Rectangle) error {
 		return err
 	}
 	now, focused := time.Now(), focusCues(l)
-	last := min(len(l.rows), (ub.Y+ub.Height+l.offset+rowH-1)/rowH)
-	for i := max(0, (ub.Y+l.offset)/rowH); i < last; i++ {
-		r := walk.Rectangle{Y: i*rowH - l.offset, Width: b.Width, Height: rowH}
+	last := min(len(l.rows), (ub.Y+ub.Height+l.off+rowH-1)/rowH)
+	for i := max(0, (ub.Y+l.off)/rowH); i < last; i++ {
+		r := walk.Rectangle{Y: i*rowH - l.off, Width: b.Width, Height: rowH}
 		if err := l.paintRow(c, l.rows[i], r, now); err != nil {
 			return err
 		}
