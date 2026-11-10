@@ -19,9 +19,12 @@ type Tray struct {
 	hwnd    win.HWND
 	appName string
 	base    walk.Image
-	badged  *walk.Icon // current generated icon (nil when plain); owned by Tray
-	count   int
-	d       *Dispatcher
+	// Lazily built badge icons, index 1-9 = count, 10 = "9+". Never disposed before Dispose():
+	// walk's icon cache keeps every Icon handed to SetIcon (and any per-DPI copy), so a fixed
+	// set bounds that growth.
+	badges [10 + 1]*walk.Icon
+	count  int
+	d      *Dispatcher
 }
 
 // NewTray creates a visible tray icon. onOpen restores the window (left click or menu "Open"),
@@ -90,34 +93,33 @@ func (t *Tray) SetUnread(n int) error {
 	if n > 0 {
 		tip += " - " + strconv.Itoa(n) + " unread"
 	}
-	var next *walk.Icon
 	img := t.base
 	if n > 0 {
-		var err error
-		if next, err = badgedIcon(t.base, badgeLabel(n)); err != nil {
-			return err
+		i := min(n, 10)
+		if t.badges[i] == nil {
+			ic, err := badgedIcon(t.base, badgeLabel(n))
+			if err != nil {
+				return err
+			}
+			t.badges[i] = ic
 		}
-		img = next
+		img = t.badges[i]
 	}
 	if err := t.ni.SetIcon(img); err != nil {
-		if next != nil {
-			next.Dispose()
-		}
 		return err
 	}
-	if t.badged != nil {
-		t.badged.Dispose()
-	}
-	t.badged, t.count = next, n
+	t.count = n
 	return t.ni.SetToolTip(tip)
 }
 
-// Dispose removes the tray icon and frees generated icons.
+// Dispose removes the tray icon and frees all generated icons.
 func (t *Tray) Dispose() error {
 	err := t.ni.Dispose()
-	if t.badged != nil {
-		t.badged.Dispose()
-		t.badged = nil
+	for i, ic := range t.badges {
+		if ic != nil {
+			ic.Dispose()
+			t.badges[i] = nil
+		}
 	}
 	return err
 }
