@@ -44,6 +44,8 @@ const (
 func f32(v float32) uintptr { return uintptr(math.Float32bits(v)) }
 
 // call invokes a GDI+ proc and converts a non-zero Status into an error.
+//
+//go:uintptrescapes
 func call(p *windows.LazyProc, args ...uintptr) error {
 	r, _, _ := p.Call(args...)
 	if r != 0 {
