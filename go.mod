@@ -5,6 +5,7 @@ go 1.26.0
 require (
 	github.com/lxn/walk v0.0.0-20210112085537-c389da54e794
 	go.mau.fi/whatsmeow v0.0.0-20261109152745-f1b798561919
+	golang.org/x/image v0.12.0
 	golang.org/x/sys v0.49.0
 	modernc.org/sqlite v1.62.0
 )
@@ -33,7 +34,6 @@ require (
 	go.mau.fi/libsignal v0.2.2 // indirect
 	go.mau.fi/util v0.11.0 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
-	golang.org/x/image v0.12.0 // indirect
 	golang.org/x/net v0.61.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
