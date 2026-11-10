@@ -56,8 +56,10 @@ func (a *App) onMessage(m store.Message) {
 	}
 	if r.sidebar && a.side.Model().ApplyMessage(m) {
 		a.v.unread[m.AccountID] = a.side.Model().Unread()
+		a.v.listChanged(m.AccountID)
 	} else if r.unread {
 		a.v.unread[m.AccountID]++
+		a.v.listChanged(m.AccountID)
 	}
 	a.showUnread()
 	if r.notify {
@@ -151,12 +153,19 @@ func (a *App) accountChanged(acct string) {
 	}
 }
 
-// loadChats reads acct's chat list off the UI thread: its unread total, and the sidebar and stories
-// when it is the active account.
+// loadChats reloads acct's chat list, and its stories when it is the active account.
 func (a *App) loadChats(acct string) {
 	if acct == a.v.active {
 		a.loadStories(acct)
 	}
+	a.reloadList(acct)
+}
+
+// reloadList reads acct's chat list off the UI thread: its unread total, and the sidebar when it is
+// the active account. A list that may be older than what the screen shows is dropped and read again
+// (see view.reloadArrived).
+func (a *App) reloadList(acct string) {
+	seq := a.v.reloadStarted(acct)
 	go func() {
 		chats, err := a.db.ListChats(acct)
 		a.mw.Synchronize(func() {
@@ -166,6 +175,13 @@ func (a *App) loadChats(acct string) {
 			}
 			if !slices.Contains(a.rail.Model().Accounts(), acct) {
 				return // logged out meanwhile
+			}
+			apply, again := a.v.reloadArrived(acct, seq)
+			if again {
+				a.reloadList(acct)
+			}
+			if !apply {
+				return
 			}
 			n := 0
 			for _, c := range chats {

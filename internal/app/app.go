@@ -10,7 +10,6 @@ import (
 	"context"
 	"errors"
 	"log"
-	"slices"
 	"time"
 
 	"github.com/lxn/walk"
@@ -50,6 +49,7 @@ var _ Backend = (*whatsapp.Manager)(nil)
 const (
 	netTimeout   = 30 * time.Second // receipts, presence, typing, contacts, text
 	mediaTimeout = 5 * time.Minute  // uploads and downloads
+	exitTimeout  = 3 * time.Second  // the last unavailable broadcast at Exit
 )
 
 // globalKeys are the app-global settings kept in memory (account "" of the settings table).
@@ -65,8 +65,10 @@ type App struct {
 	cfg      map[string]string // globalKeys as last saved
 	pal      theme.Palette
 	presence presenceState
-	signals  chan func() // presence and typing, sent one at a time in order, off the UI thread
-	sent     chan struct{}
+	outbox   *presenceBox                     // the presence to broadcast next, never dropped
+	typingQ  chan func(context.Context) error // typing updates, sent one at a time in order
+	bg       context.Context                  // ends at Exit: queued typing is skipped, calls under way stop
+	stopBG   context.CancelFunc
 
 	mw    *walk.MainWindow
 	icon  *walk.Icon
@@ -181,13 +183,10 @@ func (a *App) Attach(mgr Backend) {
 	a.mgr = mgr
 	logErr("proxy", mgr.SetProxy(a.cfg[ui.KeyProxy])) // ValidateProxy errors never repeat the address
 	mgr.AddListener(a.listen)
-	a.signals, a.sent = make(chan func(), 64), make(chan struct{})
-	go func() {
-		for f := range a.signals {
-			f()
-		}
-		close(a.sent)
-	}()
+	a.bg, a.stopBG = context.WithCancel(context.Background())
+	a.outbox, a.typingQ = newPresenceBox(), make(chan func(context.Context) error, 64)
+	go a.presenceWorker()
+	go a.typingWorker()
 	go func() {
 		err := mgr.Start(context.Background())
 		a.mw.Synchronize(func() {
@@ -215,9 +214,8 @@ func (a *App) Run() error {
 	if a.tray != nil { // the loop ended some other way than Exit
 		logErr("tray", a.tray.Dispose())
 	}
-	close(a.signals)
-	<-a.sent
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	a.stopBG() // queued typing is skipped; a broadcast under way stops, so it cannot land after this one
+	ctx, cancel := context.WithTimeout(context.Background(), exitTimeout)
 	logErr("presence", a.mgr.SetPresenceAll(ctx, types.PresenceUnavailable))
 	cancel()
 	logErr("disconnect", a.mgr.Close())
@@ -276,23 +274,52 @@ func (a *App) foreground() bool {
 }
 
 // sendPresence broadcasts the presence the window's state calls for (see presenceState.next).
+// Accounts not connected yet fail (logged); a reconnect broadcasts again.
 func (a *App) sendPresence(force bool) {
-	p, send := a.presence.next(a.mw.Visible(), a.cfg[ui.KeyAppearOffline] == "true", force)
-	if send && slices.ContainsFunc(a.rail.Model().Accounts(), a.rail.Model().Connected) { // a reconnect says it again
-		a.signal("presence", func(ctx context.Context) error { return a.mgr.SetPresenceAll(ctx, p) })
+	if p, send := a.presence.next(a.mw.Visible(), a.cfg[ui.KeyAppearOffline] == "true", force); send {
+		a.outbox.put(p)
 	}
 }
 
-// signal queues f behind the presence and typing updates already queued.
-func (a *App) signal(what string, f func(ctx context.Context) error) {
+// presenceWorker broadcasts the latest presence put in the outbox, one broadcast at a time.
+func (a *App) presenceWorker() {
+	for {
+		select {
+		case <-a.bg.Done():
+			return
+		case <-a.outbox.wake:
+			if p, ok := a.outbox.take(); ok && a.bg.Err() == nil {
+				ctx, cancel := context.WithTimeout(a.bg, netTimeout)
+				logErr("presence", a.mgr.SetPresenceAll(ctx, p))
+				cancel()
+			}
+		}
+	}
+}
+
+// queueTyping queues a typing update behind the ones waiting; one lost when 64 wait does no harm
+// (WhatsApp ends a typing indicator by itself).
+func (a *App) queueTyping(f func(ctx context.Context) error) {
 	select {
-	case a.signals <- func() {
-		ctx, cancel := context.WithTimeout(context.Background(), netTimeout)
-		defer cancel()
-		logErr(what, f(ctx))
-	}:
+	case a.typingQ <- f:
 	default:
-		log.Printf("app: %s dropped: too many updates waiting", what)
+		log.Printf("app: typing update dropped: too many waiting")
+	}
+}
+
+func (a *App) typingWorker() {
+	for {
+		select {
+		case <-a.bg.Done():
+			return
+		case f := <-a.typingQ:
+			if a.bg.Err() != nil {
+				return // Exit: what is still queued is skipped
+			}
+			ctx, cancel := context.WithTimeout(a.bg, netTimeout)
+			logErr("typing", f(ctx))
+			cancel()
+		}
 	}
 }
 

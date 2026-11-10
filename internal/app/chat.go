@@ -41,18 +41,17 @@ func (a *App) openChat(acct, jid, name string) {
 		name = a.chatName(acct, jid)
 	}
 	a.bar.Reset() // before the switch: it may still tell the chat being left that typing stopped
-	a.v.openChat(c)
+	gen := a.v.openChat(c)
 	a.showChatPane(true)
 	logErr("focus", a.bar.SetFocus())
 	go func() {
 		page, err := a.db.GetChatMessages(acct, jid, 0)
 		a.mw.Synchronize(func() {
-			if a.v.open != c {
-				return // another chat was opened meanwhile
+			if !a.v.firstPageShown(gen) {
+				return // another chat, or this one again, was opened meanwhile
 			}
 			logErr("open chat", err) // shown empty then
 			a.chat.SetChat(acct, jid, name, isGroup(jid), page)
-			a.v.loaded = true
 			for _, m := range a.v.pending {
 				a.chat.Upsert(m)
 			}
@@ -62,17 +61,19 @@ func (a *App) openChat(acct, jid, name string) {
 	}()
 }
 
-// loadPrevious answers the chat view's request for the open chat's next older page.
+// loadPrevious answers the chat view's request for the open chat's next older page. A request the
+// view makes while it still shows the chat before is not answered: SetChat resets it.
 func (a *App) loadPrevious() {
-	c := a.v.open
-	if c.jid == "" {
+	c, page, gen, ok := a.v.nextPage()
+	if !ok {
 		return
 	}
-	a.v.page++
-	page := a.v.page
 	go func() {
 		msgs, err := a.db.GetChatMessages(c.acct, c.jid, page)
 		a.mw.Synchronize(func() {
+			if !a.v.current(gen) {
+				return // the chat was closed or opened again meanwhile
+			}
 			logErr("older messages", err) // answered as the end of the history: no retry loop
 			if len(msgs) == 0 {
 				a.chat.NoMoreHistory(c.acct, c.jid)
@@ -86,6 +87,7 @@ func (a *App) loadPrevious() {
 // markChatRead marks c read: on screen at once, then in the store, then on WhatsApp for its newest
 // unread messages unless the account's read receipts are off.
 func (a *App) markChatRead(c chatRef) {
+	a.v.writeStarted(c.acct) // until it is stored, a reloaded chat list would bring the badge back
 	if a.side.Model().Account() == c.acct {
 		a.side.Model().MarkRead(c.jid)
 		a.v.unread[c.acct] = a.side.Model().Unread()
@@ -97,6 +99,7 @@ func (a *App) markChatRead(c chatRef) {
 		if err == nil {
 			err = a.db.MarkChatRead(c.acct, c.jid)
 		}
+		a.writeDone(c.acct)
 		if err != nil {
 			logErr("mark read", err)
 			return
@@ -108,13 +111,26 @@ func (a *App) markChatRead(c chatRef) {
 // markMessageRead marks one message read (a message arriving in the chat being looked at, or a
 // status that was viewed), with a read receipt unless the account's are off.
 func (a *App) markMessageRead(m store.Message) {
+	a.v.writeStarted(m.AccountID)
 	go func() {
-		if err := a.db.UpdateMessageStatus(m.AccountID, m.ChatJID, []string{m.ID}, store.StatusRead); err != nil {
+		err := a.db.UpdateMessageStatus(m.AccountID, m.ChatJID, []string{m.ID}, store.StatusRead)
+		a.writeDone(m.AccountID)
+		if err != nil {
 			logErr("mark read", err)
 			return
 		}
 		a.sendReceipts(m.AccountID, []store.Message{m})
 	}()
+}
+
+// writeDone tells the UI thread a mark-read write of acct ended (off the UI thread); a chat list
+// reload dropped meanwhile runs now.
+func (a *App) writeDone(acct string) {
+	a.mw.Synchronize(func() {
+		if a.v.writeDone(acct) {
+			a.reloadList(acct)
+		}
+	})
 }
 
 // sendReceipts sends read receipts for msgs of acct unless acct's read receipts are off; when that
@@ -224,7 +240,7 @@ func (a *App) typing(composing bool) {
 	if c.jid == "" || !typingOn(a.cfg[ui.KeyGhostTyping]) {
 		return
 	}
-	a.signal("typing", func(ctx context.Context) error { return a.mgr.SetTyping(ctx, c.acct, c.jid, composing) })
+	a.queueTyping(func(ctx context.Context) error { return a.mgr.SetTyping(ctx, c.acct, c.jid, composing) })
 }
 
 // newChat fetches the active account's contacts off the UI thread, then shows the New Chat picker.

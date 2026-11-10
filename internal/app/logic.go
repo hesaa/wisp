@@ -1,12 +1,14 @@
 package app
 
 import (
+	"sync"
+
 	"go.mau.fi/whatsmeow/types"
 
 	"wa-go/internal/store"
 )
 
-// The window-free rules of the wiring, tested on their own. UI thread only.
+// The window-free rules of the wiring, tested on their own. UI thread only, except presenceBox.
 
 const statusBroadcast = "status@broadcast" // stories: never a chat
 
@@ -123,22 +125,138 @@ func (f inflight) done(k mediaKey) { delete(f, k) }
 type view struct {
 	active   string
 	open     chatRef         // zero while no chat is open
+	gen      int             // per opening of a chat: answers for an earlier opening are dropped
 	page     int             // the open chat's last page asked for
 	loaded   bool            // the chat view shows open: its first page arrived
 	pending  []store.Message // messages of open that arrived before its first page
 	openNext chatRef         // open this chat once its account's chats load (a toast of another account)
 	unread   map[string]int
+	lists    map[string]*listState // per account; see reloadArrived
 }
 
-// switchAccount makes acct active; the chat pane empties.
-func (v *view) switchAccount(acct string) {
+// switchAccount makes acct active; the chat pane empties. It returns the new opening (of no chat).
+func (v *view) switchAccount(acct string) int {
 	v.active = acct
-	v.openChat(chatRef{})
+	return v.openChat(chatRef{})
 }
 
-// openChat makes c the open chat (zero: none), not yet loaded.
-func (v *view) openChat(c chatRef) {
+// openChat makes c the open chat (zero: none), not yet loaded, and returns the generation that names
+// this opening.
+func (v *view) openChat(c chatRef) int {
+	v.gen++
 	v.open, v.page, v.loaded, v.pending = c, 0, false, nil
+	return v.gen
+}
+
+// current reports whether gen is still the open chat's opening.
+func (v *view) current(gen int) bool { return gen == v.gen }
+
+// firstPageShown records that the first page of opening gen is shown; false (nothing changes) for an
+// earlier opening.
+func (v *view) firstPageShown(gen int) bool {
+	if !v.current(gen) {
+		return false
+	}
+	v.loaded = true
+	return true
+}
+
+// nextPage returns the open chat, the next older page to load and its opening; ok is false while
+// no chat is shown, or while the chat view still shows the chat before (its first page is loading).
+func (v *view) nextPage() (c chatRef, page, gen int, ok bool) {
+	if v.open.jid == "" || !v.loaded {
+		return chatRef{}, 0, 0, false
+	}
+	v.page++
+	return v.open, v.page, v.gen, true
+}
+
+// listState tracks what a reloaded chat list of one account may have missed.
+type listState struct {
+	seq     int  // changes made on screen, and store writes started or ended
+	writing int  // store writes under way (mark read) that a reload may not see yet
+	again   bool // a reload was dropped while writing: ask again once the writes are done
+}
+
+func (v *view) list(acct string) *listState {
+	if v.lists == nil {
+		v.lists = map[string]*listState{}
+	}
+	if v.lists[acct] == nil {
+		v.lists[acct] = &listState{}
+	}
+	return v.lists[acct]
+}
+
+// listChanged records an on-screen change to acct's chat list or unread total (a message folded in).
+func (v *view) listChanged(acct string) { v.list(acct).seq++ }
+
+// reloadStarted returns the mark a reload of acct's chat list hands back to reloadArrived.
+func (v *view) reloadStarted(acct string) int { return v.list(acct).seq }
+
+// writeStarted records a store write (mark read) of acct whose effect is already on screen.
+func (v *view) writeStarted(acct string) {
+	l := v.list(acct)
+	l.writing++
+	l.seq++
+}
+
+// writeDone records the end of a store write of acct and reports whether to reload its chat list now
+// (a reload was dropped while it ran).
+func (v *view) writeDone(acct string) bool {
+	l := v.list(acct)
+	l.writing--
+	l.seq++ // a reload under way may have read the store before the write
+	if l.writing > 0 || !l.again {
+		return false
+	}
+	l.again = false
+	return true
+}
+
+// reloadArrived decides on a chat list of acct read from the store since reloadStarted gave seq: it
+// is applied only when nothing changed on screen since and no write it may have missed is under way,
+// so a stale list never undoes newer changes. A dropped list is asked for again: at once (again), or
+// after the writes under way (writeDone).
+func (v *view) reloadArrived(acct string, seq int) (apply, again bool) {
+	l := v.list(acct)
+	switch {
+	case l.writing > 0:
+		l.again = true
+		return false, false
+	case l.seq != seq:
+		return false, true
+	}
+	return true, false
+}
+
+// presenceBox holds the presence waiting to be broadcast: a newer one replaces it, none is ever
+// dropped, and wake (one slot) says there is one.
+type presenceBox struct {
+	mu   sync.Mutex
+	p    types.Presence // "" when none waits
+	wake chan struct{}
+}
+
+func newPresenceBox() *presenceBox { return &presenceBox{wake: make(chan struct{}, 1)} }
+
+func (b *presenceBox) put(p types.Presence) {
+	b.mu.Lock()
+	b.p = p
+	b.mu.Unlock()
+	select {
+	case b.wake <- struct{}{}:
+	default: // a wake-up is already pending
+	}
+}
+
+// take returns the waiting presence, once.
+func (b *presenceBox) take() (types.Presence, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	p := b.p
+	b.p = ""
+	return p, p != ""
 }
 
 // takeOpenNext returns, once, the chat queued to open in acct.
