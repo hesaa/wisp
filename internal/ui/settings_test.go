@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -39,12 +40,24 @@ type fakePrivacy struct {
 	calls  []privacyCall
 	timers []timerCall
 	server map[string]types.PrivacySettings
-	fail   error // every call fails with it
+	fail   error         // every call fails with it
+	gate   chan struct{} // when set, SetPrivacySetting waits for it to close (a slow network)
 }
 
 func (f *fakePrivacy) SetPrivacySetting(_ context.Context, account string, name types.PrivacySettingType, value types.PrivacySetting) (types.PrivacySettings, error) {
+	if f.gate != nil {
+		<-f.gate
+	}
 	f.calls = append(f.calls, privacyCall{account, name, value})
-	return f.server[account], f.fail
+	if f.fail != nil {
+		return types.PrivacySettings{}, f.fail
+	}
+	ps := f.server[account]
+	if name == types.PrivacySettingTypeLastSeen {
+		ps.LastSeen = value
+	}
+	f.server[account] = ps
+	return ps, nil
 }
 
 func (f *fakePrivacy) PrivacySettings(_ context.Context, account string) (types.PrivacySettings, error) {
@@ -74,14 +87,22 @@ func newSettingsHarness(t *testing.T) *settingsHarness {
 	}
 	t.Cleanup(func() { db.Close() })
 	h := &settingsHarness{db: db, wa: &fakePrivacy{server: map[string]types.PrivacySettings{}}}
-	h.ctl = &settingsCtl{
-		store:     db,
+	h.ctl = h.dialog(&settingsShared{}, func(work func() error, done func(error)) { done(work()) }, func() bool { return false })
+	return h
+}
+
+// dialog is the controller of one Settings dialog over h's store and WhatsApp; closed reports
+// whether that dialog has closed.
+func (h *settingsHarness) dialog(shared *settingsShared, bg func(func() error, func(error)), closed func() bool) *settingsCtl {
+	return &settingsCtl{
+		store:     h.db,
 		wa:        h.wa,
-		bg:        func(work func() error, done func(error)) { done(work()) },
+		bg:        bg,
 		onTheme:   func(m theme.ThemeMode) { h.themes = append(h.themes, m) },
 		onChanged: func(key string) { h.changed = append(h.changed, key) },
+		shared:    shared,
+		closed:    closed,
 	}
-	return h
 }
 
 func (h *settingsHarness) privacy(account, key, value string) error {
@@ -365,5 +386,81 @@ func TestSerialRunsJobsOneAtATimeInOrder(t *testing.T) {
 	}
 	if len(got) != 100 {
 		t.Fatalf("%d of 100 jobs ran", len(got))
+	}
+}
+
+func TestADialogOpenedDuringASaveLoadsItsOutcome(t *testing.T) {
+	h := newSettingsHarness(t)
+	h.wa.server[acctA] = types.PrivacySettings{LastSeen: types.PrivacySettingAll}
+	if err := h.db.SetSetting(acctA, KeyLastSeen, "all"); err != nil {
+		t.Fatal(err)
+	}
+	h.wa.gate = make(chan struct{})
+	var shared settingsShared
+	bg := onWorker(&shared.jobs, func(f func()) { f() }) // done runs on the worker here
+	var closed atomic.Bool
+	first := h.dialog(&shared, bg, closed.Load)
+	saved := make(chan error, 1)
+	first.setPrivacy(acctA, KeyLastSeen, "none", func(err error) { saved <- err })
+	closed.Store(true) // closed while WhatsApp has not answered yet
+
+	second := h.dialog(&shared, bg, func() bool { return false })
+	loaded := make(chan map[string]string, 2)
+	second.refresh(acctA, func(v map[string]string, err error) {
+		if err != nil {
+			t.Error(err)
+		}
+		loaded <- v
+	})
+	select {
+	case <-loaded:
+		t.Fatal("the new dialog loaded before the earlier save finished")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(h.wa.gate)
+	if err := <-saved; err != nil {
+		t.Fatal(err)
+	}
+	if v := <-loaded; v[KeyLastSeen] != "none" {
+		t.Fatalf("new dialog shows last seen %q, WhatsApp has none", v[KeyLastSeen])
+	}
+	if v := h.stored(t, acctA, KeyLastSeen); v != "none" {
+		t.Fatalf("table %q, WhatsApp has none", v)
+	}
+	if m := second.takeMissed(); m != "" {
+		t.Fatalf("a save that worked was reported: %q", m)
+	}
+}
+
+func TestASaveThatFailsAfterItsDialogClosedIsKeptForTheNextOne(t *testing.T) {
+	h := newSettingsHarness(t)
+	shared := &settingsShared{}
+	inline := func(work func() error, done func(error)) { done(work()) }
+	h.wa.fail = errors.New("not connected")
+
+	open := h.dialog(shared, inline, func() bool { return false })
+	got := errNotDone
+	open.setPrivacy(acctA, KeyLastSeen, "none", func(err error) { got = err })
+	if got == nil || shared.missed != "" {
+		t.Fatalf("a failure its open dialog showed was kept: %q (%v)", shared.missed, got)
+	}
+
+	closed := h.dialog(shared, inline, func() bool { return true })
+	closed.setPrivacy(acctA, KeyProfilePhoto, "contacts", func(error) {})
+	next := h.dialog(shared, inline, func() bool { return false })
+	m := next.takeMissed()
+	for _, want := range []string{"+" + acctA, "Profile photo", "not connected"} {
+		if !strings.Contains(m, want) {
+			t.Fatalf("kept failure %q lacks %q", m, want)
+		}
+	}
+	if again := next.takeMissed(); again != "" {
+		t.Fatalf("reported twice: %q", again)
+	}
+
+	h.db.Close() // app-global saves too
+	closed.setGlobal(KeyNotify, "false", func(error) {})
+	if m := next.takeMissed(); !strings.Contains(m, "Notifications") {
+		t.Fatalf("kept failure %q", m)
 	}
 }

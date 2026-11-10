@@ -70,7 +70,8 @@ func RunSettings(owner walk.Form, p theme.Palette, deps SettingsDeps) error {
 	}
 	d := &settingsDialog{Dialog: dlg, kit: &kit{pal: p}, owner: owner, deps: deps,
 		vals: map[string]string{}, privacy: map[string]valueWidget{}, globals: map[string]valueWidget{}}
-	d.ctl = &settingsCtl{store: deps.Store, wa: deps.Manager, bg: d.background, onTheme: d.themeChanged,
+	d.ctl = &settingsCtl{store: deps.Store, wa: deps.Manager, bg: onWorker(&settingsState.jobs, owner.Synchronize),
+		onTheme: d.themeChanged, shared: &settingsState, closed: func() bool { return d.closed },
 		onChanged: func(key string) {
 			if deps.OnSettingsChanged != nil {
 				deps.OnSettingsChanged(key)
@@ -89,6 +90,10 @@ func RunSettings(owner walk.Form, p theme.Palette, deps SettingsDeps) error {
 	return nil
 }
 
+// settingsState is shared by every Settings dialog: a dialog reopened while a change made in the
+// last one is still being saved queues behind it and shows its outcome.
+var settingsState settingsShared
+
 // settingsDialog is the open Settings dialog. UI-thread only.
 type settingsDialog struct {
 	*walk.Dialog
@@ -96,7 +101,6 @@ type settingsDialog struct {
 	owner      walk.Form // its Synchronize outlives the dialog, for answers arriving after it closed
 	deps       SettingsDeps
 	ctl        *settingsCtl
-	jobs       serial
 	closed     bool                   // answers arriving now only reach the callbacks
 	addAccount bool                   // closed by Add account
 	account    string                 // the Privacy section's account
@@ -209,10 +213,10 @@ func (d *settingsDialog) buildPrivacy(pg *walk.Composite) error {
 	if err != nil {
 		return err
 	}
-	d.bind(secPrivacy, KeyLastSeen, "Last seen", lastSeen)
-	d.bind(secPrivacy, KeyProfilePhoto, "Profile photo", photo)
-	d.bind(secPrivacy, KeyReadReceipts, "Read receipts", receipts)
-	d.bind(secPrivacy, KeyDisappearing, "Default message timer", timer)
+	d.bind(secPrivacy, KeyLastSeen, lastSeen)
+	d.bind(secPrivacy, KeyProfilePhoto, photo)
+	d.bind(secPrivacy, KeyReadReceipts, receipts)
+	d.bind(secPrivacy, KeyDisappearing, timer)
 	return nil
 }
 
@@ -225,8 +229,8 @@ func (d *settingsDialog) buildChats(pg *walk.Composite) error {
 	if err != nil {
 		return err
 	}
-	d.bind(secChats, KeyGhostTyping, "Ghost typing", ghost)
-	d.bind(secChats, KeyAppearOffline, "Appear offline", offline)
+	d.bind(secChats, KeyGhostTyping, ghost)
+	d.bind(secChats, KeyAppearOffline, offline)
 	_, err = d.newLabel(pg, "These apply to this PC only; your phone is unaffected.", 9, 0, toneSecondary, 20)
 	return err
 }
@@ -236,7 +240,7 @@ func (d *settingsDialog) buildMedia(pg *walk.Composite) error {
 	if err != nil {
 		return err
 	}
-	d.bind(secMedia, KeyAutoDownloadImages, "Auto-download images", auto)
+	d.bind(secMedia, KeyAutoDownloadImages, auto)
 	row, err := d.newRow(pg, fieldH)
 	if err != nil {
 		return err
@@ -317,18 +321,19 @@ func (d *settingsDialog) buildNotify(pg *walk.Composite) error {
 		if err != nil {
 			return err
 		}
-		d.bind(secNotify, t.key, t.name, w)
+		d.bind(secNotify, t.key, w)
 	}
 	th, err := d.newChoice(pg, "Theme", themeOptions)
 	if err != nil {
 		return err
 	}
-	d.bind(secNotify, KeyTheme, "Theme", th)
+	d.bind(secNotify, KeyTheme, th)
 	return nil
 }
 
-// bind saves w's changes to key, a per-account or an app-global setting; name is its label.
-func (d *settingsDialog) bind(sec int, key, name string, w valueWidget) {
+// bind saves w's changes to key, a per-account or an app-global setting.
+func (d *settingsDialog) bind(sec int, key string, w valueWidget) {
+	name := settingNames[key]
 	if _, ok := privacyKeys[key]; ok {
 		d.privacy[key] = w
 		w.listen(func(v string) { d.savePrivacy(key, name, v) })
@@ -353,16 +358,6 @@ func (d *settingsDialog) show(i int) {
 
 // say puts text on section sec's status line.
 func (d *settingsDialog) say(sec int, text string, tone int) { d.notes[sec].set(text, tone) }
-
-// background runs work on the dialog's worker, one job at a time in call order (so a refresh and a
-// change made meanwhile reach WhatsApp and the table in the order they were made), then done on the
-// UI thread. Jobs still queued when the dialog closes run to the end.
-func (d *settingsDialog) background(work func() error, done func(error)) {
-	d.jobs.do(func() {
-		err := work()
-		d.owner.Synchronize(func() { done(err) })
-	})
-}
 
 // loadGlobals shows the saved app-global values; their controls ignore input until then.
 func (d *settingsDialog) loadGlobals() {
@@ -398,6 +393,11 @@ func (d *settingsDialog) loadPrivacy() {
 	d.gen++
 	gen, id := d.gen, d.account
 	if id == "" {
+		d.ctl.bg(func() error { return nil }, func(error) { // after the changes queued before it
+			if m := d.ctl.takeMissed(); m != "" && !d.closed {
+				d.say(secPrivacy, m, toneError)
+			}
+		})
 		return
 	}
 	for _, w := range d.privacy {
@@ -425,11 +425,17 @@ func (d *settingsDialog) loadPrivacy() {
 		if d.closed || gen != d.gen {
 			return
 		}
+		// queued behind every earlier change, so one that failed after its dialog closed is known now
+		missed := d.ctl.takeMissed()
 		if err != nil {
-			d.say(secPrivacy, "Couldn't reach WhatsApp, so these are the values last saved here: "+err.Error(), toneError)
+			d.say(secPrivacy, strings.TrimSpace(missed+" Couldn't reach WhatsApp, so these are the values last saved here: "+err.Error()), toneError)
 			return
 		}
-		d.say(secPrivacy, "", toneSecondary)
+		if missed != "" {
+			d.say(secPrivacy, missed, toneError)
+		} else {
+			d.say(secPrivacy, "", toneSecondary)
+		}
 		for key, w := range d.privacy {
 			d.vals[key] = vals[key]
 			if !w.isBusy() { // a change still being saved keeps showing its new value

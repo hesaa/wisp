@@ -55,6 +55,15 @@ var privacyTypes = map[string]types.PrivacySettingType{
 	KeyProfilePhoto: types.PrivacySettingTypeProfile,
 }
 
+// settingNames are the settings' names as the dialog shows them.
+var settingNames = map[string]string{
+	KeyLastSeen: "Last seen", KeyReadReceipts: "Read receipts", KeyProfilePhoto: "Profile photo",
+	KeyDisappearing: "Default message timer", KeyGhostTyping: "Ghost typing", KeyAppearOffline: "Appear offline",
+	KeyAutoDownloadImages: "Auto-download images", KeyGiphyAPIKey: "GIPHY API key", KeyProxy: "Proxy",
+	KeyNotify: "Notifications", KeyNotifyPrivate: "Private notifications", KeyNotifySound: "Notification sound",
+	KeyTheme: "Theme",
+}
+
 // defaults are the values of settings never saved. Privacy ones stand in until WhatsApp's answer.
 var defaults = map[string]string{
 	KeyLastSeen: "all", KeyReadReceipts: "all", KeyProfilePhoto: "all", KeyDisappearing: "0",
@@ -98,6 +107,25 @@ func ParseTheme(v string) theme.ThemeMode {
 // errNotMirrored: WhatsApp took a privacy change but the settings table could not record it.
 var errNotMirrored = errors.New("saved on WhatsApp, but not on this PC")
 
+// settingsShared is what every Settings dialog shares: one worker, so a dialog opened while an
+// earlier one's change is still being saved loads only after it; and the last change that failed
+// after its dialog had closed, for the next dialog to report (UI thread only).
+type settingsShared struct {
+	jobs   serial
+	missed string
+}
+
+// onWorker makes a settingsCtl.bg: work runs on jobs, one at a time in call order, and its done is
+// handed to deliver (the UI thread's Synchronize), so dones arrive in that order too.
+func onWorker(jobs *serial, deliver func(func())) func(work func() error, done func(error)) {
+	return func(work func() error, done func(error)) {
+		jobs.do(func() {
+			err := work()
+			deliver(func() { done(err) })
+		})
+	}
+}
+
 // settingsCtl is the Settings dialog without its window: it writes privacy settings to WhatsApp
 // first and then to the settings table, and app-global settings to the table only.
 type settingsCtl struct {
@@ -106,6 +134,31 @@ type settingsCtl struct {
 	bg        func(work func() error, done func(error)) // work off the UI thread, then done on it, in call order
 	onTheme   func(theme.ThemeMode)                     // a theme was picked (before it is saved)
 	onChanged func(key string)                          // an app-global setting was saved
+	shared    *settingsShared
+	closed    func() bool // the dialog has closed: a change failing now is kept for the next one
+}
+
+// finish wraps the done of a change to key (of accountID, "" for app-global): a failure arriving
+// after the dialog closed is logged and kept for the next dialog, which takeMissed hands it to.
+func (c *settingsCtl) finish(accountID, key string, done func(error)) func(error) {
+	return func(err error) {
+		if err != nil && c.closed() {
+			who := ""
+			if accountID != "" {
+				who = "+" + accountID + ": "
+			}
+			c.shared.missed = who + "a change to " + settingNames[key] + " made before Settings closed failed: " + err.Error()
+			logErr("settings", errors.New(c.shared.missed))
+		}
+		done(err)
+	}
+}
+
+// takeMissed returns, once, the last change that failed after its dialog had closed ("" for none).
+func (c *settingsCtl) takeMissed() string {
+	m := c.shared.missed
+	c.shared.missed = ""
+	return m
 }
 
 // values are the shown values of the app-global settings and, unless accountID is "", of its
@@ -153,7 +206,7 @@ func (c *settingsCtl) setPrivacy(accountID, key, value string, done func(error))
 			return fmt.Errorf("%w: %w", errNotMirrored, err)
 		}
 		return nil
-	}, done)
+	}, c.finish(accountID, key, done))
 }
 
 // refresh fetches accountID's privacy settings from WhatsApp into the settings table; done gets the
@@ -198,10 +251,10 @@ func (c *settingsCtl) setGlobal(key, value string, done func(error)) {
 	case KeyTheme:
 		c.onTheme(ParseTheme(value))
 	}
-	c.bg(func() error { return c.store.SetSetting("", key, value) }, func(err error) {
+	c.bg(func() error { return c.store.SetSetting("", key, value) }, c.finish("", key, func(err error) {
 		if err == nil {
 			c.onChanged(key)
 		}
 		done(err)
-	})
+	}))
 }
