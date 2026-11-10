@@ -6,11 +6,16 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/lxn/walk"
+	"golang.org/x/sys/windows"
 
 	"wa-go/internal/app"
 	"wa-go/internal/media"
@@ -27,13 +32,13 @@ const logLimit = 1 << 20
 
 func main() {
 	if err := run(); err != nil {
-		log.Printf("wa-go: %v", err)
 		walk.MsgBox(nil, "wa-go", "wa-go could not start: "+err.Error(), walk.MsgBoxIconError|walk.MsgBoxOK)
 		os.Exit(1)
 	}
 }
 
-func run() error {
+// run starts wa-go and returns once it exits; an error is logged before the log closes.
+func run() (err error) {
 	base, err := os.UserCacheDir() // %LOCALAPPDATA%
 	if err != nil {
 		return err
@@ -42,10 +47,25 @@ func run() error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	if f, err := openLog(filepath.Join(dir, "wa-go.log"), logLimit); err == nil {
+	if f, ferr := openLog(filepath.Join(dir, "wa-go.log"), logLimit); ferr == nil {
 		log.SetOutput(f)
-		defer f.Close()
+		defer func() {
+			if err != nil {
+				log.Printf("wa-go: %v", err)
+			}
+			f.Close()
+		}()
 	} // else: a GUI build has nowhere to log, the app still runs
+
+	show, first, err := claimInstance(dir)
+	if err != nil {
+		return err
+	}
+	if !first {
+		log.Printf("wa-go: already running; brought it to the front")
+		return nil
+	}
+	defer windows.CloseHandle(show)
 
 	db, err := store.Open(filepath.Join(dir, "wa-go.db"))
 	if err != nil {
@@ -66,8 +86,47 @@ func run() error {
 		return err
 	}
 	a.Attach(mgr)
+	go func() { // another wa-go asked for the window
+		for {
+			if ev, err := windows.WaitForSingleObject(show, windows.INFINITE); ev != windows.WAIT_OBJECT_0 {
+				log.Printf("wa-go: instance signal: %v", err)
+				return
+			}
+			a.Restore()
+		}
+	}()
 	return a.Run()
 }
+
+// instanceName names the per-session event that keeps one wa-go per data folder: two would share
+// the database and connect the same accounts twice.
+func instanceName(dataDir string) string {
+	sum := sha256.Sum256([]byte(strings.ToLower(filepath.Clean(dataDir))))
+	return `Local\wa-go-` + hex.EncodeToString(sum[:16])
+}
+
+// claimInstance makes this the running wa-go for dataDir and returns the event other instances set
+// to bring it to the front. When one already runs, it is signalled instead and first is false.
+func claimInstance(dataDir string) (show windows.Handle, first bool, err error) {
+	name, err := windows.UTF16PtrFromString(instanceName(dataDir))
+	if err != nil {
+		return 0, false, err
+	}
+	show, err = windows.CreateEvent(nil, 0, 0, name) // auto-reset, unset
+	if errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		defer windows.CloseHandle(show)
+		allowSetForegroundWindow.Call(asfwAny) // we have the foreground: let the running one take it
+		return 0, false, windows.SetEvent(show)
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return show, true, nil
+}
+
+var allowSetForegroundWindow = windows.NewLazySystemDLL("user32.dll").NewProc("AllowSetForegroundWindow")
+
+const asfwAny = ^uintptr(0) // ASFW_ANY
 
 // openLog opens the log at path for appending, emptying it first when it is over limit bytes.
 func openLog(path string, limit int64) (*os.File, error) {
