@@ -265,3 +265,79 @@ func TestCheckOpenable(t *testing.T) {
 		t.Errorf("link escape accepted, resolved %q", got)
 	}
 }
+
+func TestMarkFromInternetWritesTheZoneStream(t *testing.T) {
+	c, _ := newCache(t)
+	data := []byte("%PDF-1.4 hello")
+	p, err := c.Save("acct", ".pdf", bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := MarkFromInternet(p); err != nil {
+		t.Fatal(err)
+	}
+	zone, err := os.ReadFile(p + ":Zone.Identifier")
+	if err != nil || string(zone) != "[ZoneTransfer]\r\nZoneId=3\r\n" {
+		t.Fatalf("Zone.Identifier = %q, %v", zone, err)
+	}
+	if _, err := c.checkOpenable(p); err != nil {
+		t.Fatalf("the marked file itself is refused: %v", err)
+	}
+	if n, err := c.GetCacheSizeBytes(); err != nil || n != int64(len(data)) {
+		t.Fatalf("cache size = %d, %v; want %d (the stream is not counted)", n, err, len(data))
+	}
+	if err := c.ClearMediaCache(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("marked file survived Clear: %v", err)
+	}
+}
+
+func TestRemoveDeletesOnlyInsideTheCache(t *testing.T) {
+	c, _ := newCache(t)
+	p, err := c.Save("acct", ".jpg", bytes.NewReader(jpegBytes(t, 300, 200)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	thumb, err := c.Thumbnail(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "keep.jpg")
+	if err := os.WriteFile(outside, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Remove(outside); err == nil {
+		t.Fatal("Remove deleted a file outside the cache")
+	}
+	if _, err := os.Stat(outside); err != nil {
+		t.Fatalf("outside file gone: %v", err)
+	}
+	if err := c.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{p, thumb} {
+		if _, err := os.Stat(f); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s survived Remove: %v", f, err)
+		}
+	}
+	if err := c.Remove(p); err != nil {
+		t.Fatalf("removing a file already gone: %v", err)
+	}
+}
+
+func TestMissing(t *testing.T) {
+	c, _ := newCache(t)
+	p, err := c.Save("acct", ".txt", strings.NewReader("hi"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if Missing(p) || Missing("") {
+		t.Fatal("an existing file (or no path) counted as missing")
+	}
+	os.Remove(p)
+	if !Missing(p) {
+		t.Fatal("a deleted download did not count as missing")
+	}
+}

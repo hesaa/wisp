@@ -203,6 +203,44 @@ func (c *Cache) ClearMediaCache() error {
 	return errors.Join(errs...)
 }
 
+// Remove deletes a cached file and its thumbnail (a disappearing message went). A path outside the
+// cache is refused; one already gone is no error.
+func (c *Cache) Remove(path string) error {
+	resolved, err := c.inRoot(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	thumb := strings.TrimSuffix(resolved, filepath.Ext(resolved)) + "_thumb.jpg"
+	return errors.Join(removeGone(resolved), removeGone(thumb))
+}
+
+// removeGone deletes path; one already gone is no error.
+func removeGone(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// MarkFromInternet gives a downloaded file the Mark of the Web (an NTFS Zone.Identifier stream for
+// the Internet zone), so Windows, SmartScreen and Office's Protected View treat it as untrusted.
+func MarkFromInternet(path string) error {
+	return os.WriteFile(path+":Zone.Identifier", []byte("[ZoneTransfer]\r\nZoneId=3\r\n"), 0o600)
+}
+
+// Missing reports whether a recorded download's file is gone (Clear Cache, or deleted by hand), so
+// it shows as downloadable again. No path is not missing: it was never downloaded.
+func Missing(path string) bool {
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return errors.Is(err, fs.ErrNotExist)
+}
+
 // OpenInDefaultApp launches a cached file with its Windows default handler,
 // refusing paths outside the cache root and non-allowlisted extensions.
 func (c *Cache) OpenInDefaultApp(filePath string) error {

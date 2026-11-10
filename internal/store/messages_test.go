@@ -3,6 +3,7 @@ package store
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -296,5 +297,108 @@ func TestGetMessageIsAccountScoped(t *testing.T) {
 		if got, ok, err := db.GetMessage(k[0], k[1], k[2]); ok || err != nil || got.ID != "" {
 			t.Fatalf("GetMessage%v = %+v, %v, %v; want not found", k, got, ok, err)
 		}
+	}
+}
+
+func TestMarkChatReadUntilLeavesLaterMessagesUnread(t *testing.T) {
+	db := openTest(t)
+	db.InsertMessagesBatch(msgs(acct, "c1", 3, false)) // timestamps 1000..1002
+	db.InsertMessagesBatch(msgs("other", "c1", 3, false))
+	if err := db.MarkChatReadUntil(acct, "c1", 1001); err != nil {
+		t.Fatal(err)
+	}
+	unread := func(account string) int {
+		chats, err := db.ListChats(account)
+		if err != nil || len(chats) != 1 {
+			t.Fatalf("ListChats(%s) = %v, %v", account, chats, err)
+		}
+		return chats[0].Unread
+	}
+	if got := unread(acct); got != 1 {
+		t.Fatalf("unread after read until 1001 = %d, want 1 (the later message)", got)
+	}
+	if got := unread("other"); got != 3 {
+		t.Fatalf("another account's unread = %d, want 3", got)
+	}
+}
+
+func TestClearMediaPathsForgetsEveryDownload(t *testing.T) {
+	db := openTest(t)
+	ms := msgs(acct, "c1", 2, false)
+	ms[0].MediaPath = `C:\cache\a.jpg`
+	db.InsertMessagesBatch(ms)
+	if err := db.ClearMediaPaths(); err != nil {
+		t.Fatal(err)
+	}
+	page, _ := db.GetChatMessages(acct, "c1", 0)
+	for _, m := range page {
+		if m.MediaPath != "" {
+			t.Fatalf("%s still points at %q", m.ID, m.MediaPath)
+		}
+	}
+}
+
+func TestPurgeExpiredDeletesOnlyDisappearedMessages(t *testing.T) {
+	db := openTest(t)
+	ms := msgs(acct, "c1", 3, false)
+	ms[0].ExpiresAt, ms[0].MediaPath = 1500, `C:\cache\gone.jpg` // expired
+	ms[1].ExpiresAt = 3000                                       // not yet
+	db.InsertMessagesBatch(ms)
+	paths, n, err := db.PurgeExpired(2000)
+	if err != nil || n != 1 || len(paths) != 1 || paths[0] != `C:\cache\gone.jpg` {
+		t.Fatalf("PurgeExpired = %v, %d, %v", paths, n, err)
+	}
+	page, _ := db.GetChatMessages(acct, "c1", 0)
+	if len(page) != 2 || page[1].ID != "m1" || page[1].ExpiresAt != 3000 {
+		t.Fatalf("left: %+v", page)
+	}
+	if exp, err := db.ChatExpiration(acct, "c1"); err != nil || exp != 0 {
+		t.Fatalf("ChatExpiration with a lasting newest message = %d, %v", exp, err)
+	}
+}
+
+func TestChatExpirationFollowsTheNewestMessage(t *testing.T) {
+	db := openTest(t)
+	ms := msgs(acct, "c1", 2, false)
+	ms[1].ExpiresAt = ms[1].Timestamp + 86400
+	db.InsertMessagesBatch(ms)
+	if exp, err := db.ChatExpiration(acct, "c1"); err != nil || exp != 86400 {
+		t.Fatalf("ChatExpiration = %d, %v; want 86400", exp, err)
+	}
+	if exp, err := db.ChatExpiration("other", "c1"); err != nil || exp != 0 {
+		t.Fatalf("another account's ChatExpiration = %d, %v", exp, err)
+	}
+}
+
+func TestChatName(t *testing.T) {
+	db := openTest(t)
+	db.UpsertChat(acct, "g@g.us", "Team", 0)
+	if n, err := db.ChatName(acct, "g@g.us"); err != nil || n != "Team" {
+		t.Fatalf("ChatName = %q, %v", n, err)
+	}
+	if n, err := db.ChatName("other", "g@g.us"); err != nil || n != "" {
+		t.Fatalf("another account's ChatName = %q, %v", n, err)
+	}
+}
+
+func TestUnreadCountUsesThePartialIndex(t *testing.T) {
+	db := openTest(t)
+	rows, err := db.sql.Query(`EXPLAIN QUERY PLAN SELECT COUNT(*) FROM messages m WHERE m.account_id = ? AND m.chat_jid = ?
+		AND m.from_me = 0 AND m.status <> 'read'`, acct, "c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	plan := ""
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan += detail + "\n"
+	}
+	if !strings.Contains(plan, "messages_unread") {
+		t.Fatalf("unread count does not use messages_unread:\n%s", plan)
 	}
 }

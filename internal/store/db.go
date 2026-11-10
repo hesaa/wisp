@@ -14,11 +14,6 @@ const schemaVersion = 1
 // unread_count is deliberately not stored on chats: it is derived from messages,
 // so it cannot drift from the data.
 const schemaV1 = `
-CREATE TABLE accounts (
-	account_id   TEXT PRIMARY KEY,
-	display_name TEXT NOT NULL DEFAULT '',
-	added_at     INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-);
 CREATE TABLE chats (
 	account_id      TEXT NOT NULL,
 	jid             TEXT NOT NULL,
@@ -40,9 +35,12 @@ CREATE TABLE messages (
 	media_meta   BLOB NOT NULL DEFAULT x'',
 	wire_chat_jid   TEXT NOT NULL DEFAULT '',
 	wire_sender_jid TEXT NOT NULL DEFAULT '',
+	expires_at      INTEGER NOT NULL DEFAULT 0, -- unix seconds a disappearing message goes; 0: never
 	PRIMARY KEY (account_id, chat_jid, id)
 );
 CREATE INDEX messages_page ON messages (account_id, chat_jid, timestamp DESC, id DESC);
+CREATE INDEX messages_unread ON messages (account_id, chat_jid) WHERE from_me = 0 AND status <> 'read';
+CREATE INDEX messages_expiry ON messages (expires_at) WHERE expires_at > 0;
 CREATE TABLE settings (
 	account_id TEXT NOT NULL DEFAULT '',
 	key        TEXT NOT NULL,
@@ -80,7 +78,10 @@ func (d *DB) migrate() error {
 	if err := d.sql.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
 		return err
 	}
-	if v >= schemaVersion {
+	if v > schemaVersion {
+		return fmt.Errorf("the database was made by a newer wa-go (schema %d, this one knows %d): run the newer wa-go, or delete it to start over", v, schemaVersion)
+	}
+	if v == schemaVersion {
 		return nil
 	}
 	tx, err := d.sql.Begin()
