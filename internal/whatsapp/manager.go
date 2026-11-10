@@ -21,7 +21,6 @@ import (
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
-	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
 
 	"wa-go/internal/media"
@@ -54,6 +53,8 @@ type (
 		IDs                []string
 		Status             string
 	}
+	// RevisedEvent: stored message ID in ChatJID was edited or deleted for everyone; reload it.
+	RevisedEvent struct{ AccountID, ChatJID, ID string }
 	// HistorySyncEvent: a history-sync blob was stored; reload the account's chat list.
 	HistorySyncEvent struct{ AccountID string }
 	// ConnectionEvent: the account's connection state changed (State* constants).
@@ -68,8 +69,11 @@ type (
 // msgStore is the part of *store.DB the manager writes to.
 type msgStore interface {
 	InsertMessagesBatch([]store.Message) error
+	InsertMessage(store.Message) (bool, error)
 	UpsertChat(accountID, jid, name string, lastMessageTS int64) error
+	NameChatIfUnnamed(accountID, jid, name string) error
 	UpdateMessageStatus(accountID, chatJID string, ids []string, status string) error
+	ReviseMessage(accountID, chatJID, id, msgType, body string) error
 	SetMediaPath(accountID, chatJID, id, path string) error
 }
 
@@ -111,7 +115,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	for i, dev := range devices {
 		cli := m.newClient(dev)
 		cli.InitialAutoReconnect = true // app started offline: keep retrying in the background
-		m.add(dev.ID.User, cli)
+		m.add(dev.ID.User, liveClient{cli})
 		wg.Go(func() {
 			if err := cli.Connect(); err != nil {
 				errs[i] = fmt.Errorf("whatsapp: connect %s: %w", dev.ID.User, err)
@@ -138,8 +142,8 @@ func (m *Manager) Pair(ctx context.Context) (<-chan whatsmeow.QRChannelItem, err
 	return qr, nil
 }
 
-// AddListener registers fn to receive every event (MessageEvent, ReceiptEvent, HistorySyncEvent,
-// ConnectionEvent, ErrorEvent). fn runs on whatsmeow's background goroutines (or on the goroutine
+// AddListener registers fn to receive every event (MessageEvent, ReceiptEvent, RevisedEvent,
+// HistorySyncEvent, ConnectionEvent, ErrorEvent). fn runs on whatsmeow's background goroutines (or on the goroutine
 // that called SendText/SendMedia/Logout), possibly several at once: it must not block, and UI work
 // must be marshalled onto the UI thread (walk: Synchronize).
 func (m *Manager) AddListener(fn func(evt any)) {
@@ -272,17 +276,14 @@ func (m *Manager) send(ctx context.Context, cli waClient, accountID string, chat
 	if err != nil {
 		return store.Message{}, err
 	}
-	sm, _, err := toStoreMessage(accountID, &events.Message{
-		Info: types.MessageInfo{
-			MessageSource: types.MessageSource{Chat: chat, Sender: types.NewJID(accountID, types.DefaultUserServer), IsFromMe: true},
-			ID:            resp.ID,
-			Timestamp:     resp.Timestamp,
-		},
-		Message: msg,
-	})
+	sm, _, err := toStoreMessage(accountID, types.MessageInfo{
+		MessageSource: types.MessageSource{Chat: chat, Sender: types.NewJID(accountID, types.DefaultUserServer), IsFromMe: true},
+		ID:            resp.ID,
+		Timestamp:     resp.Timestamp,
+	}, msg)
 	if err == nil {
 		sm.MediaPath = mediaPath
-		err = m.persist(sm, "")
+		err = m.persist(sm)
 	}
 	if err != nil {
 		return sm, fmt.Errorf("whatsapp: message %s sent but not stored: %w", resp.ID, err)

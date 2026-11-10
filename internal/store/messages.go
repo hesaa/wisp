@@ -47,44 +47,59 @@ type Chat struct {
 func (d *DB) InsertMessagesBatch(msgs []Message) error {
 	for start := 0; start < len(msgs); start += BatchSize {
 		end := min(start+BatchSize, len(msgs))
-		if err := d.insertChunk(msgs[start:end]); err != nil {
+		if _, err := d.insertChunk(msgs[start:end]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (d *DB) insertChunk(msgs []Message) error {
+// InsertMessage stores one message like InsertMessagesBatch and reports whether it was new
+// (false for a redelivered duplicate).
+func (d *DB) InsertMessage(m Message) (bool, error) {
+	n, err := d.insertChunk([]Message{m})
+	return n == 1, err
+}
+
+// insertChunk inserts msgs in one transaction and returns how many were new.
+func (d *DB) insertChunk(msgs []Message) (int64, error) {
 	tx, err := d.sql.Begin()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer tx.Rollback()
 	ins, err := tx.Prepare(`INSERT OR IGNORE INTO messages
 		(account_id, chat_jid, id, sender_jid, timestamp, message_type, body, media_path, status, from_me, media_meta)
 		VALUES (?,?,?,?,?,?,?,?,?,?,COALESCE(?, x''))`) // COALESCE: a nil []byte binds as NULL
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer ins.Close()
 	chat, err := tx.Prepare(`INSERT INTO chats (account_id, jid, last_message_ts) VALUES (?,?,?)
 		ON CONFLICT(account_id, jid) DO UPDATE SET last_message_ts = MAX(last_message_ts, excluded.last_message_ts)`)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer chat.Close()
+	var inserted int64
 	for _, m := range msgs {
-		if _, err := ins.Exec(m.AccountID, m.ChatJID, m.ID, m.SenderJID, m.Timestamp, m.Type, m.Body, m.MediaPath, m.Status, m.FromMe, m.MediaMeta); err != nil {
-			return err
+		res, err := ins.Exec(m.AccountID, m.ChatJID, m.ID, m.SenderJID, m.Timestamp, m.Type, m.Body, m.MediaPath, m.Status, m.FromMe, m.MediaMeta)
+		if err != nil {
+			return 0, err
 		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		inserted += n
 		if m.ChatJID == statusBroadcastJID {
 			continue
 		}
 		if _, err := chat.Exec(m.AccountID, m.ChatJID, m.Timestamp); err != nil {
-			return err
+			return 0, err
 		}
 	}
-	return tx.Commit()
+	return inserted, tx.Commit()
 }
 
 // GetChatMessages returns one page (0-based) of a chat, newest first. A page past the end is empty.
@@ -146,6 +161,16 @@ func (d *DB) SetMediaPath(accountID, chatJID, id, path string) error {
 	return err
 }
 
+// ReviseMessage rewrites a stored message's body after an edit. A non-empty msgType (a
+// delete-for-everyone) also replaces its type and drops its media keys.
+func (d *DB) ReviseMessage(accountID, chatJID, id, msgType, body string) error {
+	_, err := d.sql.Exec(`UPDATE messages SET body = ?,
+		message_type = COALESCE(NULLIF(?, ''), message_type),
+		media_meta = CASE WHEN ? = '' THEN media_meta ELSE x'' END
+		WHERE account_id = ? AND chat_jid = ? AND id = ?`, body, msgType, msgType, accountID, chatJID, id)
+	return err
+}
+
 // MarkChatRead marks all incoming messages in the chat as read.
 func (d *DB) MarkChatRead(accountID, chatJID string) error {
 	_, err := d.sql.Exec(`UPDATE messages SET status = ? WHERE account_id = ? AND chat_jid = ? AND from_me = 0 AND status <> ?`,
@@ -160,6 +185,15 @@ func (d *DB) UpsertChat(accountID, jid, name string, lastMessageTS int64) error 
 		ON CONFLICT(account_id, jid) DO UPDATE SET
 			name = CASE WHEN excluded.name <> '' THEN excluded.name ELSE name END,
 			last_message_ts = MAX(last_message_ts, excluded.last_message_ts)`, accountID, jid, name, lastMessageTS)
+	return err
+}
+
+// NameChatIfUnnamed names a chat (creating it if needed) only when it has no name yet; for weak
+// names such as push names, which must not replace a better one.
+func (d *DB) NameChatIfUnnamed(accountID, jid, name string) error {
+	_, err := d.sql.Exec(`INSERT INTO chats (account_id, jid, name) VALUES (?,?,?)
+		ON CONFLICT(account_id, jid) DO UPDATE SET name = CASE WHEN name = '' THEN excluded.name ELSE name END`,
+		accountID, jid, name)
 	return err
 }
 

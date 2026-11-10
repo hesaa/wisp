@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"runtime/debug"
 	"slices"
 	"sync/atomic"
 	"time"
@@ -33,10 +34,14 @@ const (
 	TypeAudio       = "audio"
 	TypeDocument    = "document"
 	TypeSticker     = "sticker"
-	TypeUnsupported = "unsupported" // a message kind this app cannot show yet; kept, not dropped
+	TypeRevoked     = "revoked"     // deleted for everyone; Body holds revokedBody
+	TypeUnsupported = "unsupported" // a message kind this app cannot show yet; kept (as read), not dropped
 )
 
-// waClient is the part of *whatsmeow.Client the manager uses, so tests can fake it.
+const revokedBody = "This message was deleted"
+
+// waClient is the part of *whatsmeow.Client (plus its device-store lookups) the manager uses, so
+// tests can fake it.
 type waClient interface {
 	Disconnect()
 	SendMessage(ctx context.Context, to types.JID, message *waE2E.Message, extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error)
@@ -47,13 +52,30 @@ type waClient interface {
 	UploadReader(ctx context.Context, plaintext io.Reader, tempFile io.ReadWriteSeeker, appInfo whatsmeow.MediaType) (whatsmeow.UploadResponse, error)
 	DownloadToFile(ctx context.Context, msg whatsmeow.DownloadableMessage, file whatsmeow.File) error
 	ParseWebMessage(chatJID types.JID, webMsg *waWeb.WebMessageInfo) (*events.Message, error)
+	PNForLID(ctx context.Context, lid types.JID) (types.JID, error) // empty JID when unknown
+	ContactName(ctx context.Context, jid types.JID) (string, error) // address-book name, "" when unknown
 }
 
-var _ waClient = (*whatsmeow.Client)(nil)
+// liveClient adds the device-store lookups to a real client.
+type liveClient struct{ *whatsmeow.Client }
+
+func (c liveClient) PNForLID(ctx context.Context, lid types.JID) (types.JID, error) {
+	return c.Store.LIDs.GetPNForLID(ctx, lid)
+}
+
+func (c liveClient) ContactName(ctx context.Context, jid types.JID) (string, error) {
+	info, err := c.Store.Contacts.GetContact(ctx, jid)
+	return info.FullName, err
+}
+
+var _ waClient = liveClient{}
 
 // newClient creates a whatsmeow client for dev whose events are handled under its account ID.
 func (m *Manager) newClient(dev *wastore.Device) *whatsmeow.Client {
 	cli := whatsmeow.NewClient(dev, waLog.Noop)
+	// A message whose handler failed is not acked, so WhatsApp redelivers it; the buffer lets
+	// whatsmeow decrypt it again (the signal session has already moved on).
+	cli.EnableDecryptedEventBuffer = true
 	// Held here, not read from dev.ID: whatsmeow clears dev.ID on a remote logout,
 	// possibly before the LoggedOut event reaches us.
 	var id atomic.Value
@@ -61,49 +83,75 @@ func (m *Manager) newClient(dev *wastore.Device) *whatsmeow.Client {
 	if dev.ID != nil {
 		id.Store(dev.ID.User)
 	}
-	cli.AddEventHandler(func(evt any) {
+	c := liveClient{cli}
+	cli.AddEventHandlerWithSuccessStatus(func(evt any) bool {
 		if ps, ok := evt.(*events.PairSuccess); ok {
 			id.Store(ps.ID.User)
 		}
-		acct := id.Load().(string)
-		// shortcut: a failed store write is reported but the message is still acked, so WhatsApp won't
-		// redeliver it; use SynchronousAck + EnableDecryptedEventBuffer + a success-status handler if that matters.
-		if err := m.handleEvent(acct, cli, evt); err != nil {
-			m.emit(ErrorEvent{AccountID: acct, Err: err})
-		}
+		return m.onEvent(context.Background(), id.Load().(string), c, evt)
 	})
 	return cli
 }
 
+// onEvent handles evt and reports whether whatsmeow may ack it. A message that could not be
+// stored is not acked, so WhatsApp delivers it again; any failure is also sent as an ErrorEvent.
+func (m *Manager) onEvent(ctx context.Context, id string, cli waClient, evt any) bool {
+	err := m.handleEvent(ctx, id, cli, evt)
+	if err == nil {
+		return true
+	}
+	m.emit(ErrorEvent{AccountID: id, Err: err})
+	_, isMessage := evt.(*events.Message)
+	return !isMessage
+}
+
 // handleEvent persists and forwards one whatsmeow event of account id. It runs on whatsmeow's
 // goroutines (several at once per account); tests call it directly.
-func (m *Manager) handleEvent(id string, cli waClient, evt any) error {
+func (m *Manager) handleEvent(ctx context.Context, id string, cli waClient, evt any) error {
 	if id == "" {
 		return nil // still pairing: progress is reported on the QR channel
 	}
 	switch e := evt.(type) {
 	case *events.Message:
-		msg, ok, err := toStoreMessage(id, e)
+		info := e.Info
+		var err error
+		if info.MessageSource, err = pnSource(ctx, cli, info.MessageSource); err != nil {
+			return err
+		}
+		if pm := e.Message.GetProtocolMessage(); pm != nil {
+			return m.revise(id, info.Chat.String(), pm)
+		}
+		msg, ok, err := toStoreMessage(id, info, e.Message)
 		if err != nil || !ok {
 			return err
 		}
-		name := ""
-		if isDM(e.Info.Chat) && !e.Info.IsFromMe {
-			name = e.Info.PushName
+		if isDM(info.Chat) && !info.IsFromMe {
+			if err := m.nameDM(ctx, id, cli, info.Chat, info.PushName); err != nil {
+				return err
+			}
 		}
-		return m.persist(msg, name)
+		return m.persist(msg)
 	case *events.Receipt:
 		status := receiptStatus(e.Type)
 		if status == "" {
 			return nil
 		}
-		chat := e.Chat.String()
+		src, err := pnSource(ctx, cli, e.MessageSource)
+		if err != nil {
+			return err
+		}
+		chat := src.Chat.String()
 		if err := m.store.UpdateMessageStatus(id, chat, e.MessageIDs, status); err != nil {
 			return err
 		}
 		m.emit(ReceiptEvent{AccountID: id, ChatJID: chat, IDs: e.MessageIDs, Status: status})
 	case *events.HistorySync:
-		return m.ingestHistory(id, cli, e)
+		err := m.ingestHistory(ctx, id, cli, e)
+		// whatsmeow decoded the whole blob before this event; drop our handle (we are its only
+		// reader) and return the spike to the OS so idle RSS recovers.
+		e.Data = nil
+		debug.FreeOSMemory()
+		return err
 	case *events.PairSuccess:
 		m.add(id, cli)
 		m.emit(ConnectionEvent{AccountID: id, State: StatePaired})
@@ -126,78 +174,166 @@ func (m *Manager) handleEvent(id string, cli waClient, evt any) error {
 	return nil
 }
 
-// persist stores msg, names its chat when chatName is known, and tells listeners.
-func (m *Manager) persist(msg store.Message, chatName string) error {
-	if err := m.store.InsertMessagesBatch([]store.Message{msg}); err != nil {
+// persist stores msg and, unless it is a redelivered duplicate, tells listeners.
+func (m *Manager) persist(msg store.Message) error {
+	isNew, err := m.store.InsertMessage(msg)
+	if err == nil && isNew {
+		m.emit(MessageEvent{AccountID: msg.AccountID, Message: msg})
+	}
+	return err
+}
+
+// nameDM records the best name for a 1:1 chat: the address-book name always wins; a push name only
+// names a chat that has none ("-" means no name, as in whatsmeow).
+func (m *Manager) nameDM(ctx context.Context, id string, cli waClient, chat types.JID, pushName string) error {
+	full, err := cli.ContactName(ctx, chat)
+	if err != nil {
 		return err
 	}
-	if chatName != "" {
-		if err := m.store.UpsertChat(msg.AccountID, msg.ChatJID, chatName, msg.Timestamp); err != nil {
+	if full != "" {
+		return m.store.UpsertChat(id, chat.String(), full, 0)
+	}
+	if pushName == "" || pushName == "-" {
+		return nil
+	}
+	return m.store.NameChatIfUnnamed(id, chat.String(), pushName)
+}
+
+// revise applies an edit or a delete-for-everyone to the stored target message. Other protocol
+// messages (key shares, history-sync notices, ...) are signalling and ignored.
+func (m *Manager) revise(id, chat string, pm *waE2E.ProtocolMessage) error {
+	if pm.Type == nil {
+		return nil // REVOKE is the zero value: never infer it from a missing type
+	}
+	target := pm.GetKey().GetID()
+	switch pm.GetType() {
+	case waE2E.ProtocolMessage_MESSAGE_EDIT:
+		typ, body, _, skip := content(pm.GetEditedMessage())
+		if skip || typ == TypeUnsupported {
+			return nil
+		}
+		if err := m.store.ReviseMessage(id, chat, target, "", body); err != nil {
 			return err
 		}
+	case waE2E.ProtocolMessage_REVOKE:
+		if err := m.store.ReviseMessage(id, chat, target, TypeRevoked, revokedBody); err != nil {
+			return err
+		}
+	default:
+		return nil
 	}
-	m.emit(MessageEvent{AccountID: msg.AccountID, Message: msg})
+	m.emit(RevisedEvent{AccountID: id, ChatJID: chat, ID: target})
 	return nil
+}
+
+// pnSource rewrites a 1:1 chat and the sender from LID to phone-number JIDs, so each contact is
+// stored under one key. An LID with no known phone number is kept. Groups keep their @g.us chat.
+func pnSource(ctx context.Context, cli waClient, src types.MessageSource) (types.MessageSource, error) {
+	chatAlt := src.SenderAlt
+	if src.IsFromMe {
+		chatAlt = src.RecipientAlt
+	}
+	var err error
+	if src.Chat, err = toPN(ctx, cli, src.Chat, chatAlt); err != nil {
+		return src, err
+	}
+	src.Sender, err = toPN(ctx, cli, src.Sender, src.SenderAlt)
+	return src, err
+}
+
+// toPN returns the phone-number JID for an LID jid (from alt when whatsmeow supplied it, else from
+// the account's LID map); other JIDs are returned unchanged.
+func toPN(ctx context.Context, cli waClient, jid, alt types.JID) (types.JID, error) {
+	if jid.Server != types.HiddenUserServer {
+		return jid, nil
+	}
+	if alt.Server == types.DefaultUserServer && alt.User != "" {
+		return alt.ToNonAD(), nil
+	}
+	pn, err := cli.PNForLID(ctx, jid.ToNonAD())
+	if err != nil || pn.IsEmpty() {
+		return jid, err
+	}
+	return pn.ToNonAD(), nil
 }
 
 // ingestHistory stores a history-sync blob, flushing at most store.BatchSize messages at a time so
 // the archive is never copied into one big slice. Unparseable messages are skipped and reported.
-func (m *Manager) ingestHistory(id string, cli waClient, h *events.HistorySync) error {
+func (m *Manager) ingestHistory(ctx context.Context, id string, cli waClient, h *events.HistorySync) error {
 	batch := make([]store.Message, 0, store.BatchSize)
-	flush := func() error {
-		err := m.store.InsertMessagesBatch(batch)
-		batch = batch[:0]
-		return err
-	}
 	var skipped int
 	var firstErr error
-	skip := func(err error) {
-		skipped++
-		firstErr = cmp.Or(firstErr, err)
+	// add queues one archived message, flushing the batch when full. It returns the parsed info
+	// (nil when the message was skipped) and only store errors, which abort the sync.
+	add := func(chat types.JID, wm *waWeb.WebMessageInfo, unreadFrom int64) (*types.MessageInfo, error) {
+		evt, err := cli.ParseWebMessage(chat, wm)
+		if err == nil {
+			evt.Info.MessageSource, err = pnSource(ctx, cli, evt.Info.MessageSource)
+		}
+		var msg store.Message
+		ok := false
+		if err == nil {
+			msg, ok, err = toStoreMessage(id, evt.Info, evt.Message)
+		}
+		if err != nil {
+			skipped++
+			firstErr = cmp.Or(firstErr, err)
+		}
+		if !ok {
+			return nil, nil
+		}
+		if !msg.FromMe && msg.Timestamp < unreadFrom {
+			msg.Status = store.StatusRead
+		}
+		batch = append(batch, msg)
+		if len(batch) < store.BatchSize {
+			return &evt.Info, nil
+		}
+		err = m.store.InsertMessagesBatch(batch)
+		batch = batch[:0]
+		return &evt.Info, err
 	}
 	for _, conv := range h.Data.GetConversations() {
 		chat, err := types.ParseJID(conv.GetID())
+		if err == nil {
+			alt, _ := types.ParseJID(conv.GetPnJID()) // unusable alts are ignored by toPN
+			chat, err = toPN(ctx, cli, chat, alt)
+		}
 		if err != nil {
-			skip(err)
+			skipped++
+			firstErr = cmp.Or(firstErr, err)
 			continue
 		}
 		cutoff := unreadCutoff(conv)
-		name := cmp.Or(conv.GetName(), conv.GetDisplayName())
+		pushName := ""
 		for _, hm := range conv.GetMessages() {
-			evt, err := cli.ParseWebMessage(chat, hm.GetMessage())
+			info, err := add(chat, hm.GetMessage(), cutoff)
 			if err != nil {
-				skip(err)
-				continue
+				return err
 			}
-			msg, ok, err := toStoreMessage(id, evt)
-			if err != nil {
-				skip(err)
-			}
-			if !ok {
-				continue
-			}
-			if !msg.FromMe {
-				if msg.Timestamp < cutoff {
-					msg.Status = store.StatusRead
-				}
-				if name == "" && isDM(chat) {
-					name = evt.Info.PushName
-				}
-			}
-			batch = append(batch, msg)
-			if len(batch) == store.BatchSize {
-				if err := flush(); err != nil {
-					return err
-				}
+			if info != nil && !info.IsFromMe && pushName == "" {
+				pushName = info.PushName
 			}
 		}
-		if chat != types.StatusBroadcastJID {
-			if err := m.store.UpsertChat(id, chat.String(), name, int64(conv.GetConversationTimestamp())); err != nil {
+		if chat == types.StatusBroadcastJID {
+			continue
+		}
+		name := cmp.Or(conv.GetName(), conv.GetDisplayName())
+		if err := m.store.UpsertChat(id, chat.String(), name, int64(conv.GetConversationTimestamp())); err != nil {
+			return err
+		}
+		if name == "" && isDM(chat) {
+			if err := m.nameDM(ctx, id, cli, chat, pushName); err != nil {
 				return err
 			}
 		}
 	}
-	if err := flush(); err != nil {
+	for _, wm := range h.Data.GetStatusV3Messages() { // stories: stored, never a chat row
+		if _, err := add(types.StatusBroadcastJID, wm, math.MinInt64); err != nil {
+			return err
+		}
+	}
+	if err := m.store.InsertMessagesBatch(batch); err != nil {
 		return err
 	}
 	m.emit(HistorySyncEvent{AccountID: id})
@@ -235,38 +371,23 @@ func unreadCutoff(conv *waHistorySync.Conversation) int64 {
 	return newest[n-1]
 }
 
-// toStoreMessage converts e for account id. ok is false for signalling that is not chat content
-// (protocol messages such as revokes, edits and key shares; bare sender-key distribution).
-func toStoreMessage(id string, e *events.Message) (msg store.Message, ok bool, err error) {
-	msg = store.Message{
-		ID: e.Info.ID, ChatJID: e.Info.Chat.String(), AccountID: id,
-		SenderJID: e.Info.Sender.ToNonAD().String(), Timestamp: e.Info.Timestamp.Unix(),
-		FromMe: e.Info.IsFromMe, Status: store.StatusReceived,
-	}
-	if msg.FromMe {
-		msg.Status = store.StatusSent
-	}
-	var media proto.Message
-	switch m := e.Message; {
-	case m.GetConversation() != "":
-		msg.Type, msg.Body = TypeText, m.GetConversation()
-	case m.GetExtendedTextMessage() != nil:
-		msg.Type, msg.Body = TypeText, m.GetExtendedTextMessage().GetText()
-	case m.GetImageMessage() != nil:
-		msg.Type, msg.Body, media = TypeImage, m.GetImageMessage().GetCaption(), m.GetImageMessage()
-	case m.GetVideoMessage() != nil:
-		msg.Type, msg.Body, media = TypeVideo, m.GetVideoMessage().GetCaption(), m.GetVideoMessage()
-	case m.GetAudioMessage() != nil:
-		msg.Type, media = TypeAudio, m.GetAudioMessage()
-	case m.GetDocumentMessage() != nil:
-		d := m.GetDocumentMessage()
-		msg.Type, msg.Body, media = TypeDocument, cmp.Or(d.GetCaption(), d.GetFileName()), d
-	case m.GetStickerMessage() != nil:
-		msg.Type, media = TypeSticker, m.GetStickerMessage()
-	case m.GetProtocolMessage() != nil, m.GetSenderKeyDistributionMessage() != nil:
+// toStoreMessage converts a message of account id. ok is false for what is not chat content
+// (see content).
+func toStoreMessage(id string, info types.MessageInfo, m *waE2E.Message) (msg store.Message, ok bool, err error) {
+	typ, body, media, skip := content(m)
+	if skip {
 		return msg, false, nil
-	default:
-		msg.Type = TypeUnsupported
+	}
+	msg = store.Message{
+		ID: info.ID, ChatJID: info.Chat.String(), AccountID: id,
+		SenderJID: info.Sender.ToNonAD().String(), Timestamp: info.Timestamp.Unix(),
+		Type: typ, Body: body, FromMe: info.IsFromMe, Status: store.StatusReceived,
+	}
+	switch {
+	case typ == TypeUnsupported:
+		msg.Status = store.StatusRead // never counts as unread
+	case msg.FromMe:
+		msg.Status = store.StatusSent
 	}
 	if media != nil {
 		if msg.MediaMeta, err = proto.Marshal(media); err != nil {
@@ -274,6 +395,34 @@ func toStoreMessage(id string, e *events.Message) (msg store.Message, ok bool, e
 		}
 	}
 	return msg, true, nil
+}
+
+// content classifies a message: its stored type and body and the media sub-message to keep. skip is
+// true for what is not chat content: protocol messages, bare sender-key distribution, reactions,
+// poll votes, pins and keep-in-chat markers.
+func content(m *waE2E.Message) (typ, body string, media proto.Message, skip bool) {
+	switch {
+	case m.GetConversation() != "":
+		return TypeText, m.GetConversation(), nil, false
+	case m.GetExtendedTextMessage() != nil:
+		return TypeText, m.GetExtendedTextMessage().GetText(), nil, false
+	case m.GetImageMessage() != nil:
+		return TypeImage, m.GetImageMessage().GetCaption(), m.GetImageMessage(), false
+	case m.GetVideoMessage() != nil:
+		return TypeVideo, m.GetVideoMessage().GetCaption(), m.GetVideoMessage(), false
+	case m.GetAudioMessage() != nil:
+		return TypeAudio, "", m.GetAudioMessage(), false
+	case m.GetDocumentMessage() != nil:
+		d := m.GetDocumentMessage()
+		return TypeDocument, cmp.Or(d.GetCaption(), d.GetFileName()), d, false
+	case m.GetStickerMessage() != nil:
+		return TypeSticker, "", m.GetStickerMessage(), false
+	case m.GetProtocolMessage() != nil, m.GetSenderKeyDistributionMessage() != nil,
+		m.GetReactionMessage() != nil, m.GetPollUpdateMessage() != nil,
+		m.GetPinInChatMessage() != nil, m.GetKeepInChatMessage() != nil:
+		return "", "", nil, true
+	}
+	return TypeUnsupported, "", nil, false
 }
 
 func receiptStatus(t types.ReceiptType) string {

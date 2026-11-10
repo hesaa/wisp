@@ -42,10 +42,20 @@ type fakeClient struct {
 	presenceErr error
 	sent        []*waE2E.Message
 	download    []byte
-	receipts    [][]string // ids per MarkRead call
+	receipts    [][]string              // ids per MarkRead call
+	pns         map[types.JID]types.JID // LID -> phone number
+	names       map[types.JID]string    // address-book names
 }
 
 func (f *fakeClient) Disconnect() {}
+
+func (f *fakeClient) PNForLID(_ context.Context, lid types.JID) (types.JID, error) {
+	return f.pns[lid], nil
+}
+
+func (f *fakeClient) ContactName(_ context.Context, jid types.JID) (string, error) {
+	return f.names[jid], nil
+}
 
 func (f *fakeClient) SendPresence(_ context.Context, p types.Presence) error {
 	f.presences = append(f.presences, p)
@@ -72,15 +82,33 @@ func (f *fakeClient) DownloadToFile(_ context.Context, _ whatsmeow.DownloadableM
 	return err
 }
 
-// spyStore records the largest InsertMessagesBatch call.
+// spyStore records the largest InsertMessagesBatch call; with fail set, message and status writes fail.
 type spyStore struct {
 	*store.DB
 	maxBatch int
+	fail     error
 }
 
 func (s *spyStore) InsertMessagesBatch(msgs []store.Message) error {
 	s.maxBatch = max(s.maxBatch, len(msgs))
+	if s.fail != nil {
+		return s.fail
+	}
 	return s.DB.InsertMessagesBatch(msgs)
+}
+
+func (s *spyStore) InsertMessage(msg store.Message) (bool, error) {
+	if s.fail != nil {
+		return false, s.fail
+	}
+	return s.DB.InsertMessage(msg)
+}
+
+func (s *spyStore) UpdateMessageStatus(accountID, chatJID string, ids []string, status string) error {
+	if s.fail != nil {
+		return s.fail
+	}
+	return s.DB.UpdateMessageStatus(accountID, chatJID, ids, status)
 }
 
 func newTestManager(t *testing.T) (*Manager, *spyStore) {
@@ -139,11 +167,13 @@ func TestRoutesMessageToItsAccountOnly(t *testing.T) {
 	var got []any
 	m.AddListener(func(e any) { got = append(got, e) })
 
-	if err := m.handleEvent(acctA, fa, incoming(alice, "m1", "hi")); err != nil {
-		t.Fatal(err)
+	for range 2 { // the second is a redelivery
+		if err := m.handleEvent(ctx, acctA, fa, incoming(alice, "m1", "hi")); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if len(got) != 1 {
-		t.Fatalf("listener got %d events", len(got))
+		t.Fatalf("listener got %d events, want 1 (a redelivery must not re-emit)", len(got))
 	}
 	ev, ok := got[0].(MessageEvent)
 	if !ok || ev.AccountID != acctA || ev.Message.AccountID != acctA || ev.Message.Body != "hi" ||
@@ -198,13 +228,13 @@ func TestReceiptsAdvanceStatusPerAccount(t *testing.T) {
 	var got []any
 	m.AddListener(func(e any) { got = append(got, e) })
 
-	if err := m.handleEvent(acctA, fa, receipt(types.ReceiptTypeDelivered, sent.ID)); err != nil {
+	if err := m.handleEvent(ctx, acctA, fa, receipt(types.ReceiptTypeDelivered, sent.ID)); err != nil {
 		t.Fatal(err)
 	}
 	if s := statusOf(t, db, acctA, sent.ID); s != store.StatusDelivered {
 		t.Fatalf("after delivered: %s", s)
 	}
-	if err := m.handleEvent(acctA, fa, receipt(types.ReceiptTypeRead, sent.ID)); err != nil {
+	if err := m.handleEvent(ctx, acctA, fa, receipt(types.ReceiptTypeRead, sent.ID)); err != nil {
 		t.Fatal(err)
 	}
 	if s := statusOf(t, db, acctA, sent.ID); s != store.StatusRead {
@@ -218,10 +248,10 @@ func TestReceiptsAdvanceStatusPerAccount(t *testing.T) {
 	}
 
 	// reading an incoming message on another of the user's devices clears it here
-	if err := m.handleEvent(acctA, fa, incoming(alice, "in1", "yo")); err != nil {
+	if err := m.handleEvent(ctx, acctA, fa, incoming(alice, "in1", "yo")); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.handleEvent(acctA, fa, receipt(types.ReceiptTypeReadSelf, "in1")); err != nil {
+	if err := m.handleEvent(ctx, acctA, fa, receipt(types.ReceiptTypeReadSelf, "in1")); err != nil {
 		t.Fatal(err)
 	}
 	if chats, _ := db.ListChats(acctA); chats[0].Unread != 0 {
@@ -233,7 +263,7 @@ func TestStatusBroadcastStoredWithoutChat(t *testing.T) {
 	m, db := newTestManager(t)
 	fa := &fakeClient{}
 	m.add(acctA, fa)
-	if err := m.handleEvent(acctA, fa, incoming(types.StatusBroadcastJID, "s1", "my story")); err != nil {
+	if err := m.handleEvent(ctx, acctA, fa, incoming(types.StatusBroadcastJID, "s1", "my story")); err != nil {
 		t.Fatal(err)
 	}
 	page, _ := db.GetChatMessages(acctA, types.StatusBroadcastJID.String(), 0)
@@ -247,7 +277,7 @@ func TestHistorySyncInsertsInBatches(t *testing.T) {
 	m, db := newTestManager(t)
 	dev := m.container.NewDevice()
 	dev.ID = &types.JID{User: acctA, Server: types.DefaultUserServer}
-	cli := whatsmeow.NewClient(dev, nil) // offline: only ParseWebMessage is used
+	cli := liveClient{whatsmeow.NewClient(dev, nil)} // offline: only ParseWebMessage is used
 
 	conv := &waHistorySync.Conversation{ID: proto.String(alice.String()), Name: proto.String("Alice"), UnreadCount: proto.Uint32(2)}
 	for i := range 250 {
@@ -259,8 +289,16 @@ func TestHistorySyncInsertsInBatches(t *testing.T) {
 	}
 	var got []any
 	m.AddListener(func(e any) { got = append(got, e) })
-	evt := &events.HistorySync{Data: &waHistorySync.HistorySync{Conversations: []*waHistorySync.Conversation{conv}}}
-	if err := m.handleEvent(acctA, cli, evt); err != nil {
+	stories := []*waWeb.WebMessageInfo{}
+	for i := range 3 {
+		stories = append(stories, &waWeb.WebMessageInfo{
+			Key:              &waCommon.MessageKey{RemoteJID: proto.String(types.StatusBroadcastJID.String()), Participant: proto.String(alice.String()), ID: proto.String(fmt.Sprintf("s%d", i))},
+			MessageTimestamp: proto.Uint64(uint64(2000 + i)),
+			Message:          &waE2E.Message{Conversation: proto.String("story")},
+		})
+	}
+	evt := &events.HistorySync{Data: &waHistorySync.HistorySync{Conversations: []*waHistorySync.Conversation{conv}, StatusV3Messages: stories}}
+	if err := m.handleEvent(ctx, acctA, cli, evt); err != nil {
 		t.Fatal(err)
 	}
 
@@ -281,7 +319,10 @@ func TestHistorySyncInsertsInBatches(t *testing.T) {
 	if n != 250 {
 		t.Fatalf("stored %d of 250", n)
 	}
-	chats, _ := db.ListChats(acctA)
+	if st, _ := db.GetChatMessages(acctA, types.StatusBroadcastJID.String(), 0); len(st) != 3 || st[0].SenderJID != alice.String() {
+		t.Fatalf("stories stored: %+v", st)
+	}
+	chats, _ := db.ListChats(acctA) // stories add no chat row
 	if len(chats) != 1 || chats[0].Name != "Alice" || chats[0].Unread != 2 {
 		t.Fatalf("chats %+v (want name Alice, unread 2)", chats)
 	}
@@ -317,7 +358,7 @@ func TestIncomingImageDownloadsIntoCache(t *testing.T) {
 		Caption: proto.String("look"), Mimetype: proto.String("image/jpeg"),
 		DirectPath: proto.String("/x"), MediaKey: []byte("k"), JPEGThumbnail: []byte("thumb"),
 	}}
-	if err := m.handleEvent(acctA, fa, evt); err != nil {
+	if err := m.handleEvent(ctx, acctA, fa, evt); err != nil {
 		t.Fatal(err)
 	}
 	page, _ := db.GetChatMessages(acctA, alice.String(), 0)
@@ -401,5 +442,171 @@ func TestMarkReadOneReceiptPerSender(t *testing.T) {
 	}
 	if chats, _ := db.ListChats(acctA); chats[0].Unread != 0 {
 		t.Fatalf("unread %d", chats[0].Unread)
+	}
+}
+
+func TestFailedStoreWithholdsMessageAck(t *testing.T) {
+	m, db := newTestManager(t)
+	fa := &fakeClient{}
+	m.add(acctA, fa)
+	var errs []ErrorEvent
+	m.AddListener(func(e any) {
+		if ee, ok := e.(ErrorEvent); ok {
+			errs = append(errs, ee)
+		}
+	})
+	db.fail = errors.New("disk full")
+	if m.onEvent(ctx, acctA, fa, incoming(alice, "m1", "hi")) {
+		t.Fatal("message acked although it was not stored")
+	}
+	receipt := &events.Receipt{MessageSource: types.MessageSource{Chat: alice, Sender: alice}, MessageIDs: []string{"x"}, Type: types.ReceiptTypeRead}
+	if !m.onEvent(ctx, acctA, fa, receipt) {
+		t.Fatal("receipt ack withheld")
+	}
+	if len(errs) != 2 || errs[0].AccountID != acctA || !errors.Is(errs[0].Err, db.fail) {
+		t.Fatalf("error events %+v", errs)
+	}
+	db.fail = nil
+	if !m.onEvent(ctx, acctA, fa, incoming(alice, "m1", "hi")) {
+		t.Fatal("redelivered message not acked after the store recovered")
+	}
+}
+
+func TestLIDChatsStoredUnderPhoneNumber(t *testing.T) {
+	m, db := newTestManager(t)
+	lid := types.NewJID("123456789012345", types.HiddenUserServer)
+	fa := &fakeClient{pns: map[types.JID]types.JID{lid: alice}}
+	m.add(acctA, fa)
+	evt := incoming(lid, "l1", "via lid")
+	evt.Info.Sender = types.JID{User: lid.User, Server: types.HiddenUserServer, Device: 3}
+	evt.Info.SenderAlt = types.JID{User: alice.User, Server: types.DefaultUserServer, Device: 3}
+	fa.pns = nil // this one must come from SenderAlt
+	if err := m.handleEvent(ctx, acctA, fa, evt); err != nil {
+		t.Fatal(err)
+	}
+	page, _ := db.GetChatMessages(acctA, alice.String(), 0)
+	if len(page) != 1 || page[0].SenderJID != alice.String() {
+		t.Fatalf("stored under phone number: %+v", page)
+	}
+	// a receipt addressed by LID alone is resolved through the account's LID map
+	fa.pns = map[types.JID]types.JID{lid: alice}
+	sent, err := m.SendText(ctx, acctA, alice.String(), "reply")
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := &events.Receipt{MessageSource: types.MessageSource{Chat: lid, Sender: lid}, MessageIDs: []string{sent.ID}, Type: types.ReceiptTypeRead}
+	if err := m.handleEvent(ctx, acctA, fa, receipt); err != nil {
+		t.Fatal(err)
+	}
+	if s := statusOf(t, db, acctA, sent.ID); s != store.StatusRead {
+		t.Fatalf("reply status %q after LID receipt", s)
+	}
+	if chats, _ := db.ListChats(acctA); len(chats) != 1 {
+		t.Fatalf("one contact became %d chats: %+v", len(chats), chats)
+	}
+	// with no mapping at all the LID is kept rather than the message dropped
+	other := types.NewJID("999999999999999", types.HiddenUserServer)
+	if err := m.handleEvent(ctx, acctA, fa, incoming(other, "o1", "unknown")); err != nil {
+		t.Fatal(err)
+	}
+	if page, _ := db.GetChatMessages(acctA, other.String(), 0); len(page) != 1 {
+		t.Fatalf("unmapped LID message: %+v", page)
+	}
+}
+
+func TestEditAndRevokeReviseStoredMessage(t *testing.T) {
+	m, db := newTestManager(t)
+	fa := &fakeClient{}
+	m.add(acctA, fa)
+	img := incoming(alice, "i1", "")
+	img.Message = &waE2E.Message{ImageMessage: &waE2E.ImageMessage{Caption: proto.String("pic"), MediaKey: []byte("k")}}
+	edit := incoming(alice, "e1", "")
+	edit.Message = &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+		Type: waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(), Key: &waCommon.MessageKey{ID: proto.String("t1")},
+		EditedMessage: &waE2E.Message{Conversation: proto.String("fixed")},
+	}}
+	revoke := incoming(alice, "r1", "")
+	revoke.Message = &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+		Type: waE2E.ProtocolMessage_REVOKE.Enum(), Key: &waCommon.MessageKey{ID: proto.String("i1")},
+	}}
+	untyped := incoming(alice, "u1", "") // no Type: must not be taken for REVOKE, its zero value
+	untyped.Message = &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{Key: &waCommon.MessageKey{ID: proto.String("t1")}}}
+	var got []any
+	m.AddListener(func(e any) { got = append(got, e) })
+	for _, e := range []*events.Message{incoming(alice, "t1", "tpyo"), img, edit, revoke, untyped} {
+		if err := m.handleEvent(ctx, acctA, fa, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, _ := db.GetChatMessages(acctA, alice.String(), 0)
+	byID := map[string]store.Message{}
+	for _, msg := range page {
+		byID[msg.ID] = msg
+	}
+	if len(page) != 2 || byID["t1"].Body != "fixed" || byID["t1"].Type != TypeText {
+		t.Fatalf("after edit: %+v", page)
+	}
+	if r := byID["i1"]; r.Type != TypeRevoked || r.Body != revokedBody || len(r.MediaMeta) != 0 {
+		t.Fatalf("after revoke: %+v", r)
+	}
+	if ev, ok := got[len(got)-1].(RevisedEvent); !ok || ev != (RevisedEvent{AccountID: acctA, ChatJID: alice.String(), ID: "i1"}) {
+		t.Fatalf("last event %#v", got[len(got)-1])
+	}
+}
+
+func TestReactionsSkippedUnknownKindsStoredRead(t *testing.T) {
+	m, db := newTestManager(t)
+	fa := &fakeClient{}
+	m.add(acctA, fa)
+	react := incoming(alice, "x1", "")
+	react.Message = &waE2E.Message{ReactionMessage: &waE2E.ReactionMessage{Text: proto.String("ok"), Key: &waCommon.MessageKey{ID: proto.String("m")}}}
+	poll := incoming(alice, "p1", "")
+	poll.Message = &waE2E.Message{PollCreationMessage: &waE2E.PollCreationMessage{Name: proto.String("lunch?")}}
+	for _, e := range []*events.Message{react, poll} {
+		if err := m.handleEvent(ctx, acctA, fa, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, _ := db.GetChatMessages(acctA, alice.String(), 0)
+	if len(page) != 1 || page[0].ID != "p1" || page[0].Type != TypeUnsupported || page[0].Status != store.StatusRead {
+		t.Fatalf("stored %+v", page)
+	}
+	if chats, _ := db.ListChats(acctA); chats[0].Unread != 0 {
+		t.Fatalf("unsupported message counted unread: %d", chats[0].Unread)
+	}
+}
+
+func TestPushNameNeverReplacesChatName(t *testing.T) {
+	m, db := newTestManager(t)
+	fa := &fakeClient{}
+	m.add(acctA, fa)
+	bob := types.NewJID("6284444444444", types.DefaultUserServer)
+	if err := db.UpsertChat(acctA, alice.String(), "Alice (work)", 1); err != nil {
+		t.Fatal(err)
+	}
+	dash := incoming(bob, "b1", "hi")
+	dash.Info.PushName = "-" // whatsmeow's "no name"
+	for _, e := range []*events.Message{incoming(alice, "a1", "hi"), dash} {
+		if err := m.handleEvent(ctx, acctA, fa, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	names := func() map[string]string {
+		chats, _ := db.ListChats(acctA)
+		out := map[string]string{}
+		for _, c := range chats {
+			out[c.JID] = c.Name
+		}
+		return out
+	}
+	if n := names(); n[alice.String()] != "Alice (work)" || n[bob.String()] != "" {
+		t.Fatalf("names %v", n)
+	}
+	fa.names = map[types.JID]string{alice: "Alice Smith"} // the address book wins
+	if err := m.handleEvent(ctx, acctA, fa, incoming(alice, "a2", "again")); err != nil {
+		t.Fatal(err)
+	}
+	if n := names(); n[alice.String()] != "Alice Smith" {
+		t.Fatalf("names %v", n)
 	}
 }
