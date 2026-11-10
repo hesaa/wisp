@@ -12,6 +12,7 @@ import (
 	"image/jpeg"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -214,18 +215,53 @@ func TestCacheSizeAndClear(t *testing.T) {
 	}
 }
 
-func TestOpenRefusals(t *testing.T) {
+func TestCheckOpenable(t *testing.T) {
 	c, root := newCache(t)
-	exe, _ := c.Save("a1", ".exe", strings.NewReader("MZ"))
-	if err := c.OpenInDefaultApp(exe); err == nil {
-		t.Fatal("exe opened")
+	touch := func(p string) string {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
 	}
-	outside := filepath.Join(t.TempDir(), "x.pdf")
-	os.WriteFile(outside, []byte("x"), 0o600)
-	if err := c.OpenInDefaultApp(outside); err == nil {
-		t.Fatal("outside opened")
+	media := filepath.Join(root, "acct", "media")
+	good := touch(filepath.Join(media, "ok.pdf"))
+	want, _ := filepath.EvalSymlinks(good)
+	if got, err := c.checkOpenable(good); err != nil || got != want {
+		t.Fatalf("happy path: %q %v", got, err)
 	}
-	if err := c.OpenInDefaultApp(filepath.Join(root, "a1", "media", "..", "..", "..", "x.pdf")); err == nil {
-		t.Fatal("traversal opened")
+
+	outside := touch(filepath.Join(filepath.Dir(root), "outside-"+filepath.Base(root)+".pdf"))
+	sibling := touch(filepath.Join(root+"2", "x.pdf"))
+	t.Cleanup(func() { os.Remove(outside); os.RemoveAll(root + "2") })
+	cases := map[string]string{
+		"exe in root":    touch(filepath.Join(media, "bad.exe")),
+		"outside":        outside,
+		"dotdot escape":  filepath.Join(media, "..", "..", "..", filepath.Base(outside)),
+		"prefix sibling": sibling,
+		"ADS exe:pdf":    good[:len(good)-4] + ".exe:x.pdf",
+		"ADS pdf:exe":    good + ":evil.exe",
+		"missing file":   filepath.Join(media, "nope.pdf"),
+	}
+	for name, p := range cases {
+		if got, err := c.checkOpenable(p); err == nil {
+			t.Errorf("%s: accepted, resolved %q", name, got)
+		}
+	}
+
+	// Directory link inside the root pointing outside it.
+	link := filepath.Join(media, "lnk")
+	target := filepath.Dir(sibling)
+	if err := os.Symlink(target, link); err != nil {
+		out, jerr := exec.Command("cmd", "/c", "mklink", "/J", link, target).CombinedOutput()
+		if jerr != nil {
+			t.Skipf("cannot create symlink (%v) or junction (%v: %s); link-escape case skipped", err, jerr, out)
+		}
+	}
+	if got, err := c.checkOpenable(filepath.Join(link, "x.pdf")); err == nil {
+		t.Errorf("link escape accepted, resolved %q", got)
 	}
 }

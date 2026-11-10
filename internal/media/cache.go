@@ -206,12 +206,9 @@ func (c *Cache) ClearMediaCache() error {
 // OpenInDefaultApp launches a cached file with its Windows default handler,
 // refusing paths outside the cache root and non-allowlisted extensions.
 func (c *Cache) OpenInDefaultApp(filePath string) error {
-	resolved, err := c.inRoot(filePath)
+	resolved, err := c.checkOpenable(filePath)
 	if err != nil {
 		return err
-	}
-	if ext := strings.ToLower(filepath.Ext(resolved)); !openAllow[ext] {
-		return fmt.Errorf("media: refusing to open %q files", ext)
 	}
 	p, err := windows.UTF16PtrFromString(resolved)
 	if err != nil {
@@ -220,8 +217,24 @@ func (c *Cache) OpenInDefaultApp(filePath string) error {
 	return windows.ShellExecute(0, windows.StringToUTF16Ptr("open"), p, nil, nil, windows.SW_SHOWNORMAL)
 }
 
+// checkOpenable returns the resolved path if it is inside the root and allowlisted.
+func (c *Cache) checkOpenable(filePath string) (string, error) {
+	resolved, err := c.inRoot(filePath)
+	if err != nil {
+		return "", err
+	}
+	if ext := strings.ToLower(filepath.Ext(resolved)); !openAllow[ext] {
+		return "", fmt.Errorf("media: refusing to open %q files", ext)
+	}
+	return resolved, nil
+}
+
 // inRoot resolves symlinks/.. and returns the real path if it lies inside the root.
 func (c *Cache) inRoot(path string) (string, error) {
+	// Reject NTFS alternate data streams ("file.exe:x.pdf") outright.
+	if strings.Contains(path[len(filepath.VolumeName(path)):], ":") {
+		return "", fmt.Errorf("media: %q contains ':'", path)
+	}
 	root, err := filepath.EvalSymlinks(c.root)
 	if err != nil {
 		return "", err
