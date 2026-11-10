@@ -12,6 +12,9 @@ const (
 	StatusSent      = "sent"
 	StatusDelivered = "delivered"
 	StatusRead      = "read"
+
+	// statusBroadcastJID holds WhatsApp stories: stored and read by chat JID, never listed as a chat.
+	statusBroadcastJID = "status@broadcast"
 )
 
 // Message is one stored message. Incoming messages are unread until Status is StatusRead.
@@ -26,6 +29,7 @@ type Message struct {
 	MediaPath string
 	Status    string
 	FromMe    bool
+	MediaMeta []byte // marshaled media sub-message (keys + embedded thumbnail) for on-demand download
 }
 
 // Chat is a sidebar row.
@@ -38,7 +42,8 @@ type Chat struct {
 }
 
 // InsertMessagesBatch stores msgs in transactions of BatchSize rows. Messages already
-// stored (same account, chat, id) are ignored. Chats are created/bumped as needed.
+// stored (same account, chat, id) are ignored. Chats are created/bumped as needed
+// (never for status@broadcast).
 func (d *DB) InsertMessagesBatch(msgs []Message) error {
 	for start := 0; start < len(msgs); start += BatchSize {
 		end := min(start+BatchSize, len(msgs))
@@ -56,8 +61,8 @@ func (d *DB) insertChunk(msgs []Message) error {
 	}
 	defer tx.Rollback()
 	ins, err := tx.Prepare(`INSERT OR IGNORE INTO messages
-		(account_id, chat_jid, id, sender_jid, timestamp, message_type, body, media_path, status, from_me)
-		VALUES (?,?,?,?,?,?,?,?,?,?)`)
+		(account_id, chat_jid, id, sender_jid, timestamp, message_type, body, media_path, status, from_me, media_meta)
+		VALUES (?,?,?,?,?,?,?,?,?,?,COALESCE(?, x''))`) // COALESCE: a nil []byte binds as NULL
 	if err != nil {
 		return err
 	}
@@ -69,8 +74,11 @@ func (d *DB) insertChunk(msgs []Message) error {
 	}
 	defer chat.Close()
 	for _, m := range msgs {
-		if _, err := ins.Exec(m.AccountID, m.ChatJID, m.ID, m.SenderJID, m.Timestamp, m.Type, m.Body, m.MediaPath, m.Status, m.FromMe); err != nil {
+		if _, err := ins.Exec(m.AccountID, m.ChatJID, m.ID, m.SenderJID, m.Timestamp, m.Type, m.Body, m.MediaPath, m.Status, m.FromMe, m.MediaMeta); err != nil {
 			return err
+		}
+		if m.ChatJID == statusBroadcastJID {
+			continue
 		}
 		if _, err := chat.Exec(m.AccountID, m.ChatJID, m.Timestamp); err != nil {
 			return err
@@ -84,7 +92,7 @@ func (d *DB) GetChatMessages(accountID, chatJID string, page int) ([]Message, er
 	if page < 0 {
 		page = 0
 	}
-	rows, err := d.sql.Query(`SELECT id, chat_jid, account_id, sender_jid, timestamp, message_type, body, media_path, status, from_me
+	rows, err := d.sql.Query(`SELECT id, chat_jid, account_id, sender_jid, timestamp, message_type, body, media_path, status, from_me, media_meta
 		FROM messages WHERE account_id = ? AND chat_jid = ?
 		ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?`, accountID, chatJID, PageSize, page*PageSize)
 	if err != nil {
@@ -94,7 +102,7 @@ func (d *DB) GetChatMessages(accountID, chatJID string, page int) ([]Message, er
 	out := []Message{}
 	for rows.Next() {
 		var m Message
-		if err := rows.Scan(&m.ID, &m.ChatJID, &m.AccountID, &m.SenderJID, &m.Timestamp, &m.Type, &m.Body, &m.MediaPath, &m.Status, &m.FromMe); err != nil {
+		if err := rows.Scan(&m.ID, &m.ChatJID, &m.AccountID, &m.SenderJID, &m.Timestamp, &m.Type, &m.Body, &m.MediaPath, &m.Status, &m.FromMe, &m.MediaMeta); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
@@ -130,6 +138,12 @@ func (d *DB) UpdateMessageStatus(accountID, chatJID string, ids []string, status
 		}
 	}
 	return tx.Commit()
+}
+
+// SetMediaPath records where a message's downloaded media was cached.
+func (d *DB) SetMediaPath(accountID, chatJID, id, path string) error {
+	_, err := d.sql.Exec(`UPDATE messages SET media_path = ? WHERE account_id = ? AND chat_jid = ? AND id = ?`, path, accountID, chatJID, id)
+	return err
 }
 
 // MarkChatRead marks all incoming messages in the chat as read.

@@ -188,3 +188,16 @@ func TestStatusNeverRegresses(t *testing.T) {
 		t.Fatal("unknown status accepted")
 	}
 }
+
+func TestMediaMetaRoundTrip(t *testing.T) {
+	db := openTest(t)
+	ms := msgs(acct, "c1", 2, false)
+	ms[1].MediaMeta = []byte{1, 2, 3}
+	if err := db.InsertMessagesBatch(ms); err != nil {
+		t.Fatal(err)
+	}
+	page, _ := db.GetChatMessages(acct, "c1", 0)
+	if string(page[0].MediaMeta) != "\x01\x02\x03" || len(page[1].MediaMeta) != 0 {
+		t.Fatalf("meta %v / %v", page[0].MediaMeta, page[1].MediaMeta)
+	}
+}

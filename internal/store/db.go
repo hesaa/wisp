@@ -37,6 +37,7 @@ CREATE TABLE messages (
 	media_path   TEXT NOT NULL DEFAULT '',
 	status       TEXT NOT NULL DEFAULT '',
 	from_me      INTEGER NOT NULL DEFAULT 0,
+	media_meta   BLOB NOT NULL DEFAULT x'',
 	PRIMARY KEY (account_id, chat_jid, id)
 );
 CREATE INDEX messages_page ON messages (account_id, chat_jid, timestamp DESC, id DESC);
