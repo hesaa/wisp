@@ -61,10 +61,19 @@ func unreadIncoming(msgs []store.Message) []store.Message {
 	return out
 }
 
-// presenceFor is the presence every account shows: available only while the window is visible and
-// the user does not appear offline.
-func presenceFor(visible, appearOffline bool) types.Presence {
-	if visible && !appearOffline {
+// windowState is how the main window shows.
+type windowState int
+
+const (
+	windowShown     windowState = iota // on screen
+	windowMinimized                    // on the taskbar
+	windowHidden                       // closed to the tray
+)
+
+// presenceFor is the presence every account shows: available only while the window is on screen
+// (neither minimised nor in the tray) and the user does not appear offline.
+func presenceFor(w windowState, appearOffline bool) types.Presence {
+	if w == windowShown && !appearOffline {
 		return types.PresenceAvailable
 	}
 	return types.PresenceUnavailable
@@ -73,11 +82,11 @@ func presenceFor(visible, appearOffline bool) types.Presence {
 // presenceState remembers the last broadcast presence, so window activations do not repeat it.
 type presenceState struct{ sent types.Presence }
 
-// next returns the presence for the window's visibility and the appear-offline setting, and whether
-// to broadcast it: always when forced (hidden to the tray, exit, a setting change, a reconnect),
+// next returns the presence for the window's state and the appear-offline setting, and whether to
+// broadcast it: always when forced (minimised, hidden to the tray, a setting change, a reconnect),
 // otherwise only when it differs from the last one.
-func (p *presenceState) next(visible, appearOffline, force bool) (types.Presence, bool) {
-	want := presenceFor(visible, appearOffline)
+func (p *presenceState) next(w windowState, appearOffline, force bool) (types.Presence, bool) {
+	want := presenceFor(w, appearOffline)
 	if !force && want == p.sent {
 		return want, false
 	}

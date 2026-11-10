@@ -82,31 +82,53 @@ func TestUnreadIncoming(t *testing.T) {
 	}
 }
 
+func TestPresenceForEveryWindowState(t *testing.T) {
+	for _, w := range []windowState{windowShown, windowMinimized, windowHidden} {
+		for _, appearOffline := range []bool{false, true} {
+			want := types.PresenceUnavailable
+			if w == windowShown && !appearOffline {
+				want = types.PresenceAvailable // only on screen, and only when not appearing offline
+			}
+			if got := presenceFor(w, appearOffline); got != want {
+				t.Errorf("presenceFor(%v, appear offline %v) = %q, want %q", w, appearOffline, got, want)
+			}
+		}
+	}
+}
+
 func TestPresenceDecisions(t *testing.T) {
 	type step struct {
-		visible, appearOffline, force bool
-		want                          types.Presence
-		send                          bool
+		window        windowState
+		appearOffline bool
+		force         bool
+		want          types.Presence
+		send          bool
 	}
+	on, off := types.PresenceAvailable, types.PresenceUnavailable
 	for name, steps := range map[string][]step{
-		"startup online, activations, hide to tray, restore": {
-			{true, false, false, types.PresenceAvailable, true},
-			{true, false, false, types.PresenceAvailable, false},  // another activation: nothing new
-			{false, false, true, types.PresenceUnavailable, true}, // closed to the tray: at once
-			{true, false, false, types.PresenceAvailable, true},   // restored
-			{true, false, true, types.PresenceAvailable, true},    // reconnected: said again
+		"startup, activations, minimise, restore, tray, restore": {
+			{windowShown, false, false, on, true},
+			{windowShown, false, false, on, false},      // another activation: nothing new
+			{windowMinimized, false, true, off, true},   // minimised: at once
+			{windowMinimized, false, false, off, false}, // still minimised (an activation)
+			{windowShown, false, false, on, true},       // restored
+			{windowHidden, false, true, off, true},      // closed to the tray: at once
+			{windowShown, false, false, on, true},       // restored from the tray
+			{windowShown, false, true, on, true},        // reconnected: said again
 		},
-		"appear offline": {
-			{true, true, false, types.PresenceUnavailable, true}, // startup
-			{true, true, false, types.PresenceUnavailable, false},
-			{false, true, true, types.PresenceUnavailable, true},
-			{true, true, false, types.PresenceUnavailable, false}, // restored: still offline, already said
-			{true, false, true, types.PresenceAvailable, true},    // setting turned off
+		"appear offline wins in every state": {
+			{windowShown, true, false, off, true}, // startup
+			{windowShown, true, false, off, false},
+			{windowMinimized, true, false, off, false},
+			{windowShown, true, false, off, false},
+			{windowHidden, true, true, off, true},
+			{windowShown, true, false, off, false}, // restored: still offline, already said
+			{windowShown, false, true, on, true},   // setting turned off
 		},
 	} {
 		var p presenceState
 		for i, s := range steps {
-			got, send := p.next(s.visible, s.appearOffline, s.force)
+			got, send := p.next(s.window, s.appearOffline, s.force)
 			if got != s.want || send != s.send {
 				t.Errorf("%s, step %d: got %q send %v, want %q send %v", name, i, got, send, s.want, s.send)
 			}

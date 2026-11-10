@@ -86,6 +86,7 @@ type App struct {
 	statusAcct string
 	pairing    bool
 	exiting    bool
+	minimized  bool // as sizeChanged last saw the window
 }
 
 // New builds the main window, themed by the settings in db; nothing connects until Attach.
@@ -169,6 +170,7 @@ func (a *App) build() error {
 	a.bar.OnSendGIF(a.sendGIF)
 	mw.Closing().Attach(a.closing)
 	mw.Activating().Attach(a.activated)
+	mw.SizeChanged().Attach(a.sizeChanged)
 	// the focus can only be set once the window runs; the search box takes it, without a focus ring
 	mw.Starting().Attach(func() { mw.Synchronize(func() { logErr("focus", a.side.FocusSearch()) }) })
 	mw.SendMessage(win.WM_CHANGEUISTATE, win.UIS_INITIALIZE, 0)
@@ -276,8 +278,29 @@ func (a *App) foreground() bool {
 // sendPresence broadcasts the presence the window's state calls for (see presenceState.next).
 // Accounts not connected yet fail (logged); a reconnect broadcasts again.
 func (a *App) sendPresence(force bool) {
-	if p, send := a.presence.next(a.mw.Visible(), a.cfg[ui.KeyAppearOffline] == "true", force); send {
+	if p, send := a.presence.next(a.windowState(), a.cfg[ui.KeyAppearOffline] == "true", force); send {
 		a.outbox.put(p)
+	}
+}
+
+func (a *App) windowState() windowState {
+	switch {
+	case !a.mw.Visible():
+		return windowHidden
+	case win.IsIconic(a.mw.Handle()):
+		return windowMinimized
+	}
+	return windowShown
+}
+
+// sizeChanged follows minimising and restoring (walk publishes SizeChanged from WM_WINDOWPOSCHANGED,
+// which every route sends: the minimise button, the taskbar button, Win+Down): minimised, every
+// account goes unavailable at once, as when closed to the tray; restored, available again unless
+// appearing offline.
+func (a *App) sizeChanged() {
+	if m := win.IsIconic(a.mw.Handle()); m != a.minimized {
+		a.minimized = m
+		a.sendPresence(m)
 	}
 }
 
