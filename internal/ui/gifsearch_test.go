@@ -58,6 +58,9 @@ func TestOnlyGiphyHTTPSURLsAreFetched(t *testing.T) {
 		"https://media0.giphy.com\\@evil.com/x.gif":   false,
 		"": false,
 		"https://media0.giphy.com/x.gif\x00.evil.com": false,
+		"https://media0.gİphy.com/x.gif":              false, // U+0130 lower-cases to ASCII i, but is dialled as punycode
+		"https://gİphy.com/x":                         false,
+		"https://media0.xn--giphy-8fd.com/x.gif":      false, // that punycode spelled out
 	} {
 		if got := allowedGIFURL(raw); got != want {
 			t.Errorf("allowedGIFURL(%q) = %v", raw, got)
@@ -201,6 +204,14 @@ func TestGiphyFailuresAreErrorsThatHideTheKey(t *testing.T) {
 	srv.Close() // connection refused: net/http's error names the URL, which holds the key
 	if _, err := g.search(context.Background(), "S3CRET", "cats"); err == nil || strings.Contains(err.Error(), "S3CRET") {
 		t.Errorf("unreachable: error %v", err)
+	}
+	// a refused redirect that carries the key: the error names no more than the host
+	hop := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "https://evil.example/v1/gifs/search?api_key=S3CRET&q=cats", http.StatusFound)
+	}))
+	defer hop.Close()
+	if _, err := testGiphy(hop).search(context.Background(), "S3CRET", "cats"); err == nil || strings.Contains(err.Error(), "S3CRET") {
+		t.Errorf("refused redirect: error %v", err)
 	}
 }
 

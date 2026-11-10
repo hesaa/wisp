@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -44,7 +45,8 @@ func newGiphy() *giphy {
 		Timeout: 15 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 3 || !allowedGIFURL(req.URL.String()) {
-				return fmt.Errorf("ui: refusing a GIF redirect to %s", req.URL.Redacted())
+				// the host only: the target's query may repeat the API key
+				return fmt.Errorf("ui: refusing a GIF redirect to host %q", req.URL.Hostname())
 			}
 			return nil
 		},
@@ -62,7 +64,10 @@ func giphyURL(base, query, key string) string {
 // media0-4, i), on the default port and without user info.
 func allowedGIFURL(raw string) bool {
 	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != "https" || u.User != nil || u.Port() != "" {
+	// ASCII hosts only: a non-ASCII letter can lower-case to ASCII (U+0130 to i) while net/http
+	// dials the host's punycode, a different domain
+	if err != nil || u.Scheme != "https" || u.User != nil || u.Port() != "" ||
+		strings.IndexFunc(u.Host, func(r rune) bool { return r >= utf8.RuneSelf }) >= 0 {
 		return false
 	}
 	h := strings.ToLower(u.Host)
