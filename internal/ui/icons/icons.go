@@ -33,6 +33,7 @@ const (
 	IconDownload
 	IconVideo
 	IconAudio
+	IconGIF // "GIF" in a frame: the GIF search button
 )
 
 const (
@@ -122,6 +123,12 @@ var definitions = map[Icon][]op{
 	IconAudio: {
 		ellipse(4, 14.5, 7, 6),
 		poly(11, 17.5, 11, 3.5, 18.5, 6.5, 18.5, 10, 11, 7),
+	},
+	IconGIF: {
+		poly(2.5, 5, 21.5, 5, 21.5, 19, 2.5, 19, 2.5, 5),
+		poly(9.5, 9.5, 8.5, 8.5, 6.5, 8.5, 5.5, 9.5, 5.5, 14.5, 6.5, 15.5, 8.5, 15.5, 9.5, 14.5, 9.5, 12.5, 7.75, 12.5), // G
+		poly(12.25, 8.5, 12.25, 15.5),                                                                                   // I
+		poly(18.75, 8.5, 15, 8.5, 15, 15.5), poly(15, 12, 17.75, 12),                                                    // F
 	},
 }
 

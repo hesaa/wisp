@@ -42,6 +42,8 @@ type fakeClient struct {
 	presences   []types.Presence
 	presenceErr error
 	sent        []*waE2E.Message
+	uploads     []whatsmeow.MediaType
+	chatStates  []chatState // one per SendChatPresence call
 	download    []byte
 	receipts    []markRead              // one per MarkRead call
 	pns         map[types.JID]types.JID // LID -> phone number
@@ -51,6 +53,17 @@ type fakeClient struct {
 
 func (f *fakeClient) AllContacts(context.Context) (map[types.JID]types.ContactInfo, error) {
 	return f.contacts, nil
+}
+
+type chatState struct {
+	chat  types.JID
+	state types.ChatPresence
+	media types.ChatPresenceMedia
+}
+
+func (f *fakeClient) SendChatPresence(_ context.Context, chat types.JID, state types.ChatPresence, media types.ChatPresenceMedia) error {
+	f.chatStates = append(f.chatStates, chatState{chat, state, media})
+	return nil
 }
 
 type markRead struct {
@@ -83,7 +96,8 @@ func (f *fakeClient) MarkRead(_ context.Context, ids []types.MessageID, _ time.T
 	return nil
 }
 
-func (f *fakeClient) UploadReader(_ context.Context, r io.Reader, tmp io.ReadWriteSeeker, _ whatsmeow.MediaType) (whatsmeow.UploadResponse, error) {
+func (f *fakeClient) UploadReader(_ context.Context, r io.Reader, tmp io.ReadWriteSeeker, kind whatsmeow.MediaType) (whatsmeow.UploadResponse, error) {
+	f.uploads = append(f.uploads, kind)
 	n, err := io.Copy(tmp, r)
 	return whatsmeow.UploadResponse{DirectPath: "/direct", FileLength: uint64(n)}, err
 }
@@ -346,8 +360,10 @@ func TestUnknownAccountIsAnError(t *testing.T) {
 	m, _ := newTestManager(t)
 	m.add(acctA, &fakeClient{})
 	ops := map[string]func() error{
-		"SendText": func() error { _, err := m.SendText(ctx, "nope", alice.String(), "x"); return err },
-		"Logout":   func() error { return m.Logout(ctx, "nope") },
+		"SendText":  func() error { _, err := m.SendText(ctx, "nope", alice.String(), "x"); return err },
+		"Logout":    func() error { return m.Logout(ctx, "nope") },
+		"SendGIF":   func() error { _, err := m.SendGIF(ctx, "nope", alice.String(), "x.mp4"); return err },
+		"SetTyping": func() error { return m.SetTyping(ctx, "nope", alice.String(), true) },
 		"DownloadMedia": func() error {
 			_, err := m.DownloadMedia(ctx, store.Message{AccountID: "nope", Type: TypeImage})
 			return err
@@ -443,6 +459,52 @@ func TestSendMediaPicksImageOrDocument(t *testing.T) {
 	}
 	if page, _ := db.GetChatMessages(acctA, alice.String(), 0); len(page) != 2 {
 		t.Fatalf("stored %d outgoing", len(page))
+	}
+}
+
+func TestSendGIFIsALoopingVideo(t *testing.T) {
+	m, db := newTestManager(t)
+	fa := &fakeClient{}
+	m.add(acctA, fa)
+	mp4 := filepath.Join(t.TempDir(), "giphy-download")
+	if err := os.WriteFile(mp4, []byte("mp4 bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.SendGIF(ctx, acctA, alice.String(), mp4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := fa.sent[0].GetVideoMessage()
+	if !v.GetGifPlayback() || v.GetMimetype() != "video/mp4" || v.GetFileLength() != 9 || v.GetDirectPath() != "/direct" {
+		t.Fatalf("video message %v", v)
+	}
+	if len(fa.uploads) != 1 || fa.uploads[0] != whatsmeow.MediaVideo {
+		t.Fatalf("uploaded as %v, want video", fa.uploads)
+	}
+	if got.Type != TypeVideo || got.Status != store.StatusSent || filepath.Ext(got.MediaPath) != ".mp4" {
+		t.Fatalf("stored %+v", got)
+	}
+	if b, err := os.ReadFile(got.MediaPath); err != nil || string(b) != "mp4 bytes" {
+		t.Fatalf("cached copy %q: %q %v", got.MediaPath, b, err)
+	}
+	if page, _ := db.GetChatMessages(acctA, alice.String(), 0); len(page) != 1 || len(page[0].MediaMeta) == 0 {
+		t.Fatalf("stored %+v", page)
+	}
+}
+
+func TestSetTypingComposingThenPaused(t *testing.T) {
+	m, _ := newTestManager(t)
+	fa := &fakeClient{}
+	m.add(acctA, fa)
+	if err := errors.Join(m.SetTyping(ctx, acctA, alice.String(), true), m.SetTyping(ctx, acctA, alice.String(), false)); err != nil {
+		t.Fatal(err)
+	}
+	want := []chatState{{alice, types.ChatPresenceComposing, types.ChatPresenceMediaText}, {alice, types.ChatPresencePaused, types.ChatPresenceMediaText}}
+	if !slices.Equal(fa.chatStates, want) {
+		t.Fatalf("chat states %+v, want %+v", fa.chatStates, want)
+	}
+	if err := m.SetTyping(ctx, acctA, "1.2.3@s.whatsapp.net", true); err == nil {
+		t.Fatal("bad chat JID accepted")
 	}
 }
 

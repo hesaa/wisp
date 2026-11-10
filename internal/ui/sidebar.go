@@ -526,9 +526,9 @@ func (b *searchBox) applyPalette() error {
 	return errors.Join(setBg(b.Composite, b.pal.Sidebar), setBg(b.pill, b.pal.Header), setBg(b.edit, b.pal.Header), b.icon.Invalidate())
 }
 
-// noBorder drops the sunken client edge walk gives every LineEdit.
-func noBorder(le *walk.LineEdit) error {
-	h := le.Handle()
+// noBorder drops the sunken client edge walk gives every LineEdit and TextEdit.
+func noBorder(w walk.Window) error {
+	h := w.Handle()
 	ex := win.GetWindowLong(h, win.GWL_EXSTYLE)
 	if win.SetWindowLong(h, win.GWL_EXSTYLE, ex&^win.WS_EX_CLIENTEDGE) == 0 {
 		return fmt.Errorf("ui: SetWindowLong(GWL_EXSTYLE) failed")

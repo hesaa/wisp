@@ -220,33 +220,12 @@ func (m *Manager) SendMedia(ctx context.Context, accountID, chatJID, path, capti
 		return store.Message{}, err
 	}
 	mimeType := cmp.Or(mime.TypeByExtension(filepath.Ext(path)), "application/octet-stream")
-	src, err := os.Open(path)
-	if err != nil {
-		return store.Message{}, err
-	}
-	cached, err := m.media.Save(accountID, mediaExt(path, mimeType), src)
-	src.Close()
-	if err != nil {
-		return store.Message{}, err
-	}
-	f, err := os.Open(cached)
-	if err != nil {
-		return store.Message{}, err
-	}
-	defer f.Close()
-	tmp, err := os.CreateTemp("", "wa-go-upload-*")
-	if err != nil {
-		return store.Message{}, err
-	}
-	defer os.Remove(tmp.Name())
-	defer tmp.Close() // runs before the Remove
-
 	isImage := strings.HasPrefix(mimeType, "image/")
 	kind := whatsmeow.MediaDocument
 	if isImage {
 		kind = whatsmeow.MediaImage
 	}
-	up, err := cli.UploadReader(ctx, f, tmp, kind)
+	up, cached, err := m.upload(ctx, cli, accountID, path, mediaExt(path, mimeType), kind)
 	if err != nil {
 		return store.Message{}, err
 	}
@@ -269,6 +248,73 @@ func (m *Manager) SendMedia(ctx context.Context, accountID, chatJID, path, capti
 		}
 	}
 	return m.send(ctx, cli, accountID, chat, msg, cached)
+}
+
+// SendGIF sends the MP4 at mp4Path to chatJID as a GIF: a video the recipient's app loops silently.
+// Like SendMedia it streams the file into the media cache and uploads the cached copy.
+func (m *Manager) SendGIF(ctx context.Context, accountID, chatJID, mp4Path string) (store.Message, error) {
+	cli, err := m.client(accountID)
+	if err != nil {
+		return store.Message{}, err
+	}
+	chat, err := types.ParseJID(chatJID)
+	if err != nil {
+		return store.Message{}, err
+	}
+	up, cached, err := m.upload(ctx, cli, accountID, mp4Path, ".mp4", whatsmeow.MediaVideo)
+	if err != nil {
+		return store.Message{}, err
+	}
+	msg := &waE2E.Message{VideoMessage: &waE2E.VideoMessage{
+		GifPlayback: proto.Bool(true), Mimetype: proto.String("video/mp4"),
+		URL: &up.URL, DirectPath: &up.DirectPath, MediaKey: up.MediaKey,
+		FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: &up.FileLength,
+	}}
+	return m.send(ctx, cli, accountID, chat, msg, cached)
+}
+
+// upload copies the file at path into the media cache (as ext) and uploads the cached copy as kind,
+// streaming through a temp file. It returns the upload and the cached path.
+func (m *Manager) upload(ctx context.Context, cli waClient, accountID, path, ext string, kind whatsmeow.MediaType) (whatsmeow.UploadResponse, string, error) {
+	src, err := os.Open(path)
+	if err != nil {
+		return whatsmeow.UploadResponse{}, "", err
+	}
+	cached, err := m.media.Save(accountID, ext, src)
+	src.Close()
+	if err != nil {
+		return whatsmeow.UploadResponse{}, "", err
+	}
+	f, err := os.Open(cached)
+	if err != nil {
+		return whatsmeow.UploadResponse{}, "", err
+	}
+	defer f.Close()
+	tmp, err := os.CreateTemp("", "wa-go-upload-*")
+	if err != nil {
+		return whatsmeow.UploadResponse{}, "", err
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close() // runs before the Remove
+	up, err := cli.UploadReader(ctx, f, tmp, kind)
+	return up, cached, err
+}
+
+// SetTyping shows accountID as typing in chatJID (composing) or no longer typing (paused).
+func (m *Manager) SetTyping(ctx context.Context, accountID, chatJID string, composing bool) error {
+	cli, err := m.client(accountID)
+	if err != nil {
+		return err
+	}
+	chat, err := types.ParseJID(chatJID)
+	if err != nil {
+		return err
+	}
+	state := types.ChatPresencePaused
+	if composing {
+		state = types.ChatPresenceComposing
+	}
+	return cli.SendChatPresence(ctx, chat, state, types.ChatPresenceMediaText)
 }
 
 // send sends msg and stores it as sent; mediaPath is the cached copy of its attachment, if any.
