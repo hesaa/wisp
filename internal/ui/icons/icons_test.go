@@ -6,7 +6,39 @@ import (
 	"github.com/lxn/walk"
 )
 
-var allIcons = []Icon{IconChat, IconStatus, IconSettings, IconSearch, IconAttach, IconEmoji, IconSend, IconDoubleCheck}
+var allIcons = []Icon{IconChat, IconStatus, IconSettings, IconSearch, IconAttach, IconEmoji, IconSend, IconDoubleCheck,
+	IconAdd, IconNewChat}
+
+func TestFillCapsule(t *testing.T) {
+	bmp, err := walk.NewBitmapForDPI(walk.Size{Width: 40, Height: 20}, 96)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bmp.Dispose()
+	c, err := walk.NewCanvasFromImage(bmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if Fill(c, walk.Rectangle{Width: 0, Height: 5}, 0) == nil {
+		t.Error("empty bounds accepted")
+	}
+	err = Fill(c, walk.Rectangle{Width: 40, Height: 20}, walk.RGB(200, 0, 0))
+	c.Dispose()
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := bmp.ToImage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	red := func(x, y int) bool { p := img.RGBAAt(x, y); return p.R == 200 && p.G == 0 && p.B == 0 }
+	if !red(20, 10) || !red(3, 10) || !red(36, 10) || !red(20, 0) {
+		t.Error("capsule body not filled")
+	}
+	if red(0, 0) || red(39, 19) || red(0, 19) {
+		t.Error("capsule corners filled: not rounded")
+	}
+}
 
 func TestDefinitionsExistAndStayOnGrid(t *testing.T) {
 	for _, id := range allIcons {

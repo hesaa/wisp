@@ -227,6 +227,35 @@ func (d *DB) NameChatIfUnnamed(accountID, jid, name string) error {
 	return err
 }
 
+// Story is a contact with recent status updates, for the stories strip.
+type Story struct {
+	SenderJID string
+	Name      string // the sender's chat name; "" when there is none
+	LastTS    int64  // newest status update, unix seconds
+}
+
+// RecentStories returns the distinct senders of the account's status updates at or after since (unix
+// seconds), newest first. The user's own updates are left out.
+func (d *DB) RecentStories(accountID string, since int64) ([]Story, error) {
+	rows, err := d.sql.Query(`SELECT m.sender_jid, MAX(m.timestamp) AS ts,
+		COALESCE((SELECT c.name FROM chats c WHERE c.account_id = m.account_id AND c.jid = m.sender_jid), '')
+		FROM messages m WHERE m.account_id = ? AND m.chat_jid = ? AND m.from_me = 0 AND m.timestamp >= ?
+		GROUP BY m.sender_jid ORDER BY ts DESC, m.sender_jid`, accountID, statusBroadcastJID, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Story{}
+	for rows.Next() {
+		var s Story
+		if err := rows.Scan(&s.SenderJID, &s.LastTS, &s.Name); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
 // ListChats returns the account's chats newest first, with snippet and derived unread count.
 func (d *DB) ListChats(accountID string) ([]Chat, error) {
 	rows, err := d.sql.Query(`SELECT c.jid, c.name, c.last_message_ts,

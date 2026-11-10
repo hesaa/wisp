@@ -292,6 +292,33 @@ func (m *Manager) send(ctx context.Context, cli waClient, accountID string, chat
 	return sm, nil
 }
 
+// Contact is an entry of an account's whatsmeow contact store.
+type Contact struct {
+	JID  string // phone-number JID
+	Name string // best known name: address book, then first name, business name, push name; may be ""
+}
+
+// Contacts returns accountID's contacts sorted by name. LID entries are left out: chats are keyed by
+// phone-number JIDs, and whatsmeow keeps an LID twin of many contacts.
+func (m *Manager) Contacts(ctx context.Context, accountID string) ([]Contact, error) {
+	cli, err := m.client(accountID)
+	if err != nil {
+		return nil, err
+	}
+	all, err := cli.AllContacts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Contact, 0, len(all))
+	for jid, c := range all {
+		if jid.Server == types.DefaultUserServer {
+			out = append(out, Contact{JID: jid.String(), Name: cmp.Or(c.FullName, c.FirstName, c.BusinessName, c.PushName)})
+		}
+	}
+	slices.SortFunc(out, func(a, b Contact) int { return cmp.Or(cmp.Compare(a.Name, b.Name), cmp.Compare(a.JID, b.JID)) })
+	return out, nil
+}
+
 // SetPresenceAll sends presence p for every account; PresenceUnavailable when hiding to the tray,
 // so no number shows as online. Every account is tried; the failures are joined.
 func (m *Manager) SetPresenceAll(ctx context.Context, p types.Presence) error {

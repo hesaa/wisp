@@ -54,6 +54,7 @@ type waClient interface {
 	ParseWebMessage(chatJID types.JID, webMsg *waWeb.WebMessageInfo) (*events.Message, error)
 	PNForLID(ctx context.Context, lid types.JID) (types.JID, error) // empty JID when unknown
 	ContactName(ctx context.Context, jid types.JID) (string, error) // address-book name, "" when unknown
+	AllContacts(ctx context.Context) (map[types.JID]types.ContactInfo, error)
 }
 
 // liveClient adds the device-store lookups to a real client.
@@ -66,6 +67,10 @@ func (c liveClient) PNForLID(ctx context.Context, lid types.JID) (types.JID, err
 func (c liveClient) ContactName(ctx context.Context, jid types.JID) (string, error) {
 	info, err := c.Store.Contacts.GetContact(ctx, jid)
 	return info.FullName, err
+}
+
+func (c liveClient) AllContacts(ctx context.Context) (map[types.JID]types.ContactInfo, error) {
+	return c.Store.Contacts.GetAllContacts(ctx)
 }
 
 var _ waClient = liveClient{}

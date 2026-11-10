@@ -13,28 +13,34 @@ import (
 // Go runtime mirrors the first four syscall args into XMM0-3 on amd64.
 
 var (
-	gdip               = windows.NewLazySystemDLL("gdiplus.dll")
-	pStartup           = gdip.NewProc("GdiplusStartup")
-	pCreateFromHDC     = gdip.NewProc("GdipCreateFromHDC")
-	pGetImageGraphics  = gdip.NewProc("GdipGetImageGraphicsContext")
-	pCreateBitmapScan0 = gdip.NewProc("GdipCreateBitmapFromScan0")
-	pDisposeImage      = gdip.NewProc("GdipDisposeImage")
-	pDeleteGraphics    = gdip.NewProc("GdipDeleteGraphics")
-	pSetSmoothingMode  = gdip.NewProc("GdipSetSmoothingMode")
-	pCreatePen1        = gdip.NewProc("GdipCreatePen1")
-	pDeletePen         = gdip.NewProc("GdipDeletePen")
-	pSetPenStartCap    = gdip.NewProc("GdipSetPenStartCap")
-	pSetPenEndCap      = gdip.NewProc("GdipSetPenEndCap")
-	pSetPenLineJoin    = gdip.NewProc("GdipSetPenLineJoin")
-	pDrawLines         = gdip.NewProc("GdipDrawLines")
-	pDrawEllipse       = gdip.NewProc("GdipDrawEllipse")
-	pDrawArc           = gdip.NewProc("GdipDrawArc")
-	startupOnce        sync.Once
-	startupErr         error
+	gdip                = windows.NewLazySystemDLL("gdiplus.dll")
+	pStartup            = gdip.NewProc("GdiplusStartup")
+	pCreateFromHDC      = gdip.NewProc("GdipCreateFromHDC")
+	pGetImageGraphics   = gdip.NewProc("GdipGetImageGraphicsContext")
+	pCreateBitmapScan0  = gdip.NewProc("GdipCreateBitmapFromScan0")
+	pDisposeImage       = gdip.NewProc("GdipDisposeImage")
+	pDeleteGraphics     = gdip.NewProc("GdipDeleteGraphics")
+	pSetSmoothingMode   = gdip.NewProc("GdipSetSmoothingMode")
+	pCreatePen1         = gdip.NewProc("GdipCreatePen1")
+	pDeletePen          = gdip.NewProc("GdipDeletePen")
+	pSetPenStartCap     = gdip.NewProc("GdipSetPenStartCap")
+	pSetPenEndCap       = gdip.NewProc("GdipSetPenEndCap")
+	pSetPenLineJoin     = gdip.NewProc("GdipSetPenLineJoin")
+	pDrawLines          = gdip.NewProc("GdipDrawLines")
+	pDrawEllipse        = gdip.NewProc("GdipDrawEllipse")
+	pDrawArc            = gdip.NewProc("GdipDrawArc")
+	pSetPixelOffsetMode = gdip.NewProc("GdipSetPixelOffsetMode")
+	pCreateSolidFill    = gdip.NewProc("GdipCreateSolidFill")
+	pDeleteBrush        = gdip.NewProc("GdipDeleteBrush")
+	pFillEllipseI       = gdip.NewProc("GdipFillEllipseI")
+	pFillRectangleI     = gdip.NewProc("GdipFillRectangleI")
+	startupOnce         sync.Once
+	startupErr          error
 )
 
 const (
 	smoothingAntiAlias = 4
+	pixelOffsetHalf    = 4
 	lineCapRound       = 2
 	lineJoinRound      = 2
 	unitWorld          = 0

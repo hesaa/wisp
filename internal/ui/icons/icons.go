@@ -26,6 +26,8 @@ const (
 	IconEmoji
 	IconSend
 	IconDoubleCheck
+	IconAdd
+	IconNewChat
 )
 
 const (
@@ -95,6 +97,12 @@ var definitions = map[Icon][]op{
 		poly(2, 12.5, 6.5, 17, 15, 7),
 		poly(10.5, 15.5, 12, 17, 21.5, 7),
 	},
+	IconAdd: {poly(12, 5, 12, 19), poly(5, 12, 19, 12)},
+	IconNewChat: {
+		poly(7, 3.5, 17, 3.5, 20.5, 7, 20.5, 13, 17, 16.5, 12, 16.5, 7.5, 20.5, 7.5, 16.5, 7, 16.5, 3.5, 13, 3.5, 7, 7, 3.5),
+		poly(12, 6.5, 12, 13.5),
+		poly(8.5, 10, 15.5, 10),
+	},
 }
 
 func argb(c walk.Color) uint32 {
@@ -161,6 +169,50 @@ func Draw(c *walk.Canvas, id Icon, bounds walk.Rectangle, color walk.Color) erro
 	}
 	defer call(pDeleteGraphics, g)
 	return render(g, id, bounds, color)
+}
+
+// Fill paints an anti-aliased capsule in color filling bounds (pixels): a circle when bounds is
+// square, a pill along the longer side otherwise. For avatars, status dots, badges and scroll thumbs.
+func Fill(c *walk.Canvas, bounds walk.Rectangle, color walk.Color) error {
+	if bounds.Width <= 0 || bounds.Height <= 0 {
+		return fmt.Errorf("icons: empty bounds")
+	}
+	if err := startup(); err != nil {
+		return err
+	}
+	var g, brush uintptr
+	if err := call(pCreateFromHDC, uintptr(c.HDC()), uintptr(unsafe.Pointer(&g))); err != nil {
+		return err
+	}
+	defer call(pDeleteGraphics, g)
+	if err := call(pSetSmoothingMode, g, smoothingAntiAlias); err != nil {
+		return err
+	}
+	// integer bounds are pixel edges, not pixel centres, so straight edges stay crisp
+	if err := call(pSetPixelOffsetMode, g, pixelOffsetHalf); err != nil {
+		return err
+	}
+	if err := call(pCreateSolidFill, uintptr(argb(color)), uintptr(unsafe.Pointer(&brush))); err != nil {
+		return err
+	}
+	defer call(pDeleteBrush, brush)
+
+	b := bounds
+	d := min(b.Width, b.Height)
+	rect := walk.Rectangle{X: b.X + d/2, Y: b.Y, Width: b.Width - d, Height: b.Height}
+	if b.Height > b.Width {
+		rect = walk.Rectangle{X: b.X, Y: b.Y + d/2, Width: b.Width, Height: b.Height - d}
+	}
+	if err := call(pFillEllipseI, g, brush, uintptr(b.X), uintptr(b.Y), uintptr(d), uintptr(d)); err != nil {
+		return err
+	}
+	if err := call(pFillEllipseI, g, brush, uintptr(b.X+b.Width-d), uintptr(b.Y+b.Height-d), uintptr(d), uintptr(d)); err != nil {
+		return err
+	}
+	if rect.Width <= 0 || rect.Height <= 0 {
+		return nil
+	}
+	return call(pFillRectangleI, g, brush, uintptr(rect.X), uintptr(rect.Y), uintptr(rect.Width), uintptr(rect.Height))
 }
 
 // Bitmap returns a sizePx x sizePx bitmap of the icon on a transparent background.

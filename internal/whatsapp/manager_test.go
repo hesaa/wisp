@@ -46,6 +46,11 @@ type fakeClient struct {
 	receipts    []markRead              // one per MarkRead call
 	pns         map[types.JID]types.JID // LID -> phone number
 	names       map[types.JID]string    // address-book names
+	contacts    map[types.JID]types.ContactInfo
+}
+
+func (f *fakeClient) AllContacts(context.Context) (map[types.JID]types.ContactInfo, error) {
+	return f.contacts, nil
 }
 
 type markRead struct {
@@ -352,6 +357,27 @@ func TestUnknownAccountIsAnError(t *testing.T) {
 		if err := op(); !errors.Is(err, ErrUnknownAccount) {
 			t.Errorf("%s: %v", name, err)
 		}
+	}
+}
+
+func TestContactsBestNamePhoneJIDsOnly(t *testing.T) {
+	m, _ := newTestManager(t)
+	bob := types.NewJID("6284444444444", types.DefaultUserServer)
+	m.add(acctA, &fakeClient{contacts: map[types.JID]types.ContactInfo{
+		alice: {Found: true, FullName: "Alice Smith", FirstName: "Alice", PushName: "ali"},
+		bob:   {Found: true, PushName: "Bob"},
+		types.NewJID("99887766", types.HiddenUserServer): {Found: true, FullName: "Alice Smith"}, // LID twin
+	}})
+	got, err := m.Contacts(ctx, acctA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Contact{{JID: alice.String(), Name: "Alice Smith"}, {JID: bob.String(), Name: "Bob"}}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	if _, err := m.Contacts(ctx, "nope"); !errors.Is(err, ErrUnknownAccount) {
+		t.Fatalf("unknown account: %v", err)
 	}
 }
 

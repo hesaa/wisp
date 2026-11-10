@@ -189,6 +189,34 @@ func TestStatusNeverRegresses(t *testing.T) {
 	}
 }
 
+func TestRecentStories(t *testing.T) {
+	db := openTest(t)
+	story := func(account, id, sender string, ts int64, fromMe bool) Message {
+		return Message{ID: id, ChatJID: statusBroadcastJID, AccountID: account, SenderJID: sender, Timestamp: ts, FromMe: fromMe, Status: StatusReceived}
+	}
+	if err := db.InsertMessagesBatch([]Message{
+		story(acct, "1", "alice", 100, false),
+		story(acct, "2", "alice", 300, false),
+		story(acct, "3", "bob", 200, false),
+		story(acct, "4", "carol", 50, false), // older than since
+		story(acct, "5", "me", 400, true),    // own status
+		story("other", "6", "dave", 300, false),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertChat(acct, "alice", "Alice", 0); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.RecentStories(acct, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Story{{SenderJID: "alice", Name: "Alice", LastTS: 300}, {SenderJID: "bob", LastTS: 200}}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+}
+
 func TestMediaMetaRoundTrip(t *testing.T) {
 	db := openTest(t)
 	ms := msgs(acct, "c1", 2, false)
