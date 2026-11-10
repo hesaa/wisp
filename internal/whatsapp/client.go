@@ -119,12 +119,14 @@ func (m *Manager) handleEvent(ctx context.Context, id string, cli waClient, evt 
 			return err
 		}
 		if pm := e.Message.GetProtocolMessage(); pm != nil {
-			return m.revise(id, info.Chat.String(), pm)
+			return m.revise(ctx, id, cli, info, pm)
 		}
 		msg, ok, err := toStoreMessage(id, info, e.Message)
 		if err != nil || !ok {
 			return err
 		}
+		// MarkRead must address receipts the way the message arrived, not by the normalised key.
+		msg.WireChatJID, msg.WireSenderJID = e.Info.Chat.String(), e.Info.Sender.ToNonAD().String()
 		if isDM(info.Chat) && !info.IsFromMe {
 			if err := m.nameDM(ctx, id, cli, info.Chat, info.PushName); err != nil {
 				return err
@@ -199,31 +201,57 @@ func (m *Manager) nameDM(ctx context.Context, id string, cli waClient, chat type
 	return m.store.NameChatIfUnnamed(id, chat.String(), pushName)
 }
 
-// revise applies an edit or a delete-for-everyone to the stored target message. Other protocol
-// messages (key shares, history-sync notices, ...) are signalling and ignored.
-func (m *Manager) revise(id, chat string, pm *waE2E.ProtocolMessage) error {
+// revise applies an edit or a delete-for-everyone sent by the target message's own author; anything
+// else (a forged edit, a group admin deleting someone else's message) changes nothing. Other
+// protocol messages (key shares, history-sync notices, ...) are signalling and ignored.
+func (m *Manager) revise(ctx context.Context, id string, cli waClient, info types.MessageInfo, pm *waE2E.ProtocolMessage) error {
 	if pm.Type == nil {
 		return nil // REVOKE is the zero value: never infer it from a missing type
 	}
-	target := pm.GetKey().GetID()
+	var typ, body string
 	switch pm.GetType() {
 	case waE2E.ProtocolMessage_MESSAGE_EDIT:
-		typ, body, _, skip := content(pm.GetEditedMessage())
-		if skip || typ == TypeUnsupported {
+		t, b, _, skip := content(pm.GetEditedMessage())
+		if skip || t == TypeUnsupported {
 			return nil
 		}
-		if err := m.store.ReviseMessage(id, chat, target, "", body); err != nil {
-			return err
-		}
+		body = b
 	case waE2E.ProtocolMessage_REVOKE:
-		if err := m.store.ReviseMessage(id, chat, target, TypeRevoked, revokedBody); err != nil {
-			return err
-		}
+		typ, body = TypeRevoked, revokedBody
 	default:
 		return nil
 	}
-	m.emit(RevisedEvent{AccountID: id, ChatJID: chat, ID: target})
-	return nil
+	chat, target := info.Chat.String(), pm.GetKey().GetID()
+	if ok, err := m.isAuthor(ctx, id, cli, info, chat, target); err != nil || !ok {
+		return err
+	}
+	changed, err := m.store.ReviseMessage(id, chat, target, typ, body)
+	if err == nil && changed {
+		m.emit(RevisedEvent{AccountID: id, ChatJID: chat, ID: target})
+	}
+	return err
+}
+
+// isAuthor reports whether info's sender wrote the stored message target. Both sides are compared
+// as phone-number JIDs (a stored LID is resolved now, its mapping may be newer than the message);
+// the user's own messages, from any device, are the account's own number.
+func (m *Manager) isAuthor(ctx context.Context, id string, cli waClient, info types.MessageInfo, chat, target string) (bool, error) {
+	stored, err := m.store.MessageSender(id, chat, target)
+	if err != nil || stored == "" {
+		return false, err // not stored: nothing to revise
+	}
+	author, err := types.ParseJID(stored)
+	if err == nil {
+		author, err = toPN(ctx, cli, author, types.EmptyJID)
+	}
+	if err != nil {
+		return false, err
+	}
+	editor := info.Sender.ToNonAD()
+	if info.IsFromMe {
+		editor = types.NewJID(id, types.DefaultUserServer)
+	}
+	return author.ToNonAD().String() == editor.String(), nil
 }
 
 // pnSource rewrites a 1:1 chat and the sender from LID to phone-number JIDs, so each contact is

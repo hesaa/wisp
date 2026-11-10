@@ -73,7 +73,8 @@ type msgStore interface {
 	UpsertChat(accountID, jid, name string, lastMessageTS int64) error
 	NameChatIfUnnamed(accountID, jid, name string) error
 	UpdateMessageStatus(accountID, chatJID string, ids []string, status string) error
-	ReviseMessage(accountID, chatJID, id, msgType, body string) error
+	ReviseMessage(accountID, chatJID, id, msgType, body string) (bool, error)
+	MessageSender(accountID, chatJID, id string) (string, error)
 	SetMediaPath(accountID, chatJID, id, path string) error
 }
 
@@ -316,13 +317,14 @@ func (m *Manager) SetPrivacySetting(ctx context.Context, accountID string, name 
 }
 
 // MarkRead sends read receipts for the incoming messages among msgs (as read from the store) and
-// marks them read locally.
+// marks them read locally. Receipts are addressed as the messages arrived (LID or phone number),
+// falling back to the stored key where that is unknown.
 func (m *Manager) MarkRead(ctx context.Context, msgs []store.Message) error {
-	type key struct{ account, chat, sender string } // one receipt covers one sender's messages
+	type key struct{ account, chat, wireChat, wireSender string } // one receipt covers one sender's messages
 	groups := map[key][]string{}
 	for _, msg := range msgs {
 		if !msg.FromMe {
-			k := key{msg.AccountID, msg.ChatJID, msg.SenderJID}
+			k := key{msg.AccountID, msg.ChatJID, cmp.Or(msg.WireChatJID, msg.ChatJID), cmp.Or(msg.WireSenderJID, msg.SenderJID)}
 			groups[k] = append(groups[k], msg.ID)
 		}
 	}
@@ -331,11 +333,11 @@ func (m *Manager) MarkRead(ctx context.Context, msgs []store.Message) error {
 		if err != nil {
 			return err
 		}
-		chat, err := types.ParseJID(k.chat)
+		chat, err := types.ParseJID(k.wireChat)
 		if err != nil {
 			return err
 		}
-		sender, err := types.ParseJID(k.sender)
+		sender, err := types.ParseJID(k.wireSender)
 		if err != nil {
 			return err
 		}

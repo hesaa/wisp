@@ -38,6 +38,8 @@ CREATE TABLE messages (
 	status       TEXT NOT NULL DEFAULT '',
 	from_me      INTEGER NOT NULL DEFAULT 0,
 	media_meta   BLOB NOT NULL DEFAULT x'',
+	wire_chat_jid   TEXT NOT NULL DEFAULT '',
+	wire_sender_jid TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY (account_id, chat_jid, id)
 );
 CREATE INDEX messages_page ON messages (account_id, chat_jid, timestamp DESC, id DESC);

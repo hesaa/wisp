@@ -1,6 +1,10 @@
 package store
 
-import "fmt"
+import (
+	"database/sql"
+	"errors"
+	"fmt"
+)
 
 const (
 	// PageSize is the number of messages per page.
@@ -30,6 +34,9 @@ type Message struct {
 	Status    string
 	FromMe    bool
 	MediaMeta []byte // marshaled media sub-message (keys + embedded thumbnail) for on-demand download
+	// Chat and sender exactly as received (an LID or a phone number), for addressing read receipts
+	// back the way the server expects; empty when unknown (history, own messages).
+	WireChatJID, WireSenderJID string
 }
 
 // Chat is a sidebar row.
@@ -69,8 +76,9 @@ func (d *DB) insertChunk(msgs []Message) (int64, error) {
 	}
 	defer tx.Rollback()
 	ins, err := tx.Prepare(`INSERT OR IGNORE INTO messages
-		(account_id, chat_jid, id, sender_jid, timestamp, message_type, body, media_path, status, from_me, media_meta)
-		VALUES (?,?,?,?,?,?,?,?,?,?,COALESCE(?, x''))`) // COALESCE: a nil []byte binds as NULL
+		(account_id, chat_jid, id, sender_jid, timestamp, message_type, body, media_path, status, from_me, media_meta,
+		 wire_chat_jid, wire_sender_jid)
+		VALUES (?,?,?,?,?,?,?,?,?,?,COALESCE(?, x''),?,?)`) // COALESCE: a nil []byte binds as NULL
 	if err != nil {
 		return 0, err
 	}
@@ -83,7 +91,8 @@ func (d *DB) insertChunk(msgs []Message) (int64, error) {
 	defer chat.Close()
 	var inserted int64
 	for _, m := range msgs {
-		res, err := ins.Exec(m.AccountID, m.ChatJID, m.ID, m.SenderJID, m.Timestamp, m.Type, m.Body, m.MediaPath, m.Status, m.FromMe, m.MediaMeta)
+		res, err := ins.Exec(m.AccountID, m.ChatJID, m.ID, m.SenderJID, m.Timestamp, m.Type, m.Body, m.MediaPath, m.Status, m.FromMe, m.MediaMeta,
+			m.WireChatJID, m.WireSenderJID)
 		if err != nil {
 			return 0, err
 		}
@@ -107,7 +116,8 @@ func (d *DB) GetChatMessages(accountID, chatJID string, page int) ([]Message, er
 	if page < 0 {
 		page = 0
 	}
-	rows, err := d.sql.Query(`SELECT id, chat_jid, account_id, sender_jid, timestamp, message_type, body, media_path, status, from_me, media_meta
+	rows, err := d.sql.Query(`SELECT id, chat_jid, account_id, sender_jid, timestamp, message_type, body, media_path, status, from_me, media_meta,
+		wire_chat_jid, wire_sender_jid
 		FROM messages WHERE account_id = ? AND chat_jid = ?
 		ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?`, accountID, chatJID, PageSize, page*PageSize)
 	if err != nil {
@@ -117,7 +127,8 @@ func (d *DB) GetChatMessages(accountID, chatJID string, page int) ([]Message, er
 	out := []Message{}
 	for rows.Next() {
 		var m Message
-		if err := rows.Scan(&m.ID, &m.ChatJID, &m.AccountID, &m.SenderJID, &m.Timestamp, &m.Type, &m.Body, &m.MediaPath, &m.Status, &m.FromMe, &m.MediaMeta); err != nil {
+		if err := rows.Scan(&m.ID, &m.ChatJID, &m.AccountID, &m.SenderJID, &m.Timestamp, &m.Type, &m.Body, &m.MediaPath, &m.Status, &m.FromMe, &m.MediaMeta,
+			&m.WireChatJID, &m.WireSenderJID); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
@@ -161,14 +172,33 @@ func (d *DB) SetMediaPath(accountID, chatJID, id, path string) error {
 	return err
 }
 
+// MessageSender returns the sender JID of a stored message, or "" when it is not stored.
+func (d *DB) MessageSender(accountID, chatJID, id string) (string, error) {
+	var sender string
+	err := d.sql.QueryRow(`SELECT sender_jid FROM messages WHERE account_id = ? AND chat_jid = ? AND id = ?`,
+		accountID, chatJID, id).Scan(&sender)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return sender, err
+}
+
 // ReviseMessage rewrites a stored message's body after an edit. A non-empty msgType (a
-// delete-for-everyone) also replaces its type and drops its media keys.
-func (d *DB) ReviseMessage(accountID, chatJID, id, msgType, body string) error {
-	_, err := d.sql.Exec(`UPDATE messages SET body = ?,
-		message_type = COALESCE(NULLIF(?, ''), message_type),
-		media_meta = CASE WHEN ? = '' THEN media_meta ELSE x'' END
-		WHERE account_id = ? AND chat_jid = ? AND id = ?`, body, msgType, msgType, accountID, chatJID, id)
-	return err
+// delete-for-everyone) also replaces its type and unlinks its media (keys and cached path; the
+// cached file stays on disk). It reports whether the row changed.
+func (d *DB) ReviseMessage(accountID, chatJID, id, msgType, body string) (bool, error) {
+	res, err := d.sql.Exec(`UPDATE messages SET body = ?4,
+		message_type = COALESCE(NULLIF(?5, ''), message_type),
+		media_meta = CASE WHEN ?5 = '' THEN media_meta ELSE x'' END,
+		media_path = CASE WHEN ?5 = '' THEN media_path ELSE '' END
+		WHERE account_id = ?1 AND chat_jid = ?2 AND id = ?3
+		AND (body <> ?4 OR message_type <> COALESCE(NULLIF(?5, ''), message_type))`,
+		accountID, chatJID, id, body, msgType)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
 }
 
 // MarkChatRead marks all incoming messages in the chat as read.

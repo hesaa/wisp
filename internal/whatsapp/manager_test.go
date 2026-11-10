@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -42,9 +43,14 @@ type fakeClient struct {
 	presenceErr error
 	sent        []*waE2E.Message
 	download    []byte
-	receipts    [][]string              // ids per MarkRead call
+	receipts    []markRead              // one per MarkRead call
 	pns         map[types.JID]types.JID // LID -> phone number
 	names       map[types.JID]string    // address-book names
+}
+
+type markRead struct {
+	chat, sender types.JID
+	ids          []string
 }
 
 func (f *fakeClient) Disconnect() {}
@@ -67,8 +73,8 @@ func (f *fakeClient) SendMessage(_ context.Context, _ types.JID, msg *waE2E.Mess
 	return whatsmeow.SendResponse{ID: fmt.Sprintf("out%d", len(f.sent)), Timestamp: time.Unix(2000, 0)}, nil
 }
 
-func (f *fakeClient) MarkRead(_ context.Context, ids []types.MessageID, _ time.Time, _, _ types.JID, _ ...types.ReceiptType) error {
-	f.receipts = append(f.receipts, ids)
+func (f *fakeClient) MarkRead(_ context.Context, ids []types.MessageID, _ time.Time, chat, sender types.JID, _ ...types.ReceiptType) error {
+	f.receipts = append(f.receipts, markRead{chat, sender, ids})
 	return nil
 }
 
@@ -433,8 +439,11 @@ func TestMarkReadOneReceiptPerSender(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := make([]string, 0, len(fa.receipts))
-	for _, ids := range fa.receipts {
-		got = append(got, strings.Join(ids, ","))
+	for _, r := range fa.receipts {
+		if r.chat != group { // no wire addressing stored: falls back to the stored key
+			t.Fatalf("receipt to %s", r.chat)
+		}
+		got = append(got, strings.Join(r.ids, ","))
 	}
 	slices.Sort(got)
 	if !slices.Equal(got, []string{"a1,a2", "b1"}) {
@@ -488,6 +497,12 @@ func TestLIDChatsStoredUnderPhoneNumber(t *testing.T) {
 	if len(page) != 1 || page[0].SenderJID != alice.String() {
 		t.Fatalf("stored under phone number: %+v", page)
 	}
+	if err := m.MarkRead(ctx, page); err != nil {
+		t.Fatal(err)
+	}
+	if r := fa.receipts; len(r) != 1 || r[0].chat != lid || r[0].sender.String() != lid.String() || statusOf(t, db, acctA, "l1") != store.StatusRead {
+		t.Fatalf("read receipt %+v (want it addressed to the LID it came from)", r)
+	}
 	// a receipt addressed by LID alone is resolved through the account's LID map
 	fa.pns = map[types.JID]types.JID{lid: alice}
 	sent, err := m.SendText(ctx, acctA, alice.String(), "reply")
@@ -514,43 +529,92 @@ func TestLIDChatsStoredUnderPhoneNumber(t *testing.T) {
 	}
 }
 
-func TestEditAndRevokeReviseStoredMessage(t *testing.T) {
+func TestEditAndRevokeOnlyByTheAuthor(t *testing.T) {
 	m, db := newTestManager(t)
 	fa := &fakeClient{}
 	m.add(acctA, fa)
-	img := incoming(alice, "i1", "")
-	img.Message = &waE2E.Message{ImageMessage: &waE2E.ImageMessage{Caption: proto.String("pic"), MediaKey: []byte("k")}}
-	edit := incoming(alice, "e1", "")
-	edit.Message = &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
-		Type: waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(), Key: &waCommon.MessageKey{ID: proto.String("t1")},
-		EditedMessage: &waE2E.Message{Conversation: proto.String("fixed")},
-	}}
-	revoke := incoming(alice, "r1", "")
-	revoke.Message = &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
-		Type: waE2E.ProtocolMessage_REVOKE.Enum(), Key: &waCommon.MessageKey{ID: proto.String("i1")},
-	}}
-	untyped := incoming(alice, "u1", "") // no Type: must not be taken for REVOKE, its zero value
-	untyped.Message = &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{Key: &waCommon.MessageKey{ID: proto.String("t1")}}}
-	var got []any
-	m.AddListener(func(e any) { got = append(got, e) })
-	for _, e := range []*events.Message{incoming(alice, "t1", "tpyo"), img, edit, revoke, untyped} {
-		if err := m.handleEvent(ctx, acctA, fa, e); err != nil {
-			t.Fatal(err)
+	group := types.NewJID("120363000000000000", types.GroupServer)
+	bob := types.NewJID("6284444444444", types.DefaultUserServer)
+	carol := types.NewJID("6285555555555", types.DefaultUserServer)
+	carolLID := types.NewJID("222222222222222", types.HiddenUserServer)
+	n := 0
+	protocol := func(sender types.JID, pm *waE2E.ProtocolMessage) *events.Message {
+		n++
+		e := incoming(group, fmt.Sprintf("p%d", n), "")
+		e.Info.Sender = sender
+		e.Message = &waE2E.Message{ProtocolMessage: pm}
+		return e
+	}
+	edit := func(sender types.JID, target, text string) *events.Message {
+		return protocol(sender, &waE2E.ProtocolMessage{
+			Type: waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(), Key: &waCommon.MessageKey{ID: proto.String(target)},
+			EditedMessage: &waE2E.Message{Conversation: proto.String(text)},
+		})
+	}
+	revoke := func(sender types.JID, target string) *events.Message {
+		return protocol(sender, &waE2E.ProtocolMessage{
+			Type: waE2E.ProtocolMessage_REVOKE.Enum(), Key: &waCommon.MessageKey{ID: proto.String(target)},
+		})
+	}
+	handle := func(evts ...*events.Message) {
+		t.Helper()
+		for _, e := range evts {
+			if err := m.handleEvent(ctx, acctA, fa, e); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
-	page, _ := db.GetChatMessages(acctA, alice.String(), 0)
-	byID := map[string]store.Message{}
-	for _, msg := range page {
-		byID[msg.ID] = msg
+	rows := func() map[string]store.Message {
+		page, _ := db.GetChatMessages(acctA, group.String(), 0)
+		out := map[string]store.Message{}
+		for _, msg := range page {
+			out[msg.ID] = msg
+		}
+		return out
 	}
-	if len(page) != 2 || byID["t1"].Body != "fixed" || byID["t1"].Type != TypeText {
-		t.Fatalf("after edit: %+v", page)
+
+	img := incoming(group, "i1", "")
+	img.Message = &waE2E.Message{ImageMessage: &waE2E.ImageMessage{Caption: proto.String("pic"), MediaKey: []byte("k")}}
+	fromCarol := incoming(group, "c1", "crol") // carol's LID has no phone number yet
+	fromCarol.Info.Sender = types.JID{User: carolLID.User, Server: types.HiddenUserServer, Device: 1}
+	handle(incoming(group, "t1", "tpyo"), img, fromCarol)
+	own, err := m.SendText(ctx, acctA, group.String(), "mine")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if r := byID["i1"]; r.Type != TypeRevoked || r.Body != revokedBody || len(r.MediaMeta) != 0 {
-		t.Fatalf("after revoke: %+v", r)
+	if err := db.SetMediaPath(acctA, group.String(), "i1", `C:\cache\pic.jpeg`); err != nil {
+		t.Fatal(err)
 	}
-	if ev, ok := got[len(got)-1].(RevisedEvent); !ok || ev != (RevisedEvent{AccountID: acctA, ChatJID: alice.String(), ID: "i1"}) {
-		t.Fatalf("last event %#v", got[len(got)-1])
+	before := rows()
+	var revised []string
+	m.AddListener(func(e any) {
+		if ev, ok := e.(RevisedEvent); ok {
+			revised = append(revised, ev.ID)
+		}
+	})
+
+	// forged: another member (or an admin) edits or deletes someone else's message
+	untyped := protocol(alice, &waE2E.ProtocolMessage{Key: &waCommon.MessageKey{ID: proto.String("t1")}}) // REVOKE is the zero value
+	handle(edit(bob, "t1", "forged"), revoke(bob, "i1"), edit(alice, own.ID, "forged"), revoke(bob, own.ID), untyped)
+	if after := rows(); !maps.EqualFunc(before, after, func(a, b store.Message) bool { return a.Body == b.Body && a.Type == b.Type }) || len(revised) != 0 {
+		t.Fatalf("forged revisions applied: %+v, events %v", after, revised)
+	}
+
+	// the authors themselves: alice; the user from another device (own LID, unmapped); carol, whose
+	// stored LID is resolved through the mapping learned since
+	ownOtherDevice := edit(types.JID{User: "333333333333333", Server: types.HiddenUserServer, Device: 2}, own.ID, "mine, edited")
+	ownOtherDevice.Info.IsFromMe = true
+	fa.pns = map[types.JID]types.JID{carolLID: carol}
+	handle(edit(alice, "t1", "fixed"), revoke(alice, "i1"), revoke(alice, "i1"), ownOtherDevice, edit(carol, "c1", "carol"))
+	r := rows()
+	if r["t1"].Body != "fixed" || r[own.ID].Body != "mine, edited" || r["c1"].Body != "carol" {
+		t.Fatalf("edits: %+v", r)
+	}
+	if i := r["i1"]; i.Type != TypeRevoked || i.Body != revokedBody || len(i.MediaMeta) != 0 || i.MediaPath != "" {
+		t.Fatalf("revoke: %+v", i)
+	}
+	if !slices.Equal(revised, []string{"t1", "i1", own.ID, "c1"}) { // the repeated revoke changed nothing
+		t.Fatalf("revised events %v", revised)
 	}
 }
 
