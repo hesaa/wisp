@@ -7,6 +7,7 @@ import (
 	"unsafe"
 
 	"github.com/lxn/walk"
+	"github.com/lxn/win"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
@@ -85,7 +86,7 @@ func Color(hex string) walk.Color {
 
 var procSetWindowAttribute = windows.NewLazySystemDLL("dwmapi.dll").NewProc("DwmSetWindowAttribute")
 
-// ApplyTitleBar switches the native title bar of hwnd to dark or light.
+// ApplyTitleBar switches the native title bar of hwnd to dark or light, at once when it is shown.
 // Attribute 20 is DWMWA_USE_IMMERSIVE_DARK_MODE; builds before Windows 10 20H1 use 19.
 func ApplyTitleBar(hwnd uintptr, dark bool) error {
 	var v int32
@@ -96,8 +97,24 @@ func ApplyTitleBar(hwnd uintptr, dark bool) error {
 	for _, attr := range []uintptr{20, 19} {
 		hr, _, _ = procSetWindowAttribute.Call(hwnd, attr, uintptr(unsafe.Pointer(&v)), 4)
 		if hr == 0 {
+			repaintCaption(win.HWND(hwnd))
 			return nil
 		}
 	}
 	return fmt.Errorf("DwmSetWindowAttribute failed: HRESULT 0x%x", hr)
+}
+
+// repaintCaption redraws a shown window's title bar in its new colours. Windows 10 does that only
+// when the caption's active state changes (a redraw or SWP_FRAMECHANGED keeps the old colours), so
+// it is flipped to the other state and back to the one it shows: active only in the foreground.
+func repaintCaption(h win.HWND) {
+	if !win.IsWindowVisible(h) {
+		return
+	}
+	var active uintptr
+	if win.GetForegroundWindow() == h {
+		active = 1
+	}
+	win.SendMessage(h, win.WM_NCACTIVATE, 1-active, 0)
+	win.SendMessage(h, win.WM_NCACTIVATE, active, 0)
 }
