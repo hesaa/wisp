@@ -1,11 +1,15 @@
 package app
 
 import (
+	"strings"
 	"sync"
+	"time"
 
 	"go.mau.fi/whatsmeow/types"
 
+	"wa-go/internal/media"
 	"wa-go/internal/store"
+	"wa-go/internal/whatsapp"
 )
 
 // The window-free rules of the wiring, tested on their own. UI thread only, except presenceBox.
@@ -47,8 +51,61 @@ func routeMessage(m store.Message, active string, open chatRef, foreground, noti
 // receiptsOn reports whether read receipts may be sent under an account's privacy.read_receipts value.
 func receiptsOn(v string) bool { return v != "none" }
 
-// typingOn reports whether typing may be shown under the stealth.ghost_typing value.
-func typingOn(ghost string) bool { return ghost != "true" }
+// selfOnlyReceipts reports whether a chat read here is told only to the user's own devices
+// (read-self): when the account's read receipts are off, or that setting cannot be read.
+func selfOnlyReceipts(v string, err error) bool { return err != nil || !receiptsOn(v) }
+
+// typingOn reports whether typing may be shown under the stealth.ghost_typing and
+// stealth.appear_offline values: someone appearing offline never shows as typing.
+func typingOn(ghost, appearOffline string) bool { return ghost != "true" && appearOffline != "true" }
+
+// listToReload names the account whose chat list (and unread total) evt changed behind the screen's
+// back: messages read on another of the user's devices, a chat named. ok is false for other events.
+func listToReload(evt any) (acct string, ok bool) {
+	switch e := evt.(type) {
+	case whatsapp.ReceiptEvent:
+		return e.AccountID, e.FromMe && e.Status == store.StatusRead
+	case whatsapp.ChatReadEvent:
+		return e.AccountID, true
+	case whatsapp.ChatNamedEvent:
+		return e.AccountID, true
+	}
+	return "", false
+}
+
+// chatNames maps the named chats of a chat list to their names, for toasts and group senders.
+func chatNames(chats []store.Chat) map[string]string {
+	names := map[string]string{}
+	for _, c := range chats {
+		if c.Name != "" {
+			names[c.JID] = c.Name
+		}
+	}
+	return names
+}
+
+// labelOf is jid's name in names, else its phone number.
+func labelOf(names map[string]string, jid string) string {
+	if n := names[jid]; n != "" {
+		return n
+	}
+	user, server, _ := strings.Cut(jid, "@")
+	if server == "s.whatsapp.net" {
+		return "+" + user
+	}
+	return user
+}
+
+// dropMissingMedia forgets the download of each message whose cached file is gone (Clear Cache, or
+// deleted by hand), so the chat view and the status viewer offer it again. Off the UI thread: it
+// touches the disk.
+func dropMissingMedia(msgs []store.Message) {
+	for i := range msgs {
+		if media.Missing(msgs[i].MediaPath) {
+			msgs[i].MediaPath = ""
+		}
+	}
+}
 
 // unreadIncoming returns the messages of msgs a read receipt is due for.
 func unreadIncoming(msgs []store.Message) []store.Message {
@@ -61,22 +118,119 @@ func unreadIncoming(msgs []store.Message) []store.Message {
 	return out
 }
 
-// windowState is how the main window shows.
+// windowState is how the user sees wa-go.
 type windowState int
 
 const (
-	windowShown     windowState = iota // on screen
-	windowMinimized                    // on the taskbar
-	windowHidden                       // closed to the tray
+	windowForeground windowState = iota // in front: the user is in wa-go (any of its windows)
+	windowBackground                    // on screen behind another program, past the grace period
+	windowMinimized                     // on the taskbar
+	windowHidden                        // closed to the tray
+	windowLocked                        // the session is locked
 )
 
-// presenceFor is the presence every account shows: available only while the window is on screen
-// (neither minimised nor in the tray) and the user does not appear offline.
+// stateOf names the window's state from what Windows reports (visible, iconic), session lock
+// notifications (locked), whether wa-go has the foreground (active) and whether the grace period
+// after the user switched away still runs.
+func stateOf(visible, iconic, locked, active, grace bool) windowState {
+	switch {
+	case locked:
+		return windowLocked
+	case !visible:
+		return windowHidden
+	case iconic:
+		return windowMinimized
+	case active || grace:
+		return windowForeground
+	}
+	return windowBackground
+}
+
+// presenceFor is the presence every account shows: available only while wa-go is in front and the
+// user does not appear offline.
 func presenceFor(w windowState, appearOffline bool) types.Presence {
-	if w == windowShown && !appearOffline {
+	if w == windowForeground && !appearOffline {
 		return types.PresenceAvailable
 	}
 	return types.PresenceUnavailable
+}
+
+// graceDelay is how long presence stays available after the user switches to another program.
+const graceDelay = 10 * time.Second
+
+// grace delays going unavailable when the user switches away; its one-shot timer exists only while
+// pending. UI thread only.
+type grace struct {
+	after func(d time.Duration, f func()) (stop func() bool) // f runs on the UI thread
+	stop  func() bool                                        // nil unless pending
+	gen   int                                                // per timer: an expiry queued before cancel is ignored
+}
+
+// start begins a grace period unless one runs; expired runs when it ends.
+func (g *grace) start(expired func()) {
+	if g.stop != nil {
+		return
+	}
+	g.gen++
+	gen := g.gen
+	g.stop = g.after(graceDelay, func() {
+		if gen == g.gen {
+			g.stop = nil
+			expired()
+		}
+	})
+}
+
+// cancel ends a pending grace period without expiring it.
+func (g *grace) cancel() {
+	if g.stop != nil {
+		g.stop()
+		g.stop = nil
+		g.gen++
+	}
+}
+
+func (g *grace) pending() bool { return g.stop != nil }
+
+// presenceCtl decides every account's presence from the window, the session and the appear-offline
+// setting, and hands each one to broadcast to send. UI thread only.
+type presenceCtl struct {
+	window        func() (visible, iconic bool)
+	appearOffline func() bool
+	send          func(types.Presence)
+	active        bool // wa-go has the foreground (WM_ACTIVATEAPP)
+	locked        bool // the session is locked
+	grace         grace
+	last          presenceState
+}
+
+// update broadcasts the presence the state calls for: always when forced (minimised, hidden to the
+// tray, locked, a setting change, a reconnect), otherwise only when it changed.
+func (p *presenceCtl) update(force bool) {
+	visible, iconic := p.window()
+	w := stateOf(visible, iconic, p.locked, p.active, p.grace.pending())
+	if pr, send := p.last.next(w, p.appearOffline(), force); send {
+		p.send(pr)
+	}
+}
+
+// activated follows the user switching to wa-go or to another program: back, presence follows at
+// once; away, it drops once graceDelay passes unless they come back first.
+func (p *presenceCtl) activated(active bool) {
+	p.active = active
+	if active {
+		p.grace.cancel()
+		p.update(false)
+		return
+	}
+	p.grace.start(func() { p.update(false) })
+}
+
+// sessionLocked: locked, every account goes unavailable at once; unlocked, presence follows the
+// window again.
+func (p *presenceCtl) sessionLocked(locked bool) {
+	p.locked = locked
+	p.update(locked)
 }
 
 // presenceState remembers the last broadcast presence, so window activations do not repeat it.
@@ -140,7 +294,8 @@ type view struct {
 	pending  []store.Message // messages of open that arrived before its first page
 	openNext chatRef         // open this chat once its account's chats load (a toast of another account)
 	unread   map[string]int
-	lists    map[string]*listState // per account; see reloadArrived
+	names    map[string]map[string]string // per account: chat JID to name, from its last applied list
+	lists    map[string]*listState        // per account; see reloadArrived
 }
 
 // switchAccount makes acct active; the chat pane empties. It returns the new opening (of no chat).

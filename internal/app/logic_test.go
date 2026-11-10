@@ -1,12 +1,17 @@
 package app
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"go.mau.fi/whatsmeow/types"
 
 	"wa-go/internal/store"
 	"wa-go/internal/ui"
+	"wa-go/internal/whatsapp"
 )
 
 const (
@@ -64,9 +69,22 @@ func TestSettingGates(t *testing.T) {
 			t.Errorf("receiptsOn(%q) = %v", v, !want)
 		}
 	}
-	for v, want := range map[string]bool{"false": true, "": true, "true": false} {
-		if typingOn(v) != want {
-			t.Errorf("typingOn(ghost %q) = %v", v, !want)
+	for _, c := range []struct {
+		ghost, offline string
+		want           bool
+	}{{"false", "false", true}, {"", "", true}, {"true", "false", false}, {"false", "true", false}, {"true", "true", false}} {
+		if typingOn(c.ghost, c.offline) != c.want {
+			t.Errorf("typingOn(ghost %q, appear offline %q) = %v", c.ghost, c.offline, !c.want)
+		}
+	}
+	// read here is always synced to the user's own devices; senders hear of it only with receipts on
+	for _, c := range []struct {
+		v    string
+		err  error
+		self bool
+	}{{"all", nil, false}, {"contacts", nil, false}, {"none", nil, true}, {"all", errors.New("db"), true}} {
+		if selfOnlyReceipts(c.v, c.err) != c.self {
+			t.Errorf("selfOnlyReceipts(%q, %v) = %v", c.v, c.err, !c.self)
 		}
 	}
 }
@@ -83,11 +101,11 @@ func TestUnreadIncoming(t *testing.T) {
 }
 
 func TestPresenceForEveryWindowState(t *testing.T) {
-	for _, w := range []windowState{windowShown, windowMinimized, windowHidden} {
+	for _, w := range []windowState{windowForeground, windowBackground, windowMinimized, windowHidden, windowLocked} {
 		for _, appearOffline := range []bool{false, true} {
 			want := types.PresenceUnavailable
-			if w == windowShown && !appearOffline {
-				want = types.PresenceAvailable // only on screen, and only when not appearing offline
+			if w == windowForeground && !appearOffline {
+				want = types.PresenceAvailable // only in front, and only when not appearing offline
 			}
 			if got := presenceFor(w, appearOffline); got != want {
 				t.Errorf("presenceFor(%v, appear offline %v) = %q, want %q", w, appearOffline, got, want)
@@ -107,23 +125,29 @@ func TestPresenceDecisions(t *testing.T) {
 	on, off := types.PresenceAvailable, types.PresenceUnavailable
 	for name, steps := range map[string][]step{
 		"startup, activations, minimise, restore, tray, restore": {
-			{windowShown, false, false, on, true},
-			{windowShown, false, false, on, false},      // another activation: nothing new
+			{windowForeground, false, false, on, true},
+			{windowForeground, false, false, on, false}, // another activation: nothing new
 			{windowMinimized, false, true, off, true},   // minimised: at once
 			{windowMinimized, false, false, off, false}, // still minimised (an activation)
-			{windowShown, false, false, on, true},       // restored
+			{windowForeground, false, false, on, true},  // restored
 			{windowHidden, false, true, off, true},      // closed to the tray: at once
-			{windowShown, false, false, on, true},       // restored from the tray
-			{windowShown, false, true, on, true},        // reconnected: said again
+			{windowForeground, false, false, on, true},  // restored from the tray
+			{windowForeground, false, true, on, true},   // reconnected: said again
+			{windowBackground, false, false, off, true}, // behind another program, grace over
+			{windowBackground, false, true, off, true},  // reconnected there: unavailable, not available
+			{windowLocked, false, true, off, true},      // locked
+			{windowForeground, false, false, on, true},  // unlocked, in front
 		},
 		"appear offline wins in every state": {
-			{windowShown, true, false, off, true}, // startup
-			{windowShown, true, false, off, false},
+			{windowForeground, true, false, off, true}, // startup
+			{windowForeground, true, false, off, false},
 			{windowMinimized, true, false, off, false},
-			{windowShown, true, false, off, false},
+			{windowForeground, true, false, off, false},
 			{windowHidden, true, true, off, true},
-			{windowShown, true, false, off, false}, // restored: still offline, already said
-			{windowShown, false, true, on, true},   // setting turned off
+			{windowForeground, true, false, off, false}, // restored: still offline, already said
+			{windowBackground, true, true, off, true},   // reconnected behind another program
+			{windowLocked, true, true, off, true},
+			{windowForeground, false, true, on, true}, // setting turned off
 		},
 	} {
 		var p presenceState
@@ -343,5 +367,213 @@ func TestOlderPagesBelongToOneOpening(t *testing.T) {
 	}
 	if g := v.switchAccount(acctB); v.current(g3) || g == g3 {
 		t.Fatal("answers for the chat of the previous account are still taken")
+	}
+}
+
+func TestStateOf(t *testing.T) {
+	for _, c := range []struct {
+		visible, iconic, locked, active, grace bool
+		want                                   windowState
+	}{
+		{true, false, false, true, false, windowForeground},
+		{true, false, false, false, true, windowForeground}, // just left: the grace period runs
+		{true, false, false, false, false, windowBackground},
+		{true, true, false, true, false, windowMinimized},
+		{false, false, false, true, false, windowHidden},
+		{true, false, true, true, true, windowLocked}, // a locked session wins over everything
+	} {
+		if got := stateOf(c.visible, c.iconic, c.locked, c.active, c.grace); got != c.want {
+			t.Errorf("stateOf(%+v) = %v, want %v", c, got, c.want)
+		}
+	}
+}
+
+// presenceRig is a presenceCtl over a fake window and fake timers, recording what it broadcasts.
+type presenceRig struct {
+	presenceCtl
+	visible, iconic, offline bool
+	sent                     []types.Presence
+	timers                   []*rigTimer
+}
+
+type rigTimer struct {
+	f       func()
+	stopped bool
+}
+
+func newPresenceRig() *presenceRig {
+	r := &presenceRig{visible: true}
+	r.window = func() (bool, bool) { return r.visible, r.iconic }
+	r.appearOffline = func() bool { return r.offline }
+	r.send = func(p types.Presence) { r.sent = append(r.sent, p) }
+	r.grace.after = func(d time.Duration, f func()) func() bool {
+		if d != graceDelay {
+			panic("unexpected delay")
+		}
+		t := &rigTimer{f: f}
+		r.timers = append(r.timers, t)
+		return func() bool { was := !t.stopped; t.stopped = true; return was }
+	}
+	return r
+}
+
+// live counts timers neither fired nor stopped.
+func (r *presenceRig) live() int {
+	n := 0
+	for _, t := range r.timers {
+		if !t.stopped {
+			n++
+		}
+	}
+	return n
+}
+
+// expire fires the newest timer as its expiry would.
+func (r *presenceRig) expire() {
+	t := r.timers[len(r.timers)-1]
+	t.stopped = true
+	t.f()
+}
+
+func (r *presenceRig) expect(t *testing.T, step string, want ...types.Presence) {
+	t.Helper()
+	if len(r.sent) != len(want) {
+		t.Fatalf("%s: sent %v, want %v", step, r.sent, want)
+	}
+	for i := range want {
+		if r.sent[i] != want[i] {
+			t.Fatalf("%s: sent %v, want %v", step, r.sent, want)
+		}
+	}
+	r.sent = nil
+}
+
+func TestPresenceFollowsTheForeground(t *testing.T) {
+	on, off := types.PresenceAvailable, types.PresenceUnavailable
+	r := newPresenceRig()
+	r.activated(true)
+	r.expect(t, "in front at startup", on)
+
+	r.activated(false)
+	r.expect(t, "just switched away: the grace period runs")
+	if r.live() != 1 {
+		t.Fatalf("%d grace timers, want 1", r.live())
+	}
+	r.activated(false) // a second deactivation does not restart it
+	if len(r.timers) != 1 {
+		t.Fatalf("grace restarted: %d timers", len(r.timers))
+	}
+	r.expire()
+	r.expect(t, "grace over in the background", off)
+	if r.live() != 0 {
+		t.Fatal("a timer outlived its grace period")
+	}
+
+	r.activated(true)
+	r.expect(t, "back in front", on)
+	r.activated(false)
+	r.activated(true)
+	r.expect(t, "back within the grace period: never unavailable")
+	if r.live() != 0 {
+		t.Fatal("the cancelled grace timer is still live")
+	}
+	r.timers[len(r.timers)-1].f() // an expiry queued before the cancel
+	r.expect(t, "a stale expiry")
+
+	r.update(true)
+	r.expect(t, "reconnected in front", on)
+	r.activated(false)
+	r.expire()
+	r.expect(t, "background again", off)
+	r.update(true)
+	r.expect(t, "reconnected in the background: what the rule says, not available", off)
+}
+
+func TestPresenceLockMinimiseAndAppearOffline(t *testing.T) {
+	on, off := types.PresenceAvailable, types.PresenceUnavailable
+	r := newPresenceRig()
+	r.activated(true)
+	r.expect(t, "startup", on)
+
+	r.activated(false) // locking takes the foreground too
+	r.sessionLocked(true)
+	r.expect(t, "locked: at once, grace or not", off)
+	r.expire()
+	r.expect(t, "grace over while locked")
+	r.sessionLocked(false)
+	r.expect(t, "unlocked, another program in front")
+	r.activated(true)
+	r.expect(t, "unlocked and in front", on)
+	r.activated(true)
+	r.sessionLocked(true)
+	r.sessionLocked(false)
+	r.expect(t, "locked and unlocked while in front", off, on)
+
+	r.iconic = true
+	r.update(true)
+	r.expect(t, "minimised: at once", off)
+	r.iconic = false
+	r.update(false)
+	r.expect(t, "restored", on)
+	r.visible = false
+	r.update(true)
+	r.expect(t, "hidden to the tray: at once", off)
+	r.visible = true
+
+	r.offline = true
+	r.update(true)
+	r.expect(t, "appear offline turned on", off)
+	r.activated(false)
+	r.expire()
+	r.activated(true)
+	r.sessionLocked(true)
+	r.sessionLocked(false)
+	r.expect(t, "appearing offline, nothing ever says available", off)
+}
+
+func TestListToReload(t *testing.T) {
+	for _, c := range []struct {
+		evt  any
+		acct string
+		ok   bool
+	}{
+		{whatsapp.ReceiptEvent{AccountID: acctB, Status: store.StatusRead, FromMe: true}, acctB, true}, // read-self on the phone
+		{whatsapp.ReceiptEvent{AccountID: acctB, Status: store.StatusRead}, acctB, false},              // a contact read mine
+		{whatsapp.ReceiptEvent{AccountID: acctB, Status: store.StatusDelivered, FromMe: true}, acctB, false},
+		{whatsapp.ChatReadEvent{AccountID: acctB, ChatJID: alice}, acctB, true},
+		{whatsapp.ChatNamedEvent{AccountID: acctA, ChatJID: "1@g.us", Name: "Team"}, acctA, true},
+		{whatsapp.HistorySyncEvent{AccountID: acctA}, "", false}, // loadChats handles it
+	} {
+		if acct, ok := listToReload(c.evt); ok != c.ok || (ok && acct != c.acct) {
+			t.Errorf("listToReload(%#v) = %q, %v", c.evt, acct, ok)
+		}
+	}
+}
+
+func TestToastLabelsComeFromEveryAccountsList(t *testing.T) {
+	// account B is not active: its names come from its own applied list, not the sidebar
+	v := view{active: acctA, names: map[string]map[string]string{
+		acctB: chatNames([]store.Chat{{JID: alice, Name: "Alice"}, {JID: "120363@g.us", Name: "Family"}, {JID: bob}}),
+	}}
+	for jid, want := range map[string]string{alice: "Alice", "120363@g.us": "Family", bob: "+6282222222222"} {
+		if got := labelOf(v.names[acctB], jid); got != want {
+			t.Errorf("label of %s in B = %q, want %q", jid, got, want)
+		}
+	}
+	if got := labelOf(v.names[acctA], alice); got != "+6281111111111" {
+		t.Errorf("A has no name for alice, got %q", got)
+	}
+}
+
+func TestDropMissingMedia(t *testing.T) {
+	dir := t.TempDir()
+	kept := filepath.Join(dir, "kept.jpg")
+	if err := os.WriteFile(kept, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	msgs := []store.Message{{ID: "a", MediaPath: kept}, {ID: "b", MediaPath: filepath.Join(dir, "cleared.jpg")}, {ID: "c"}}
+	dropMissingMedia(msgs)
+	if msgs[0].MediaPath != kept || msgs[1].MediaPath != "" || msgs[2].MediaPath != "" {
+		t.Fatalf("after: %+v", msgs)
 	}
 }

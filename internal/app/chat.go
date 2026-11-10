@@ -11,8 +11,8 @@ import (
 	"wa-go/internal/whatsapp"
 )
 
-// gifHTTP downloads picked GIFs.
-var gifHTTP = newGIFClient(nil, time.Minute)
+// gifHTTP downloads picked GIFs, through the proxy in Settings.
+var gifHTTP = newGIFClient(ui.GIFTransport, time.Minute)
 
 // showChatPane shows the chat and the input bar, or the empty state.
 func (a *App) showChatPane(open bool) {
@@ -41,22 +41,60 @@ func (a *App) openChat(acct, jid, name string) {
 		name = a.chatName(acct, jid)
 	}
 	a.bar.Reset() // before the switch: it may still tell the chat being left that typing stopped
-	gen := a.v.openChat(c)
+	a.loadChat(c, name)
 	a.showChatPane(true)
 	logErr("focus", a.bar.SetFocus())
+}
+
+// loadChat shows c in the chat view from its newest page, read off the UI thread once disappeared
+// messages are gone, and marks it read. The input bar is left alone.
+func (a *App) loadChat(c chatRef, name string) {
+	gen := a.v.openChat(c)
 	go func() {
-		page, err := a.db.GetChatMessages(acct, jid, 0)
+		purged := a.purgeExpired()
+		page, err := a.db.GetChatMessages(c.acct, c.jid, 0)
+		dropMissingMedia(page)
 		a.mw.Synchronize(func() {
+			if purged {
+				for _, acct := range a.rail.Model().Accounts() {
+					a.reloadList(acct)
+				}
+			}
 			if !a.v.firstPageShown(gen) {
 				return // another chat, or this one again, was opened meanwhile
 			}
 			logErr("open chat", err) // shown empty then
-			a.chat.SetChat(acct, jid, name, isGroup(jid), page)
+			a.chat.SetChat(c.acct, c.jid, name, isGroup(c.jid), page)
 			for _, m := range a.v.pending {
 				a.chat.Upsert(m)
 			}
 			a.v.pending = nil
 			a.markChatRead(c)
+		})
+	}()
+}
+
+// purgeExpired deletes the disappearing messages whose time is up, with their downloads, and
+// reports whether any went. Off the UI thread.
+func (a *App) purgeExpired() bool {
+	paths, n, err := a.db.PurgeExpired(time.Now().Unix())
+	logErr("disappearing messages", err)
+	for _, p := range paths {
+		logErr("disappearing media", a.cache.Remove(p))
+	}
+	return n > 0
+}
+
+// cacheCleared forgets every download after Clear Cache in Settings and shows the open chat again,
+// its media downloadable.
+func (a *App) cacheCleared() {
+	go func() {
+		err := a.db.ClearMediaPaths()
+		a.mw.Synchronize(func() {
+			logErr("forget downloads", err) // the views still treat a missing file as not downloaded
+			if c := a.v.open; c.jid != "" {
+				a.loadChat(c, a.chatName(c.acct, c.jid))
+			}
 		})
 	}()
 }
@@ -70,6 +108,7 @@ func (a *App) loadPrevious() {
 	}
 	go func() {
 		msgs, err := a.db.GetChatMessages(c.acct, c.jid, page)
+		dropMissingMedia(msgs)
 		a.mw.Synchronize(func() {
 			if !a.v.current(gen) {
 				return // the chat was closed or opened again meanwhile
@@ -85,7 +124,7 @@ func (a *App) loadPrevious() {
 }
 
 // markChatRead marks c read: on screen at once, then in the store, then on WhatsApp for its newest
-// unread messages unless the account's read receipts are off.
+// unread messages (only the user's own devices hear of it when the account's read receipts are off).
 func (a *App) markChatRead(c chatRef) {
 	a.v.writeStarted(c.acct) // until it is stored, a reloaded chat list would bring the badge back
 	if a.side.Model().Account() == c.acct {
@@ -109,7 +148,7 @@ func (a *App) markChatRead(c chatRef) {
 }
 
 // markMessageRead marks one message read (a message arriving in the chat being looked at, or a
-// status that was viewed), with a read receipt unless the account's are off.
+// status that was viewed), with a read receipt (read-self when the account's are off).
 func (a *App) markMessageRead(m store.Message) {
 	a.v.writeStarted(m.AccountID)
 	go func() {
@@ -133,23 +172,18 @@ func (a *App) writeDone(acct string) {
 	})
 }
 
-// sendReceipts sends read receipts for msgs of acct unless acct's read receipts are off; when that
-// setting cannot be read, none are sent. Off the UI thread.
+// sendReceipts tells WhatsApp msgs of acct were read: the senders too while acct's read receipts
+// are on; otherwise, or when that setting cannot be read, only the user's own devices (read-self),
+// which keeps them in sync without revealing anything. Off the UI thread.
 func (a *App) sendReceipts(acct string, msgs []store.Message) {
 	if len(msgs) == 0 {
 		return
 	}
 	v, err := ui.Setting(a.db, acct, ui.KeyReadReceipts)
-	if err != nil {
-		logErr("read receipts withheld", err)
-		return
-	}
-	if !receiptsOn(v) {
-		return
-	}
+	logErr("read receipts setting (own devices only)", err)
 	ctx, cancel := context.WithTimeout(context.Background(), netTimeout)
 	defer cancel()
-	logErr("read receipts", a.mgr.MarkRead(ctx, msgs))
+	logErr("read receipts", a.mgr.MarkRead(ctx, msgs, selfOnlyReceipts(v, err)))
 }
 
 // needMedia downloads a message's media for the chat view or the status viewer, once at a time per
@@ -188,13 +222,18 @@ func (a *App) openMedia(path string) {
 	}
 }
 
-// send sends text to the open chat; the stored message comes back as a MessageEvent.
+// send sends text to the open chat; the stored message comes back as a MessageEvent. Failed, the
+// text goes back in the box if its chat is still open and nothing new was typed.
 func (a *App) send(text string) {
 	c := a.v.open
 	a.sendOff("Message not sent", func(ctx context.Context) error {
 		_, err := a.mgr.SendText(ctx, c.acct, c.jid, text)
 		return err
-	}, netTimeout)
+	}, netTimeout, func() {
+		if a.v.open == c {
+			a.bar.Restore(text)
+		}
+	})
 }
 
 // attach sends a picked file to the open chat.
@@ -203,7 +242,7 @@ func (a *App) attach(path string) {
 	a.sendOff("File not sent", func(ctx context.Context) error {
 		_, err := a.mgr.SendMedia(ctx, c.acct, c.jid, path, "")
 		return err
-	}, mediaTimeout)
+	}, mediaTimeout, nil)
 }
 
 // sendGIF downloads a picked GIPHY MP4 (allowlist checked again, size capped) and sends it to the
@@ -218,26 +257,33 @@ func (a *App) sendGIF(mp4URL string) {
 		defer func() { logErr("remove GIF", os.Remove(tmp)) }()
 		_, err = a.mgr.SendGIF(ctx, c.acct, c.jid, tmp)
 		return err
-	}, mediaTimeout)
+	}, mediaTimeout, nil)
 }
 
-// sendOff runs send off the UI thread and reports its failure to the user as what.
-func (a *App) sendOff(what string, send func(ctx context.Context) error, timeout time.Duration) {
+// sendOff runs send off the UI thread and reports its failure to the user as what, after failed
+// (UI thread; may be nil).
+func (a *App) sendOff(what string, send func(ctx context.Context) error, timeout time.Duration, failed func()) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		err := send(ctx)
 		cancel()
 		if err != nil {
 			log.Printf("app: %s: %v", what, err)
-			a.mw.Synchronize(func() { a.alert(what + ": " + err.Error()) })
+			a.mw.Synchronize(func() {
+				if failed != nil {
+					failed()
+				}
+				a.alert(what + ": " + err.Error())
+			})
 		}
 	}()
 }
 
-// typing tells the open chat the user is typing (or stopped), unless ghost typing is on.
+// typing tells the open chat the user is typing (or stopped), unless ghost typing is on or the user
+// appears offline.
 func (a *App) typing(composing bool) {
 	c := a.v.open
-	if c.jid == "" || !typingOn(a.cfg[ui.KeyGhostTyping]) {
+	if c.jid == "" || !typingOn(a.cfg[ui.KeyGhostTyping], a.cfg[ui.KeyAppearOffline]) {
 		return
 	}
 	a.queueTyping(func(ctx context.Context) error { return a.mgr.SetTyping(ctx, c.acct, c.jid, composing) })
@@ -284,6 +330,7 @@ func (a *App) openStory(sender string) {
 	}
 	go func() {
 		msgs, err := a.db.StatusMessages(acct, sender, time.Now().Add(-24*time.Hour).Unix())
+		dropMissingMedia(msgs)
 		a.mw.Synchronize(func() {
 			logErr("status updates", err)
 			if acct != a.v.active || len(msgs) == 0 || a.statusSet != nil {

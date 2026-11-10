@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"wa-go/internal/ui"
 )
 
 // giphyServer answers every https request as if it were the host in the URL; hits counts requests.
@@ -156,5 +158,11 @@ func TestFetchGIFTimesOutAndRejectsErrors(t *testing.T) {
 	}
 	if n := leftovers(t, dir); n != 0 {
 		t.Fatalf("%d temp files left behind", n)
+	}
+}
+
+func TestPickedGIFsGoThroughTheProxy(t *testing.T) {
+	if gifHTTP.Transport != ui.GIFTransport {
+		t.Fatal("picked GIFs are downloaded without the proxy in Settings")
 	}
 }

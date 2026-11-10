@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"maps"
+	"math"
 	"mime"
 	"net/url"
 	"os"
@@ -48,12 +50,21 @@ type (
 		AccountID string
 		Message   store.Message
 	}
-	// ReceiptEvent: the stored status of IDs in ChatJID moved forward to Status.
+	// ReceiptEvent: the stored status of IDs in ChatJID moved forward to Status. FromMe: the receipt
+	// came from one of the user's own devices (incoming messages read there: unread counts dropped).
 	ReceiptEvent struct {
 		AccountID, ChatJID string
 		IDs                []string
 		Status             string
+		FromMe             bool
 	}
+	// ChatReadEvent: ChatJID was marked read on another of the user's devices; its unread count dropped.
+	ChatReadEvent struct{ AccountID, ChatJID string }
+	// ChatNamedEvent: ChatJID (a group) got or changed its name.
+	ChatNamedEvent struct{ AccountID, ChatJID, Name string }
+	// PushNameEvent: the account's own name is known now, which presence updates need (a fresh pairing
+	// learns it only after connecting): send the presence again.
+	PushNameEvent struct{ AccountID string }
 	// RevisedEvent: stored message ID in ChatJID was edited or deleted for everyone; reload it.
 	RevisedEvent struct{ AccountID, ChatJID, ID string }
 	// HistorySyncEvent: a history-sync blob was stored; reload the account's chat list.
@@ -73,7 +84,10 @@ type msgStore interface {
 	InsertMessage(store.Message) (bool, error)
 	UpsertChat(accountID, jid, name string, lastMessageTS int64) error
 	NameChatIfUnnamed(accountID, jid, name string) error
+	ChatName(accountID, jid string) (string, error)
+	ChatExpiration(accountID, chatJID string) (int64, error)
 	UpdateMessageStatus(accountID, chatJID string, ids []string, status string) error
+	MarkChatReadUntil(accountID, chatJID string, until int64) error
 	ReviseMessage(accountID, chatJID, id, msgType, body string) (bool, error)
 	MessageSender(accountID, chatJID, id string) (string, error)
 	SetMediaPath(accountID, chatJID, id, path string) error
@@ -86,10 +100,15 @@ type Manager struct {
 	media     *media.Cache
 	container *sqlstore.Container
 
-	mu        sync.RWMutex // guards accounts, listeners and proxy; never held while calling whatsmeow or a listener
+	mu        sync.RWMutex // guards accounts, listeners, proxy and groupsAsked; never held while calling whatsmeow or a listener
 	accounts  map[string]waClient
 	listeners []func(evt any)
 	proxy     string // every client's proxy, "" for a direct connection
+
+	connect      func(*whatsmeow.Client) error // (*whatsmeow.Client).Connect; tests fake the handshake
+	groupsAsked  map[string]bool               // "account chat" of unnamed groups whose name was asked for this run
+	groupSlots   chan struct{}                 // bounds the group-name lookups under way
+	groupFetches sync.WaitGroup                // the lookups under way
 }
 
 // New opens (creating if needed) the whatsmeow session database at sessionPath, which holds every
@@ -103,30 +122,30 @@ func New(ctx context.Context, sessionPath string, db *store.DB, cache *media.Cac
 	if err != nil {
 		return nil, fmt.Errorf("whatsapp: open sessions: %w", err)
 	}
-	return &Manager{store: db, media: cache, container: container, accounts: map[string]waClient{}}, nil
+	return &Manager{store: db, media: cache, container: container, accounts: map[string]waClient{},
+		connect: (*whatsmeow.Client).Connect, groupsAsked: map[string]bool{}, groupSlots: make(chan struct{}, 2)}, nil
 }
 
-// Start creates a client for every saved device and connects them concurrently. An account whose
-// connection fails stays registered and its error is returned (joined with the others).
+// Start registers a client for every saved device and returns: Accounts lists them at once, while
+// each connects in the background (a ConnectionEvent reports it; a failed first attempt keeps
+// retrying, and a connection error is sent as an ErrorEvent). Add listeners before calling it.
 func (m *Manager) Start(ctx context.Context) error {
 	devices, err := m.container.GetAllDevices(ctx)
 	if err != nil {
 		return fmt.Errorf("whatsapp: load sessions: %w", err)
 	}
-	var wg sync.WaitGroup
-	errs := make([]error, len(devices))
-	for i, dev := range devices {
+	for _, dev := range devices {
 		cli := m.newClient(dev)
 		cli.InitialAutoReconnect = true // app started offline: keep retrying in the background
-		m.add(dev.ID.User, liveClient{cli})
-		wg.Go(func() {
-			if err := cli.Connect(); err != nil {
-				errs[i] = fmt.Errorf("whatsapp: connect %s: %w", dev.ID.User, err)
+		id := dev.ID.User
+		m.add(id, liveClient{cli})
+		go func() {
+			if err := m.connect(cli); err != nil {
+				m.emit(ErrorEvent{AccountID: id, Err: fmt.Errorf("whatsapp: connect %s: %w", id, err)})
 			}
-		})
+		}()
 	}
-	wg.Wait()
-	return errors.Join(errs...)
+	return nil
 }
 
 // Pair starts linking a new phone. Render each item whose Event is whatsmeow.QRChannelEventCode as a
@@ -209,8 +228,8 @@ func (m *Manager) SendText(ctx context.Context, accountID, chatJID, text string)
 	return m.send(ctx, cli, accountID, chat, &waE2E.Message{Conversation: proto.String(text)}, "")
 }
 
-// SendMedia sends the file at path to chatJID: as an image for image/* MIME types, otherwise as a
-// document. The file is streamed into the media cache and uploaded from there, never read whole
+// SendMedia sends the file at path to chatJID: as an image for JPEG and PNG (what WhatsApp shows
+// inline), otherwise as a document. The file is streamed into the media cache and uploaded from there, never read whole
 // into memory; the stored message points at the cached copy.
 func (m *Manager) SendMedia(ctx context.Context, accountID, chatJID, path, caption string) (store.Message, error) {
 	cli, err := m.client(accountID)
@@ -222,7 +241,7 @@ func (m *Manager) SendMedia(ctx context.Context, accountID, chatJID, path, capti
 		return store.Message{}, err
 	}
 	mimeType := cmp.Or(mime.TypeByExtension(filepath.Ext(path)), "application/octet-stream")
-	isImage := strings.HasPrefix(mimeType, "image/")
+	isImage := mimeType == "image/jpeg" || mimeType == "image/png"
 	kind := whatsmeow.MediaDocument
 	if isImage {
 		kind = whatsmeow.MediaImage
@@ -319,8 +338,16 @@ func (m *Manager) SetTyping(ctx context.Context, accountID, chatJID string, comp
 	return cli.SendChatPresence(ctx, chat, state, types.ChatPresenceMediaText)
 }
 
-// send sends msg and stores it as sent; mediaPath is the cached copy of its attachment, if any.
+// send sends msg and stores it as sent; mediaPath is the cached copy of its attachment, if any. In a
+// chat with disappearing messages on, msg disappears too, here and for everyone.
 func (m *Manager) send(ctx context.Context, cli waClient, accountID string, chat types.JID, msg *waE2E.Message, mediaPath string) (store.Message, error) {
+	exp, err := m.store.ChatExpiration(accountID, chat.String())
+	if err != nil {
+		return store.Message{}, err
+	}
+	if exp > 0 {
+		disappearing(msg, uint32(min(exp, math.MaxUint32)))
+	}
 	resp, err := cli.SendMessage(ctx, chat, msg)
 	if err != nil {
 		return store.Message{}, err
@@ -461,8 +488,13 @@ func (m *Manager) proxyAddress() string {
 
 // MarkRead sends read receipts for the incoming messages among msgs (as read from the store) and
 // marks them read locally. Receipts are addressed as the messages arrived (LID or phone number),
-// falling back to the stored key where that is unknown.
-func (m *Manager) MarkRead(ctx context.Context, msgs []store.Message) error {
+// falling back to the stored key where that is unknown. selfOnly sends read-self receipts, which
+// only the user's own devices see (read receipts off): the senders learn nothing.
+func (m *Manager) MarkRead(ctx context.Context, msgs []store.Message, selfOnly bool) error {
+	typ := types.ReceiptTypeRead
+	if selfOnly {
+		typ = types.ReceiptTypeReadSelf
+	}
 	type key struct{ account, chat, wireChat, wireSender string } // one receipt covers one sender's messages
 	groups := map[key][]string{}
 	for _, msg := range msgs {
@@ -484,7 +516,7 @@ func (m *Manager) MarkRead(ctx context.Context, msgs []store.Message) error {
 		if err != nil {
 			return err
 		}
-		if err := cli.MarkRead(ctx, ids, time.Now(), chat, sender); err != nil {
+		if err := cli.MarkRead(ctx, ids, time.Now(), chat, sender, typ); err != nil {
 			return err
 		}
 		if err := m.store.UpdateMessageStatus(k.account, k.chat, ids, store.StatusRead); err != nil {
@@ -558,6 +590,10 @@ func (m *Manager) DownloadMedia(ctx context.Context, msg store.Message) (string,
 	path, err := m.media.Save(msg.AccountID, mediaExt(name, dl.GetMimetype()), tmp)
 	if err != nil {
 		return "", err
+	}
+	// best effort: the download stands without it
+	if err := media.MarkFromInternet(path); err != nil {
+		log.Printf("whatsapp: mark of the web on %s: %v", filepath.Base(path), err)
 	}
 	return path, m.store.SetMediaPath(msg.AccountID, msg.ChatJID, msg.ID, path)
 }

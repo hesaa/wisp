@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -54,6 +55,22 @@ type fakeClient struct {
 	fetches     []bool // ignoreCache of each TryFetchPrivacySettings call
 	timers      []time.Duration
 	proxies     []string
+	groupNames  map[types.JID]string // GetGroupInfo answers
+	groupMu     sync.Mutex
+	groupN      int // GetGroupInfo calls
+}
+
+func (f *fakeClient) GetGroupInfo(_ context.Context, jid types.JID) (*types.GroupInfo, error) {
+	f.groupMu.Lock()
+	f.groupN++
+	f.groupMu.Unlock()
+	return &types.GroupInfo{JID: jid, GroupName: types.GroupName{Name: f.groupNames[jid]}}, nil
+}
+
+func (f *fakeClient) groupCalls() int {
+	f.groupMu.Lock()
+	defer f.groupMu.Unlock()
+	return f.groupN
 }
 
 func (f *fakeClient) TryFetchPrivacySettings(_ context.Context, ignoreCache bool) (*types.PrivacySettings, error) {
@@ -93,6 +110,7 @@ func (f *fakeClient) SendChatPresence(_ context.Context, chat types.JID, state t
 type markRead struct {
 	chat, sender types.JID
 	ids          []string
+	typ          types.ReceiptType
 }
 
 func (f *fakeClient) Disconnect() {}
@@ -115,8 +133,12 @@ func (f *fakeClient) SendMessage(_ context.Context, _ types.JID, msg *waE2E.Mess
 	return whatsmeow.SendResponse{ID: fmt.Sprintf("out%d", len(f.sent)), Timestamp: time.Unix(2000, 0)}, nil
 }
 
-func (f *fakeClient) MarkRead(_ context.Context, ids []types.MessageID, _ time.Time, chat, sender types.JID, _ ...types.ReceiptType) error {
-	f.receipts = append(f.receipts, markRead{chat, sender, ids})
+func (f *fakeClient) MarkRead(_ context.Context, ids []types.MessageID, _ time.Time, chat, sender types.JID, typ ...types.ReceiptType) error {
+	r := markRead{chat, sender, ids, types.ReceiptTypeRead}
+	if len(typ) == 1 {
+		r.typ = typ[0]
+	}
+	f.receipts = append(f.receipts, r)
 	return nil
 }
 
@@ -465,7 +487,9 @@ func TestSendMediaPicksImageOrDocument(t *testing.T) {
 	dir := t.TempDir()
 	png := filepath.Join(dir, "photo.png")
 	txt := filepath.Join(dir, "notes.txt")
-	if err := errors.Join(os.WriteFile(png, []byte("png bytes"), 0o600), os.WriteFile(txt, []byte("some notes"), 0o600)); err != nil {
+	gif := filepath.Join(dir, "anim.gif")
+	if err := errors.Join(os.WriteFile(png, []byte("png bytes"), 0o600), os.WriteFile(txt, []byte("some notes"), 0o600),
+		os.WriteFile(gif, []byte("gif bytes"), 0o600)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -489,7 +513,12 @@ func TestSendMediaPicksImageOrDocument(t *testing.T) {
 	if b, err := os.ReadFile(doc.MediaPath); err != nil || string(b) != "some notes" {
 		t.Fatalf("cached copy %q: %q %v", doc.MediaPath, b, err)
 	}
-	if page, _ := db.GetChatMessages(acctA, alice.String(), 0); len(page) != 2 {
+	// only JPEG and PNG are images WhatsApp shows; other image types go as documents
+	if anim, err := m.SendMedia(ctx, acctA, alice.String(), gif, ""); err != nil || anim.Type != TypeDocument ||
+		fa.sent[2].GetDocumentMessage().GetMimetype() != "image/gif" || fa.uploads[2] != whatsmeow.MediaDocument {
+		t.Fatalf("gif sent as %+v (%v), err %v", anim, fa.sent[2], err)
+	}
+	if page, _ := db.GetChatMessages(acctA, alice.String(), 0); len(page) != 3 {
 		t.Fatalf("stored %d outgoing", len(page))
 	}
 }
@@ -555,7 +584,7 @@ func TestMarkReadOneReceiptPerSender(t *testing.T) {
 	if err := db.InsertMessagesBatch(msgs); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.MarkRead(ctx, msgs); err != nil {
+	if err := m.MarkRead(ctx, msgs, false); err != nil {
 		t.Fatal(err)
 	}
 	got := make([]string, 0, len(fa.receipts))
@@ -617,7 +646,7 @@ func TestLIDChatsStoredUnderPhoneNumber(t *testing.T) {
 	if len(page) != 1 || page[0].SenderJID != alice.String() {
 		t.Fatalf("stored under phone number: %+v", page)
 	}
-	if err := m.MarkRead(ctx, page); err != nil {
+	if err := m.MarkRead(ctx, page, false); err != nil {
 		t.Fatal(err)
 	}
 	if r := fa.receipts; len(r) != 1 || r[0].chat != lid || r[0].sender.String() != lid.String() || statusOf(t, db, acctA, "l1") != store.StatusRead {

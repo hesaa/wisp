@@ -20,6 +20,9 @@ func (a *App) listen(evt any) {
 
 // handle applies one manager event. UI thread.
 func (a *App) handle(evt any) {
+	if acct, ok := listToReload(evt); ok { // any account: the rail and tray totals follow
+		a.reloadList(acct)
+	}
 	switch e := evt.(type) {
 	case whatsapp.MessageEvent:
 		a.onMessage(e.Message)
@@ -27,6 +30,10 @@ func (a *App) handle(evt any) {
 		a.reload(chatRef{e.AccountID, e.ChatJID}, e.IDs)
 	case whatsapp.RevisedEvent:
 		a.reload(chatRef{e.AccountID, e.ChatJID}, []string{e.ID})
+	case whatsapp.ChatNamedEvent:
+		a.chat.Rename(e.AccountID, e.ChatJID, e.Name)
+	case whatsapp.PushNameEvent:
+		a.sendPresence(true) // the first one after a pairing failed without the name
 	case whatsapp.HistorySyncEvent:
 		a.loadChats(e.AccountID)
 	case whatsapp.ConnectionEvent:
@@ -58,8 +65,7 @@ func (a *App) onMessage(m store.Message) {
 		a.v.unread[m.AccountID] = a.side.Model().Unread()
 		a.v.listChanged(m.AccountID)
 	} else if r.unread {
-		a.v.unread[m.AccountID]++
-		a.v.listChanged(m.AccountID)
+		a.reloadList(m.AccountID) // another account: its total comes from its stored list
 	}
 	a.showUnread()
 	if r.notify {
@@ -121,6 +127,7 @@ func (a *App) refreshAccounts() {
 	for id := range a.v.unread {
 		if !slices.Contains(ids, id) {
 			delete(a.v.unread, id)
+			delete(a.v.names, id)
 		}
 	}
 	for _, id := range ids {
@@ -188,6 +195,7 @@ func (a *App) reloadList(acct string) {
 				n += c.Unread
 			}
 			a.v.unread[acct] = n
+			a.v.names[acct] = chatNames(chats)
 			if acct == a.v.active {
 				a.side.Model().SetChats(acct, chats)
 				if jid, ok := a.v.takeOpenNext(acct); ok {
@@ -250,30 +258,11 @@ func (a *App) toastClicked(acct, jid string) {
 	a.rail.Model().SetActive(acct) // its chats load, then the chat opens
 }
 
-// chatName is jid's name in the active account's chat list, "" when it has none.
-func (a *App) chatName(acct, jid string) string {
-	if a.side.Model().Account() != acct {
-		return ""
-	}
-	for _, c := range a.side.Model().Chats() {
-		if c.JID == jid {
-			return c.Name
-		}
-	}
-	return ""
-}
+// chatName is jid's name in acct's chat list (any account), "" when it has none.
+func (a *App) chatName(acct, jid string) string { return a.v.names[acct][jid] }
 
-// label is jid's name, else its phone number.
-func (a *App) label(acct, jid string) string {
-	if n := a.chatName(acct, jid); n != "" {
-		return n
-	}
-	user, server, _ := strings.Cut(jid, "@")
-	if server == "s.whatsapp.net" {
-		return "+" + user
-	}
-	return user
-}
+// label is jid's name in acct's chat list, else its phone number.
+func (a *App) label(acct, jid string) string { return labelOf(a.v.names[acct], jid) }
 
 // chatUnread is the open account's unread count of jid.
 func (a *App) chatUnread(jid string) int {

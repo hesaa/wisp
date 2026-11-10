@@ -59,6 +59,7 @@ type waClient interface {
 	PNForLID(ctx context.Context, lid types.JID) (types.JID, error) // empty JID when unknown
 	ContactName(ctx context.Context, jid types.JID) (string, error) // address-book name, "" when unknown
 	AllContacts(ctx context.Context) (map[types.JID]types.ContactInfo, error)
+	GetGroupInfo(ctx context.Context, jid types.JID) (*types.GroupInfo, error)
 }
 
 // liveClient adds the device-store lookups to a real client.
@@ -144,6 +145,9 @@ func (m *Manager) handleEvent(ctx context.Context, id string, cli waClient, evt 
 				return err
 			}
 		}
+		if info.Chat.Server == types.GroupServer {
+			m.nameGroupOnce(id, cli, info.Chat)
+		}
 		return m.persist(msg)
 	case *events.Receipt:
 		status := receiptStatus(e.Type)
@@ -158,7 +162,17 @@ func (m *Manager) handleEvent(ctx context.Context, id string, cli waClient, evt 
 		if err := m.store.UpdateMessageStatus(id, chat, e.MessageIDs, status); err != nil {
 			return err
 		}
-		m.emit(ReceiptEvent{AccountID: id, ChatJID: chat, IDs: e.MessageIDs, Status: status})
+		m.emit(ReceiptEvent{AccountID: id, ChatJID: chat, IDs: e.MessageIDs, Status: status, FromMe: e.IsFromMe})
+	case *events.MarkChatAsRead:
+		return m.chatReadElsewhere(ctx, id, cli, e)
+	case *events.JoinedGroup:
+		return m.nameChat(id, e.JID, e.Name)
+	case *events.GroupInfo:
+		if e.Name != nil {
+			return m.nameChat(id, e.JID, e.Name.Name)
+		}
+	case *events.PushNameSetting:
+		m.emit(PushNameEvent{AccountID: id})
 	case *events.HistorySync:
 		err := m.ingestHistory(ctx, id, cli, e)
 		// whatsmeow decoded the whole blob before this event; drop our handle (we are its only
@@ -195,6 +209,73 @@ func (m *Manager) persist(msg store.Message) error {
 		m.emit(MessageEvent{AccountID: msg.AccountID, Message: msg})
 	}
 	return err
+}
+
+// chatReadElsewhere applies a chat marked read on another of the user's devices (app state): its
+// incoming messages up to the newest one that device had seen (else up to when it was marked) are
+// read. Marking a chat unread changes nothing here.
+func (m *Manager) chatReadElsewhere(ctx context.Context, id string, cli waClient, e *events.MarkChatAsRead) error {
+	if !e.Action.GetRead() {
+		return nil
+	}
+	chat, err := toPN(ctx, cli, e.JID, types.EmptyJID)
+	if err != nil {
+		return err
+	}
+	until := e.Action.GetMessageRange().GetLastMessageTimestamp()
+	if until <= 0 {
+		until = e.Timestamp.Unix()
+	}
+	if until <= 0 {
+		until = math.MaxInt64
+	}
+	if err := m.store.MarkChatReadUntil(id, chat.String(), until); err != nil {
+		return err
+	}
+	m.emit(ChatReadEvent{AccountID: id, ChatJID: chat.String()})
+	return nil
+}
+
+// nameChat records a group's name (joined, or renamed) and tells listeners.
+func (m *Manager) nameChat(id string, chat types.JID, name string) error {
+	if name == "" {
+		return nil
+	}
+	if err := m.store.UpsertChat(id, chat.String(), name, 0); err != nil {
+		return err
+	}
+	m.emit(ChatNamedEvent{AccountID: id, ChatJID: chat.String(), Name: name})
+	return nil
+}
+
+// nameGroupOnce names an unnamed group chat from WhatsApp's group info: on the group's first message
+// this run, off the message path, a few lookups at a time. A lookup that fails is not retried until
+// the next run.
+func (m *Manager) nameGroupOnce(id string, cli waClient, group types.JID) {
+	key := id + " " + group.String()
+	m.mu.Lock()
+	asked := m.groupsAsked[key]
+	m.groupsAsked[key] = true
+	m.mu.Unlock()
+	if asked {
+		return
+	}
+	m.groupFetches.Go(func() {
+		m.groupSlots <- struct{}{}
+		defer func() { <-m.groupSlots }()
+		name, err := m.store.ChatName(id, group.String())
+		if err == nil && name == "" {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			var info *types.GroupInfo
+			if info, err = cli.GetGroupInfo(ctx, group); err == nil {
+				err = m.nameChat(id, group, info.Name)
+			}
+			cancel()
+		}
+		if err != nil {
+			m.emit(ErrorEvent{AccountID: id, Err: fmt.Errorf("whatsapp: name of group %s: %w", group, err)})
+		}
+	})
 }
 
 // nameDM records the best name for a 1:1 chat: the address-book name always wins; a push name only
@@ -423,6 +504,9 @@ func toStoreMessage(id string, info types.MessageInfo, m *waE2E.Message) (msg st
 		SenderJID: info.Sender.ToNonAD().String(), Timestamp: info.Timestamp.Unix(),
 		Type: typ, Body: body, FromMe: info.IsFromMe, Status: store.StatusReceived,
 	}
+	if exp := contextInfo(m).GetExpiration(); exp > 0 { // disappearing messages: honoured here too
+		msg.ExpiresAt = msg.Timestamp + int64(exp)
+	}
 	switch {
 	case typ == TypeUnsupported:
 		msg.Status = store.StatusRead // never counts as unread
@@ -463,6 +547,45 @@ func content(m *waE2E.Message) (typ, body string, media proto.Message, skip bool
 		return "", "", nil, true
 	}
 	return TypeUnsupported, "", nil, false
+}
+
+// contextInfo is the context info (quote, disappearing timer, ...) of a message's content; nil when
+// it has none.
+func contextInfo(m *waE2E.Message) *waE2E.ContextInfo {
+	switch {
+	case m.GetExtendedTextMessage() != nil:
+		return m.GetExtendedTextMessage().GetContextInfo()
+	case m.GetImageMessage() != nil:
+		return m.GetImageMessage().GetContextInfo()
+	case m.GetVideoMessage() != nil:
+		return m.GetVideoMessage().GetContextInfo()
+	case m.GetAudioMessage() != nil:
+		return m.GetAudioMessage().GetContextInfo()
+	case m.GetDocumentMessage() != nil:
+		return m.GetDocumentMessage().GetContextInfo()
+	case m.GetStickerMessage() != nil:
+		return m.GetStickerMessage().GetContextInfo()
+	}
+	return nil
+}
+
+// disappearing makes an outgoing message disappear exp seconds after it is sent, as the chat's
+// timer asks: the timer travels in the content's context info, so plain text becomes extended text.
+func disappearing(m *waE2E.Message, exp uint32) {
+	if m.Conversation != nil {
+		m.ExtendedTextMessage, m.Conversation = &waE2E.ExtendedTextMessage{Text: m.Conversation}, nil
+	}
+	ci := &waE2E.ContextInfo{Expiration: proto.Uint32(exp)}
+	switch {
+	case m.ExtendedTextMessage != nil:
+		m.ExtendedTextMessage.ContextInfo = ci
+	case m.ImageMessage != nil:
+		m.ImageMessage.ContextInfo = ci
+	case m.VideoMessage != nil:
+		m.VideoMessage.ContextInfo = ci
+	case m.DocumentMessage != nil:
+		m.DocumentMessage.ContextInfo = ci
+	}
 }
 
 func receiptStatus(t types.ReceiptType) string {

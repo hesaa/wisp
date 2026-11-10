@@ -37,7 +37,7 @@ type Backend interface {
 	SendGIF(ctx context.Context, accountID, chatJID, mp4Path string) (store.Message, error)
 	SetTyping(ctx context.Context, accountID, chatJID string, composing bool) error
 	SetPresenceAll(ctx context.Context, p types.Presence) error
-	MarkRead(ctx context.Context, msgs []store.Message) error
+	MarkRead(ctx context.Context, msgs []store.Message, selfOnly bool) error
 	DownloadMedia(ctx context.Context, msg store.Message) (string, error)
 	SetProxy(addr string) error
 	Close() error
@@ -64,7 +64,7 @@ type App struct {
 	builtin  string            // the GIPHY key built into the binary
 	cfg      map[string]string // globalKeys as last saved
 	pal      theme.Palette
-	presence presenceState
+	presence presenceCtl
 	outbox   *presenceBox                     // the presence to broadcast next, never dropped
 	typingQ  chan func(context.Context) error // typing updates, sent one at a time in order
 	bg       context.Context                  // ends at Exit: queued typing is skipped, calls under way stop
@@ -93,7 +93,19 @@ type App struct {
 // builtinGIFKey is the GIPHY key used when Settings has none.
 func New(db *store.DB, cache *media.Cache, builtinGIFKey string) (*App, error) {
 	a := &App{db: db, cache: cache, builtin: builtinGIFKey, cfg: map[string]string{},
-		v: view{unread: map[string]int{}}, inflight: inflight{}}
+		v: view{unread: map[string]int{}, names: map[string]map[string]string{}}, inflight: inflight{}}
+	a.presence = presenceCtl{
+		window:        func() (bool, bool) { return a.mw.Visible(), win.IsIconic(a.mw.Handle()) },
+		appearOffline: func() bool { return a.cfg[ui.KeyAppearOffline] == "true" },
+		send: func(p types.Presence) {
+			if a.outbox != nil { // nil until Attach
+				a.outbox.put(p)
+			}
+		},
+		grace: grace{after: func(d time.Duration, f func()) func() bool {
+			return time.AfterFunc(d, func() { a.mw.Synchronize(f) }).Stop
+		}},
+	}
 	for _, k := range globalKeys {
 		v, err := ui.Setting(db, "", k)
 		logErr("read setting "+k, err) // the default stands in
@@ -174,6 +186,7 @@ func (a *App) build() error {
 	// the focus can only be set once the window runs; the search box takes it, without a focus ring
 	mw.Starting().Attach(func() { mw.Synchronize(func() { logErr("focus", a.side.FocusSearch()) }) })
 	mw.SendMessage(win.WM_CHANGEUISTATE, win.UIS_INITIALIZE, 0)
+	logErr("presence", a.watchActivation()) // without it presence stays unavailable
 	// cosmetic: Windows builds without dark title bars keep a light one
 	logErr("title bar", theme.ApplyTitleBar(uintptr(mw.Handle()), theme.Resolve(mode) == theme.ThemeDark))
 	return nil
@@ -184,15 +197,17 @@ func (a *App) build() error {
 func (a *App) Attach(mgr Backend) {
 	a.mgr = mgr
 	logErr("proxy", mgr.SetProxy(a.cfg[ui.KeyProxy])) // ValidateProxy errors never repeat the address
+	ui.SetGIFProxy(a.cfg[ui.KeyProxy])
 	mgr.AddListener(a.listen)
 	a.bg, a.stopBG = context.WithCancel(context.Background())
 	a.outbox, a.typingQ = newPresenceBox(), make(chan func(context.Context) error, 64)
 	go a.presenceWorker()
 	go a.typingWorker()
 	go func() {
-		err := mgr.Start(context.Background())
+		a.purgeExpired()                       // before any chat list is read
+		err := mgr.Start(context.Background()) // returns before the accounts connect
 		a.mw.Synchronize(func() {
-			logErr("connect", err) // accounts that failed keep retrying; the rail shows them offline
+			logErr("sessions", err)
 			a.refreshAccounts()
 			if len(a.rail.Model().Accounts()) == 0 {
 				a.pair()
@@ -249,6 +264,9 @@ func (a *App) exit() {
 	})
 }
 
+// Restore brings the window to the front from any goroutine (another wa-go was started).
+func (a *App) Restore() { a.mw.Synchronize(a.restore) }
+
 // restore brings the window back from the tray (or a minimised state) to the front.
 func (a *App) restore() {
 	if !a.mw.Visible() {
@@ -261,9 +279,9 @@ func (a *App) restore() {
 	win.SetForegroundWindow(h)
 }
 
-// activated: the user is back; show them available (unless appearing offline) and read the open chat.
+// activated: the user is back on the main window; read the open chat. (Presence follows
+// WM_ACTIVATEAPP: see watchActivation.)
 func (a *App) activated() {
-	a.sendPresence(false)
 	if c := a.v.open; c.jid != "" && a.v.loaded && a.chatUnread(c.jid) > 0 {
 		a.markChatRead(c)
 	}
@@ -275,23 +293,9 @@ func (a *App) foreground() bool {
 	return a.mw.Visible() && !win.IsIconic(h) && win.GetForegroundWindow() == h
 }
 
-// sendPresence broadcasts the presence the window's state calls for (see presenceState.next).
+// sendPresence broadcasts the presence the window's state calls for (see presenceCtl.update).
 // Accounts not connected yet fail (logged); a reconnect broadcasts again.
-func (a *App) sendPresence(force bool) {
-	if p, send := a.presence.next(a.windowState(), a.cfg[ui.KeyAppearOffline] == "true", force); send {
-		a.outbox.put(p)
-	}
-}
-
-func (a *App) windowState() windowState {
-	switch {
-	case !a.mw.Visible():
-		return windowHidden
-	case win.IsIconic(a.mw.Handle()):
-		return windowMinimized
-	}
-	return windowShown
-}
+func (a *App) sendPresence(force bool) { a.presence.update(force) }
 
 // sizeChanged follows minimising and restoring (walk publishes SizeChanged from WM_WINDOWPOSCHANGED,
 // which every route sends: the minimise button, the taskbar button, Win+Down): minimised, every
@@ -357,7 +361,7 @@ func (a *App) nav(n ui.Nav) {
 		}
 	case ui.NavSettings:
 		logErr("settings", ui.RunSettings(a.mw, a.pal, ui.SettingsDeps{Store: a.db, Manager: a.mgr, Media: a.cache, Account: a.v.active,
-			OnThemeChanged: a.applyTheme, OnSettingsChanged: a.settingChanged, OnAddAccount: a.pair}))
+			OnThemeChanged: a.applyTheme, OnSettingsChanged: a.settingChanged, OnAddAccount: a.pair, OnCacheCleared: a.cacheCleared}))
 	}
 }
 
@@ -381,6 +385,7 @@ func (a *App) settingChanged(key string) {
 	switch key {
 	case ui.KeyProxy:
 		logErr("proxy", a.mgr.SetProxy(v))
+		ui.SetGIFProxy(v)
 	case ui.KeyAppearOffline:
 		a.sendPresence(true)
 	case ui.KeyAutoDownloadImages:
