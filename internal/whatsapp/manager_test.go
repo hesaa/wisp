@@ -49,6 +49,30 @@ type fakeClient struct {
 	pns         map[types.JID]types.JID // LID -> phone number
 	names       map[types.JID]string    // address-book names
 	contacts    map[types.JID]types.ContactInfo
+	privacy     types.PrivacySettings
+	privacyErr  error
+	fetches     []bool // ignoreCache of each TryFetchPrivacySettings call
+	timers      []time.Duration
+	proxies     []string
+}
+
+func (f *fakeClient) TryFetchPrivacySettings(_ context.Context, ignoreCache bool) (*types.PrivacySettings, error) {
+	f.fetches = append(f.fetches, ignoreCache)
+	if f.privacyErr != nil {
+		return nil, f.privacyErr
+	}
+	ps := f.privacy
+	return &ps, nil
+}
+
+func (f *fakeClient) SetDefaultDisappearingTimer(_ context.Context, d time.Duration) error {
+	f.timers = append(f.timers, d)
+	return nil
+}
+
+func (f *fakeClient) SetProxyAddress(addr string, _ ...whatsmeow.SetProxyOptions) error {
+	f.proxies = append(f.proxies, addr)
+	return nil
 }
 
 func (f *fakeClient) AllContacts(context.Context) (map[types.JID]types.ContactInfo, error) {
@@ -367,6 +391,14 @@ func TestUnknownAccountIsAnError(t *testing.T) {
 		"DownloadMedia": func() error {
 			_, err := m.DownloadMedia(ctx, store.Message{AccountID: "nope", Type: TypeImage})
 			return err
+		},
+		"SetPrivacySetting": func() error {
+			_, err := m.SetPrivacySetting(ctx, "nope", types.PrivacySettingTypeLastSeen, types.PrivacySettingNone)
+			return err
+		},
+		"PrivacySettings": func() error { _, err := m.PrivacySettings(ctx, "nope"); return err },
+		"SetDefaultDisappearingTimer": func() error {
+			return m.SetDefaultDisappearingTimer(ctx, "nope", 24*time.Hour)
 		},
 	}
 	for name, op := range ops {
@@ -760,5 +792,70 @@ func TestPushNameNeverReplacesChatName(t *testing.T) {
 	}
 	if n := names(); n[alice.String()] != "Alice Smith" {
 		t.Fatalf("names %v", n)
+	}
+}
+
+func TestPrivacySettingsAndTimerReachOnlyTheirAccount(t *testing.T) {
+	m, _ := newTestManager(t)
+	fa := &fakeClient{privacy: types.PrivacySettings{LastSeen: types.PrivacySettingContacts}}
+	fb := &fakeClient{privacy: types.PrivacySettings{LastSeen: types.PrivacySettingNone, ReadReceipts: types.PrivacySettingNone}}
+	m.add(acctA, fa)
+	m.add(acctB, fb)
+	ps, err := m.PrivacySettings(ctx, acctB)
+	if err != nil || ps != fb.privacy {
+		t.Fatalf("B's settings %+v %v", ps, err)
+	}
+	if len(fa.fetches) != 0 || !slices.Equal(fb.fetches, []bool{false}) {
+		t.Fatalf("fetches A %v B %v (want B's only, from the cache)", fa.fetches, fb.fetches)
+	}
+	if err := m.SetDefaultDisappearingTimer(ctx, acctA, 7*24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(fa.timers, []time.Duration{7 * 24 * time.Hour}) || len(fb.timers) != 0 {
+		t.Fatalf("timers A %v B %v", fa.timers, fb.timers)
+	}
+	fb.privacyErr = errors.New("offline")
+	if _, err := m.PrivacySettings(ctx, acctB); !errors.Is(err, fb.privacyErr) {
+		t.Fatalf("fetch failure: %v", err)
+	}
+}
+
+func TestSetProxyValidatesThenReachesEveryAccount(t *testing.T) {
+	m, _ := newTestManager(t)
+	fa, fb := &fakeClient{}, &fakeClient{}
+	m.add(acctA, fa)
+	m.add(acctB, fb)
+	if err := m.SetProxy("ftp://proxy.lan:21"); !errors.Is(err, ErrBadProxy) {
+		t.Fatalf("bad proxy: %v", err)
+	}
+	if len(fa.proxies)+len(fb.proxies) != 0 {
+		t.Fatalf("a rejected proxy reached a client: %v %v", fa.proxies, fb.proxies)
+	}
+	for _, addr := range []string{"socks5://127.0.0.1:1080", ""} {
+		if err := m.SetProxy(addr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range []*fakeClient{fa, fb} {
+		if !slices.Equal(f.proxies, []string{"socks5://127.0.0.1:1080", ""}) {
+			t.Fatalf("proxies %q", f.proxies)
+		}
+	}
+}
+
+func TestValidateProxy(t *testing.T) {
+	for _, ok := range []string{"", "socks5://127.0.0.1:1080", "http://proxy.lan:8080", "https://proxy.example.com:443",
+		"socks5://user:secret@10.0.0.1:1080", "http://[::1]:3128", "http://proxy.lan:8080/"} {
+		if err := ValidateProxy(ok); err != nil {
+			t.Errorf("%q rejected: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"ftp://proxy.lan:21", "socks4://proxy.lan:1080", "http://proxy.lan", "socks5://:1080",
+		"http://proxy.lan:0", "http://proxy.lan:65536", "http://proxy.lan:port", "proxy.lan:8080", "junk", "socks5://",
+		"http://proxy.lan:8080/path", "http://proxy.lan:8080?x=1", "http://proxy.lan:8080?", "socks5://h:1080#frag",
+		" http://proxy.lan:8080"} {
+		if err := ValidateProxy(bad); !errors.Is(err, ErrBadProxy) {
+			t.Errorf("%q accepted (%v)", bad, err)
+		}
 	}
 }

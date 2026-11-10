@@ -48,6 +48,9 @@ type waClient interface {
 	SendPresence(ctx context.Context, state types.Presence) error
 	SendChatPresence(ctx context.Context, jid types.JID, state types.ChatPresence, media types.ChatPresenceMedia) error
 	SetPrivacySetting(ctx context.Context, name types.PrivacySettingType, value types.PrivacySetting) (types.PrivacySettings, error)
+	TryFetchPrivacySettings(ctx context.Context, ignoreCache bool) (*types.PrivacySettings, error)
+	SetDefaultDisappearingTimer(ctx context.Context, timer time.Duration) error
+	SetProxyAddress(addr string, opts ...whatsmeow.SetProxyOptions) error
 	MarkRead(ctx context.Context, ids []types.MessageID, timestamp time.Time, chat, sender types.JID, receiptTypeExtra ...types.ReceiptType) error
 	Logout(ctx context.Context) error
 	UploadReader(ctx context.Context, plaintext io.Reader, tempFile io.ReadWriteSeeker, appInfo whatsmeow.MediaType) (whatsmeow.UploadResponse, error)
@@ -79,6 +82,9 @@ var _ waClient = liveClient{}
 // newClient creates a whatsmeow client for dev whose events are handled under its account ID.
 func (m *Manager) newClient(dev *wastore.Device) *whatsmeow.Client {
 	cli := whatsmeow.NewClient(dev, waLog.Noop)
+	if err := cli.SetProxyAddress(m.proxyAddress()); err != nil {
+		panic(err) // unreachable: SetProxy keeps only addresses ValidateProxy accepted
+	}
 	// A message whose handler failed is not acked, so WhatsApp redelivers it; the buffer lets
 	// whatsmeow decrypt it again (the signal session has already moved on).
 	cli.EnableDecryptedEventBuffer = true

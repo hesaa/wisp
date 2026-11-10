@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -85,9 +86,10 @@ type Manager struct {
 	media     *media.Cache
 	container *sqlstore.Container
 
-	mu        sync.RWMutex // guards accounts and listeners; never held while calling whatsmeow or a listener
+	mu        sync.RWMutex // guards accounts, listeners and proxy; never held while calling whatsmeow or a listener
 	accounts  map[string]waClient
 	listeners []func(evt any)
+	proxy     string // every client's proxy, "" for a direct connection
 }
 
 // New opens (creating if needed) the whatsmeow session database at sessionPath, which holds every
@@ -387,6 +389,74 @@ func (m *Manager) SetPrivacySetting(ctx context.Context, accountID string, name 
 		return types.PrivacySettings{}, err
 	}
 	return cli.SetPrivacySetting(ctx, name, value)
+}
+
+// PrivacySettings returns accountID's privacy settings as whatsmeow last saw them (it fetches them
+// from WhatsApp the first time, and phone-side changes update its copy).
+func (m *Manager) PrivacySettings(ctx context.Context, accountID string) (types.PrivacySettings, error) {
+	cli, err := m.client(accountID)
+	if err != nil {
+		return types.PrivacySettings{}, err
+	}
+	ps, err := cli.TryFetchPrivacySettings(ctx, false)
+	if err != nil {
+		return types.PrivacySettings{}, err
+	}
+	return *ps, nil
+}
+
+// SetDefaultDisappearingTimer sets the message timer of accountID's new chats (0 turns it off).
+func (m *Manager) SetDefaultDisappearingTimer(ctx context.Context, accountID string, d time.Duration) error {
+	cli, err := m.client(accountID)
+	if err != nil {
+		return err
+	}
+	return cli.SetDefaultDisappearingTimer(ctx, d)
+}
+
+// ErrBadProxy is returned for a proxy address ValidateProxy refuses.
+var ErrBadProxy = errors.New("whatsapp: proxy must be socks5://, http:// or https:// host:port")
+
+// ValidateProxy accepts "" (a direct connection) or a socks5, http or https URL of a host and port,
+// optionally with user info and a trailing slash. Its error never repeats addr, which may hold a password.
+func ValidateProxy(addr string) error {
+	if addr == "" {
+		return nil
+	}
+	u, err := url.Parse(addr)
+	if err != nil || (u.Scheme != "socks5" && u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" ||
+		u.Opaque != "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return ErrBadProxy
+	}
+	if port, err := strconv.Atoi(u.Port()); err != nil || port < 1 || port > 65535 {
+		return ErrBadProxy
+	}
+	return nil
+}
+
+// SetProxy routes every account through the proxy at addr ("" for a direct connection; see
+// ValidateProxy), accounts added later included. A connected account uses it from its next connection.
+func (m *Manager) SetProxy(addr string) error {
+	if err := ValidateProxy(addr); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.proxy = addr
+	clients := maps.Clone(m.accounts)
+	m.mu.Unlock()
+	var errs []error
+	for id, cli := range clients {
+		if err := cli.SetProxyAddress(addr); err != nil {
+			errs = append(errs, fmt.Errorf("whatsapp: proxy of %s: %w", id, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (m *Manager) proxyAddress() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.proxy
 }
 
 // MarkRead sends read receipts for the incoming messages among msgs (as read from the store) and
