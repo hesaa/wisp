@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/lxn/walk"
+	"github.com/lxn/win"
 
 	"wa-go/internal/store"
 	"wa-go/internal/theme"
@@ -13,7 +14,8 @@ import (
 
 // RunNewChat shows the modal New Chat picker over owner: the account's chats and address-book
 // contacts filtered as the user types, plus a "start a new chat" row when the input is a phone
-// number. Clicking a row (or Enter, for the first row) calls onPick with its chat JID; Esc or closing
+// number. Clicking a row, Enter on the focused row, or Enter in the search box (the first visible
+// row) calls onPick with its chat JID; Down moves from the search box into the list; Esc or closing
 // calls nothing. UI-thread only.
 func RunNewChat(owner walk.Form, p theme.Palette, chats []store.Chat, contacts []whatsapp.Contact, onPick func(jid string)) error {
 	dlg, err := walk.NewDialog(owner)
@@ -30,7 +32,7 @@ func RunNewChat(owner walk.Form, p theme.Palette, chats []store.Chat, contacts [
 	if err != nil {
 		return err
 	}
-	list, err := newChatList(dlg, &pal)
+	list, err := newChatList(dlg, &pal, "Contacts")
 	if err != nil {
 		return err
 	}
@@ -58,12 +60,10 @@ func RunNewChat(owner walk.Form, p theme.Palette, chats []store.Chat, contacts [
 		dlg.Accept()
 	}
 	list.onClick = pick
-	search.edit.KeyDown().Attach(func(k walk.Key) {
-		if k == walk.KeyReturn && len(list.rows) > 0 {
-			pick(list.rows[0].JID)
-		}
-	})
+	searchKeys(search.edit, list)
 	dlg.Starting().Attach(func() { logErr("new chat focus", search.edit.SetFocus()) })
+	// focus cues follow the user's setting and last input (hidden after a click until a key is used)
+	dlg.SendMessage(win.WM_CHANGEUISTATE, win.UIS_INITIALIZE, 0)
 	// cosmetic: Windows builds without dark title bars keep a light one
 	logErr("new chat title bar", theme.ApplyTitleBar(uintptr(dlg.Handle()), isDark(p)))
 

@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lxn/walk"
+
 	"wa-go/internal/store"
 	"wa-go/internal/whatsapp"
 )
@@ -185,6 +187,98 @@ func TestRelTime(t *testing.T) {
 		if got := relTime(ts, now); got != want {
 			t.Errorf("relTime(%d) = %q, want %q", ts, got, want)
 		}
+	}
+}
+
+func TestNavigate(t *testing.T) {
+	for _, c := range []struct {
+		cur, n, page int
+		k            walk.Key
+		wrap         bool
+		want         int
+	}{
+		{-1, 5, 3, walk.KeyDown, false, 0}, // first Down focuses the first item
+		{2, 5, 3, walk.KeyDown, false, 3},
+		{4, 5, 3, walk.KeyDown, false, 4}, // no wrap: stays on the last
+		{4, 5, 3, walk.KeyDown, true, 0},
+		{0, 5, 3, walk.KeyUp, false, 0},
+		{0, 5, 3, walk.KeyUp, true, 4},
+		{-1, 5, 3, walk.KeyUp, true, 4},
+		{1, 5, 3, walk.KeyNext, false, 4},
+		{3, 5, 3, walk.KeyNext, true, 4}, // paging never wraps
+		{3, 5, 3, walk.KeyPrior, true, 0},
+		{3, 5, 0, walk.KeyPrior, false, 2}, // a page is at least one item
+		{2, 5, 3, walk.KeyHome, false, 0},
+		{2, 5, 3, walk.KeyEnd, false, 4},
+		{1, 3, 1, walk.KeyRight, false, 2},
+		{1, 3, 1, walk.KeyLeft, false, 0},
+		{9, 3, 1, walk.KeyUp, false, 1}, // stale index past a shrunk list: from the last item
+		{-1, 0, 3, walk.KeyDown, false, -1},
+	} {
+		if got, ok := navigate(c.cur, c.n, c.page, c.k, c.wrap); !ok || got != c.want {
+			t.Errorf("navigate(%d, n=%d, page=%d, key %d, wrap=%v) = %d, %v; want %d", c.cur, c.n, c.page, c.k, c.wrap, got, ok, c.want)
+		}
+	}
+	if _, ok := navigate(0, 5, 3, walk.KeyA, false); ok {
+		t.Error("a letter key was handled")
+	}
+}
+
+func TestScrollIntoView(t *testing.T) {
+	for _, c := range []struct{ off, start, size, view, want int }{
+		{100, 144, 72, 200, 100}, // already visible
+		{100, 72, 72, 200, 72},   // above: its top at the top
+		{100, 288, 72, 200, 160}, // below: its bottom at the bottom
+		{500, 0, 300, 200, 0},    // taller than the view: its start shows
+		{0, 216, 300, 200, 216},
+	} {
+		if got := scrollIntoView(c.off, c.start, c.size, c.view); got != c.want {
+			t.Errorf("scrollIntoView(%+v) = %d", c, got)
+		}
+	}
+}
+
+// inkWidth draws "Yesterday" at 9pt for a widget at widgetDPI on a canvas that reports canvasDPI
+// (walk's buffered canvas reports the system DPI) and returns the drawn width in pixels.
+func inkWidth(t *testing.T, canvasDPI, widgetDPI int) int {
+	t.Helper()
+	bmp, err := walk.NewBitmapForDPI(walk.Size{Width: 200, Height: 60}, canvasDPI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bmp.Dispose()
+	c, err := walk.NewCanvasFromImage(bmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// white on the bitmap's black: walk's rectangle fills need a window-initialised walk
+	err = drawText(c, widgetDPI, "Yesterday", 9, 0, walk.RGB(255, 255, 255), walk.Rectangle{Width: 200, Height: 60}, leftText)
+	c.Dispose()
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := bmp.ToImage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	left, right := 200, -1
+	for y := 0; y < 60; y++ {
+		for x := 0; x < 200; x++ {
+			if p := img.RGBAAt(x, y); p.G > 128 {
+				left, right = min(left, x), max(right, x)
+			}
+		}
+	}
+	return right - left + 1
+}
+
+func TestTextFollowsWidgetDPI(t *testing.T) {
+	base := inkWidth(t, 96, 96)
+	if got := inkWidth(t, 144, 96); got < base-2 || got > base+2 {
+		t.Errorf("system DPI 144, window at 96: text %dpx wide, want ~%d (sized for the window)", got, base)
+	}
+	if got := inkWidth(t, 96, 144); got*100 < base*135 || got*100 > base*165 {
+		t.Errorf("window at 144 on a 96 canvas: text %dpx wide, want ~1.5x %d", got, base)
 	}
 }
 

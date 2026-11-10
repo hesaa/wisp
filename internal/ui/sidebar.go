@@ -165,7 +165,8 @@ func relTime(ts int64, now time.Time) string {
 }
 
 // Sidebar is the 280px left column: stories strip, "Chats" header with the New Chat button, search
-// box and the chat list. Feed it through Model() and SetStories. UI-thread only.
+// box and the chat list. Feed it through Model() and SetStories. Tab moves between its parts; Down in
+// the search box enters the list and Enter there opens the first visible row. UI-thread only.
 type Sidebar struct {
 	*walk.Composite
 	model     *SidebarModel
@@ -207,7 +208,7 @@ func (s *Sidebar) build() error {
 	if s.search, err = newSearchBox(s.Composite, &s.pal, "Search or start new chat"); err != nil {
 		return err
 	}
-	if s.list, err = newChatList(s.Composite, &s.pal); err != nil {
+	if s.list, err = newChatList(s.Composite, &s.pal, "Chats"); err != nil {
 		return err
 	}
 	if err := fillRest(s.Composite, s.list); err != nil {
@@ -215,6 +216,7 @@ func (s *Sidebar) build() error {
 	}
 	s.stories.SetVisible(false) // until SetStories has some
 	s.search.edit.TextChanged().Attach(func() { s.model.SetFilter(s.search.edit.Text()) })
+	searchKeys(s.search.edit, s.list)
 	s.list.onClick = func(jid string) {
 		s.model.Select(jid)
 		if s.onChat != nil {
@@ -231,7 +233,7 @@ func (s *Sidebar) Model() *SidebarModel { return s.model }
 // when there are none.
 func (s *Sidebar) SetStories(st []store.Story) {
 	s.stories.stories = st
-	s.stories.offset = 0
+	s.stories.offset, s.stories.focus = 0, -1
 	s.stories.SetVisible(len(st) > 0)
 	logErr("stories repaint", s.stories.Invalidate())
 }
@@ -251,28 +253,51 @@ func (s *Sidebar) SetPalette(p theme.Palette) error {
 	return errors.Join(setBg(s.Composite, p.Sidebar), s.search.applyPalette(), s.stories.Invalidate(), s.header.Invalidate(), s.list.Invalidate())
 }
 
+// newHeader is the "Chats" title with the New Chat button, which is a tab stop (Enter or Space).
 func (s *Sidebar) newHeader() (*walk.CustomWidget, error) {
 	var h *walk.CustomWidget
 	onButton := func(x int) bool { return x >= h.ClientBoundsPixels().Width-h.IntFrom96DPI(52) }
+	newChat := func() {
+		if s.onNewChat != nil {
+			s.onNewChat()
+		}
+	}
 	h, err := newCanvas(s.Composite, func(c *walk.Canvas, _ walk.Rectangle) error {
-		sc, b, p := scaler(h.DPI()), h.ClientBoundsPixels(), s.pal
+		dpi, b, p := h.DPI(), h.ClientBoundsPixels(), s.pal
+		sc := scaler(dpi)
 		bg, err := brushFor(p.Sidebar)
 		if err != nil {
 			return err
 		}
-		return errors.Join(c.FillRectanglePixels(bg, b),
-			drawText(c, "Chats", font(15, walk.FontBold), theme.Color(p.Text), walk.Rectangle{X: sc(16), Width: b.Width - sc(70), Height: b.Height}, leftText),
-			icons.Draw(c, icons.IconNewChat, square(b.Width-sc(30), b.Height/2, sc(24)), theme.Color(p.TextSecondary)))
+		cx, cy := b.Width-sc(30), b.Height/2
+		if err := c.FillRectanglePixels(bg, b); err != nil {
+			return err
+		}
+		if focusCues(h) {
+			if err := focusRing(c, cx, cy, sc(40), sc(2), theme.Color(p.Text), theme.Color(p.Sidebar)); err != nil {
+				return err
+			}
+		}
+		return errors.Join(
+			drawText(c, dpi, "Chats", 15, walk.FontBold, theme.Color(p.Text), walk.Rectangle{X: sc(16), Width: b.Width - sc(70), Height: b.Height}, leftText),
+			icons.Draw(c, icons.IconNewChat, square(cx, cy, sc(24)), theme.Color(p.TextSecondary)))
 	})
 	if err != nil {
 		return nil, err
 	}
-	if err := h.SetMinMaxSize(walk.Size{Height: 52}, walk.Size{Height: 52}); err != nil {
+	if err := errors.Join(h.SetMinMaxSize(walk.Size{Height: 52}, walk.Size{Height: 52}),
+		focusable(h, walk.AccRolePushbutton, "New chat", func(k walk.Key) bool {
+			if k == walk.KeyReturn || k == walk.KeySpace {
+				newChat()
+				return true
+			}
+			return false
+		})); err != nil {
 		return nil, err
 	}
 	h.MouseDown().Attach(func(x, _ int, b walk.MouseButton) {
-		if b == walk.LeftButton && onButton(x) && s.onNewChat != nil {
-			s.onNewChat()
+		if b == walk.LeftButton && onButton(x) {
+			newChat()
 		}
 	})
 	tipOnHover(h, func(x, _ int) string {
@@ -290,26 +315,38 @@ type storyStrip struct {
 	pal     *theme.Palette
 	stories []store.Story
 	offset  int // horizontal scroll, pixels
+	focus   int // keyboard focus, -1 for none
 	onClick func(senderJID string)
 }
 
-const storyW = 68 // one story slot, 1/96 inch
+const (
+	storyW    = 68 // one story slot, 1/96 inch
+	storyName = "Status updates"
+)
 
+// newStoryStrip creates the strip; it is a tab stop: Left/Right move the focus, Enter or Space open.
 func newStoryStrip(parent walk.Container, pal *theme.Palette) (*storyStrip, error) {
-	st := &storyStrip{pal: pal}
+	st := &storyStrip{pal: pal, focus: -1}
 	cw, err := newCanvas(parent, st.paint)
 	if err != nil {
 		return nil, err
 	}
 	st.CustomWidget = cw
-	if err := cw.SetMinMaxSize(walk.Size{Height: 92}, walk.Size{Height: 92}); err != nil {
+	if err := errors.Join(cw.SetMinMaxSize(walk.Size{Height: 92}, walk.Size{Height: 92}),
+		focusable(cw, walk.AccRoleList, storyName, st.key)); err != nil {
 		return nil, err
 	}
 	cw.MouseDown().Attach(func(x, _ int, b walk.MouseButton) {
 		s := scaler(cw.DPI())
 		pos := x + st.offset - s(8)
-		if i := pos / s(storyW); b == walk.LeftButton && pos >= 0 && i < len(st.stories) && st.onClick != nil {
-			st.onClick(st.stories[i].SenderJID)
+		if i := pos / s(storyW); b == walk.LeftButton && pos >= 0 && i < len(st.stories) {
+			st.focus = i
+			st.open(i)
+		}
+	})
+	cw.FocusedChanged().Attach(func() {
+		if cw.Focused() && st.focus < 0 && len(st.stories) > 0 {
+			st.focusOn(0)
 		}
 	})
 	cw.MouseWheel().Attach(func(_, _ int, b walk.MouseButton) {
@@ -326,8 +363,40 @@ func (st *storyStrip) clamp(off int) int {
 	return max(0, min(off, s(16)+len(st.stories)*s(storyW)-st.ClientBoundsPixels().Width))
 }
 
+func (st *storyStrip) open(i int) {
+	if st.onClick != nil {
+		st.onClick(st.stories[i].SenderJID)
+	}
+}
+
+// focusOn moves the focus to story i and scrolls it into view.
+func (st *storyStrip) focusOn(i int) {
+	s := scaler(st.DPI())
+	st.focus = i
+	st.offset = st.clamp(scrollIntoView(st.offset, s(8)+i*s(storyW), s(storyW), st.ClientBoundsPixels().Width))
+	logErr("stories repaint", st.Invalidate())
+	story := st.stories[i]
+	announce(st, storyName, displayName(store.Chat{JID: story.SenderJID, Name: story.Name}))
+}
+
+func (st *storyStrip) key(k walk.Key) bool {
+	if k == walk.KeyReturn || k == walk.KeySpace {
+		if st.focus >= 0 && st.focus < len(st.stories) {
+			st.open(st.focus)
+		}
+		return true
+	}
+	next, ok := navigate(st.focus, len(st.stories), st.ClientBoundsPixels().Width/st.IntFrom96DPI(storyW), k, false)
+	if ok && next >= 0 {
+		st.focusOn(next)
+	}
+	return ok
+}
+
 func (st *storyStrip) paint(c *walk.Canvas, ub walk.Rectangle) error {
-	s, p, b := scaler(st.DPI()), st.pal, st.ClientBoundsPixels()
+	dpi, p, b := st.DPI(), st.pal, st.ClientBoundsPixels()
+	s := scaler(dpi)
+	focused := focusCues(st)
 	st.offset = st.clamp(st.offset)
 	bg, err := brushFor(p.Sidebar)
 	if err != nil {
@@ -350,11 +419,16 @@ func (st *storyStrip) paint(c *walk.Canvas, ub walk.Rectangle) error {
 		if f := strings.Fields(story.Name); len(f) > 0 {
 			name = f[0]
 		}
+		if focused && i == st.focus {
+			if err := focusRing(c, cx, cy, s(60), s(2), theme.Color(p.Text), theme.Color(p.Sidebar)); err != nil {
+				return err
+			}
+		}
 		if err := errors.Join(
 			icons.Fill(c, square(cx, cy, s(52)), theme.Color(p.Accent)), // unseen-update ring
 			icons.Fill(c, square(cx, cy, s(48)), theme.Color(p.Sidebar)),
-			drawAvatar(c, square(cx, cy, s(44)), story.Name, story.SenderJID, 12),
-			drawText(c, name, font(8, 0), theme.Color(p.Text), walk.Rectangle{X: x + s(2), Y: s(64), Width: s(storyW - 4), Height: s(18)}, centerText),
+			drawAvatar(c, dpi, square(cx, cy, s(44)), story.Name, story.SenderJID, 12),
+			drawText(c, dpi, name, 8, 0, theme.Color(p.Text), walk.Rectangle{X: x + s(2), Y: s(64), Width: s(storyW - 4), Height: s(18)}, centerText),
 		); err != nil {
 			return err
 		}
@@ -447,25 +521,36 @@ func noBorder(le *walk.LineEdit) error {
 }
 
 // chatList is a custom-painted, scrollable list of chats that paints only the visible rows: avatar,
-// name, time, one-line snippet and unread badge. Wheel and a draggable thumb scroll it.
+// name, time, one-line snippet and unread badge. Wheel and a draggable thumb scroll it. It is a tab
+// stop: Up/Down/PgUp/PgDn/Home/End move the focused row, Enter or Space open it like a click.
 type chatList struct {
 	*walk.CustomWidget
 	pal      *theme.Palette
+	name     string // accessible name
 	rows     []store.Chat
 	selected string
-	offset   int // scroll position, pixels
-	dragY    int // mouse y where a thumb drag started; -1 when not dragging
-	dragFrom int // offset when the drag started
+	focus    string // JID of the keyboard-focused row, so it survives reordering
+	offset   int    // scroll position, pixels
+	dragY    int    // mouse y where a thumb drag started; -1 when not dragging
+	dragFrom int    // offset when the drag started
 	onClick  func(jid string)
 }
 
-func newChatList(parent walk.Container, pal *theme.Palette) (*chatList, error) {
-	l := &chatList{pal: pal, dragY: -1}
+func newChatList(parent walk.Container, pal *theme.Palette, name string) (*chatList, error) {
+	l := &chatList{pal: pal, name: name, dragY: -1}
 	cw, err := newCanvas(parent, l.paint)
 	if err != nil {
 		return nil, err
 	}
 	l.CustomWidget = cw
+	if err := focusable(cw, walk.AccRoleList, name, l.key); err != nil {
+		return nil, err
+	}
+	cw.FocusedChanged().Attach(func() {
+		if cw.Focused() && l.focusIndex() < 0 && len(l.rows) > 0 {
+			l.focusRow(l.firstVisible())
+		}
+	})
 	cw.MouseDown().Attach(l.mouseDown)
 	cw.MouseMove().Attach(l.mouseMove)
 	cw.MouseUp().Attach(func(int, int, walk.MouseButton) { l.dragY = -1 })
@@ -476,6 +561,71 @@ func newChatList(parent walk.Container, pal *theme.Palette) (*chatList, error) {
 }
 
 func (l *chatList) rowH() int { return l.IntFrom96DPI(72) }
+
+func (l *chatList) focusIndex() int {
+	if l.focus == "" {
+		return -1
+	}
+	return slices.IndexFunc(l.rows, func(c store.Chat) bool { return c.JID == l.focus })
+}
+
+// firstVisible is the row at the top of the view, -1 when there are none.
+func (l *chatList) firstVisible() int { return min(l.offset/l.rowH(), len(l.rows)-1) }
+
+// focusRow moves the keyboard focus to row i and scrolls it into view.
+func (l *chatList) focusRow(i int) {
+	row, rowH := l.rows[i], l.rowH()
+	l.focus = row.JID
+	l.scrollTo(scrollIntoView(l.offset, i*rowH, rowH, l.ClientBoundsPixels().Height))
+	logErr("chat list repaint", l.Invalidate())
+	item := displayName(row)
+	if row.Unread > 0 {
+		item += ", " + strconv.Itoa(row.Unread) + " unread"
+	}
+	announce(l, l.name, item)
+}
+
+func (l *chatList) open(i int) {
+	l.focus = l.rows[i].JID
+	if l.onClick != nil {
+		l.onClick(l.rows[i].JID)
+	}
+}
+
+// openFirstVisible opens the row at the top of the view (Enter in the search box).
+func (l *chatList) openFirstVisible() {
+	if i := l.firstVisible(); i >= 0 {
+		l.open(i)
+	}
+}
+
+func (l *chatList) key(k walk.Key) bool {
+	i := l.focusIndex()
+	if k == walk.KeyReturn || k == walk.KeySpace {
+		if i >= 0 {
+			l.open(i)
+		}
+		return true
+	}
+	next, ok := navigate(i, len(l.rows), l.ClientBoundsPixels().Height/l.rowH(), k, false)
+	if ok && next >= 0 {
+		l.focusRow(next)
+	}
+	return ok
+}
+
+// searchKeys links a search box to its list: Down moves into the list, Enter opens the first visible row.
+func searchKeys(edit *walk.LineEdit, l *chatList) {
+	edit.KeyDown().Attach(func(k walk.Key) {
+		switch {
+		case k == walk.KeyDown && len(l.rows) > 0:
+			logErr("focus", l.SetFocus())
+			showFocusCues(l.Handle())
+		case k == walk.KeyReturn:
+			l.openFirstVisible()
+		}
+	})
+}
 
 func (l *chatList) clamp(off int) int {
 	return max(0, min(off, len(l.rows)*l.rowH()-l.ClientBoundsPixels().Height))
@@ -529,8 +679,8 @@ func (l *chatList) mouseDown(x, y int, b walk.MouseButton) {
 		l.dragY, l.dragFrom = y, l.offset
 		return
 	}
-	if i := (y + l.offset) / l.rowH(); y >= 0 && i < len(l.rows) && l.onClick != nil {
-		l.onClick(l.rows[i].JID)
+	if i := (y + l.offset) / l.rowH(); y >= 0 && i < len(l.rows) {
+		l.open(i)
 	}
 }
 
@@ -550,11 +700,17 @@ func (l *chatList) paint(c *walk.Canvas, ub walk.Rectangle) error {
 	if err := c.FillRectanglePixels(bg, ub); err != nil {
 		return err
 	}
-	now := time.Now()
+	now, focused := time.Now(), focusCues(l)
 	last := min(len(l.rows), (ub.Y+ub.Height+l.offset+rowH-1)/rowH)
 	for i := max(0, (ub.Y+l.offset)/rowH); i < last; i++ {
-		if err := l.paintRow(c, l.rows[i], walk.Rectangle{Y: i*rowH - l.offset, Width: b.Width, Height: rowH}, now); err != nil {
+		r := walk.Rectangle{Y: i*rowH - l.offset, Width: b.Width, Height: rowH}
+		if err := l.paintRow(c, l.rows[i], r, now); err != nil {
 			return err
+		}
+		if focused && l.rows[i].JID == l.focus {
+			if err := focusRect(c, r, max(1, l.IntFrom96DPI(2)), p.Text); err != nil {
+				return err
+			}
 		}
 	}
 	if t := l.thumb(); t.Height > 0 {
@@ -564,7 +720,8 @@ func (l *chatList) paint(c *walk.Canvas, ub walk.Rectangle) error {
 }
 
 func (l *chatList) paintRow(c *walk.Canvas, row store.Chat, r walk.Rectangle, now time.Time) error {
-	s, p := scaler(l.DPI()), l.pal
+	dpi, p := l.DPI(), l.pal
+	s := scaler(dpi)
 	if row.JID == l.selected {
 		sel, err := brushFor(p.Header)
 		if err != nil {
@@ -589,26 +746,18 @@ func (l *chatList) paintRow(c *walk.Canvas, row store.Chat, r walk.Rectangle, no
 		if row.Unread > 99 {
 			label = "99+"
 		}
-		if err := drawBadge(c, right, r.Y+s(40), s(20), label, theme.Color(p.Accent), theme.Color(p.Sidebar), 8); err != nil {
+		if err := drawBadge(c, dpi, right, r.Y+s(40), s(20), label, theme.Color(p.Accent), theme.Color(p.Sidebar), 8); err != nil {
 			return err
 		}
 		snipRight -= badgeWidth(s(20), label) + s(6)
 	}
 	return errors.Join(
-		drawAvatar(c, av, row.Name, row.JID, 13),
-		drawText(c, ts, font(9, 0), timeColor, walk.Rectangle{X: right - tw, Y: r.Y + s(13), Width: tw, Height: s(24)}, rightText),
-		drawText(c, displayName(row), font(12, 0), theme.Color(p.Text), walk.Rectangle{X: x, Y: r.Y + s(13), Width: right - tw - s(6) - x, Height: s(24)}, leftText),
-		drawText(c, oneLine(row.Snippet), font(10, 0), theme.Color(p.TextSecondary), walk.Rectangle{X: x, Y: r.Y + s(38), Width: snipRight - x, Height: s(22)}, leftText),
+		drawAvatar(c, dpi, av, row.Name, row.JID, 13),
+		drawText(c, dpi, ts, 9, 0, timeColor, walk.Rectangle{X: right - tw, Y: r.Y + s(13), Width: tw, Height: s(24)}, rightText),
+		drawText(c, dpi, displayName(row), 12, 0, theme.Color(p.Text), walk.Rectangle{X: x, Y: r.Y + s(13), Width: right - tw - s(6) - x, Height: s(24)}, leftText),
+		drawText(c, dpi, oneLine(row.Snippet), 10, 0, theme.Color(p.TextSecondary), walk.Rectangle{X: x, Y: r.Y + s(38), Width: snipRight - x, Height: s(22)}, leftText),
 		c.FillRectanglePixels(line, walk.Rectangle{X: x, Y: r.Y + r.Height - max(1, s(1)), Width: r.Width - x, Height: max(1, s(1))}),
 	)
-}
-
-// drawText draws non-empty text; DrawTextEx reports an empty string as a failure.
-func drawText(c *walk.Canvas, text string, f *walk.Font, color walk.Color, r walk.Rectangle, format walk.DrawTextFormat) error {
-	if text == "" || r.Width <= 0 || r.Height <= 0 {
-		return nil
-	}
-	return c.DrawTextPixels(text, f, color, r, format)
 }
 
 // oneLine is a snippet's first 200 bytes (on a rune boundary) with line breaks as spaces.

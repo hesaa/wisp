@@ -5,6 +5,7 @@
 package ui
 
 import (
+	"errors"
 	"log"
 	"maps"
 	"slices"
@@ -130,37 +131,72 @@ type Rail struct {
 	model *RailModel
 	pal   theme.Palette
 	nav   Nav // highlighted: NavChats or NavStatus
+	focus int // keyboard focus: index into targets(), -1 for none
 	onAdd func()
 	onNav func(Nav)
 }
 
-// NewRail creates the rail in parent.
+const railName = "Accounts and navigation"
+
+// NewRail creates the rail in parent. It is a tab stop: Up/Down move its focus ring (wrapping),
+// Enter or Space activate the focused item.
 func NewRail(parent walk.Container, p theme.Palette) (*Rail, error) {
-	r := &Rail{model: NewRailModel(), pal: p}
+	r := &Rail{model: NewRailModel(), pal: p, focus: -1}
 	cw, err := newCanvas(parent, r.paint)
 	if err != nil {
 		return nil, err
 	}
 	r.CustomWidget = cw
-	if err := cw.SetMinMaxSize(walk.Size{Width: railWidth}, walk.Size{Width: railWidth}); err != nil {
+	if err := errors.Join(cw.SetMinMaxSize(walk.Size{Width: railWidth}, walk.Size{Width: railWidth}),
+		focusable(cw, walk.AccRoleToolbar, railName, r.key)); err != nil {
 		cw.Dispose()
 		return nil, err
 	}
 	r.model.redraw = func() { logErr("rail repaint", cw.Invalidate()) }
 	cw.MouseDown().Attach(r.click)
-	tipOnHover(cw, func(x, y int) string {
-		it, ok := r.hit(x, y)
-		switch {
-		case !ok:
-			return ""
-		case it.kind == railAccount:
-			return "+" + it.account
-		case it.kind == railAdd:
-			return "Add account"
+	cw.FocusedChanged().Attach(func() {
+		if cw.Focused() && r.focus < 0 { // start on the active account
+			r.focusOn(max(0, slices.Index(r.model.accounts, r.model.active)))
 		}
-		return navNames[it.nav]
+	})
+	tipOnHover(cw, func(x, y int) string {
+		if it, ok := r.hit(x, y); ok {
+			return itemName(it)
+		}
+		return ""
 	})
 	return r, nil
+}
+
+// itemName is a rail item's tooltip.
+func itemName(it railItem) string {
+	switch it.kind {
+	case railAccount:
+		return "+" + it.account
+	case railAdd:
+		return "Add account"
+	}
+	return navNames[it.nav]
+}
+
+// describe is a rail item's accessible name, with the account's state.
+func (r *Rail) describe(it railItem) string {
+	name := itemName(it)
+	if it.kind != railAccount {
+		return name
+	}
+	if it.account == r.model.active {
+		name += ", active"
+	}
+	if r.model.connected[it.account] {
+		name += ", connected"
+	} else {
+		name += ", offline"
+	}
+	if n := r.model.unread[it.account]; n > 0 {
+		name += ", " + strconv.Itoa(n) + " unread"
+	}
+	return name
 }
 
 func (r *Rail) Model() *RailModel { return r.model }
@@ -214,13 +250,43 @@ func (r *Rail) items() []railItem {
 	return out
 }
 
+// targets are the items keyboard focus moves over: all but the divider.
+func (r *Rail) targets() []railItem {
+	return slices.DeleteFunc(r.items(), func(it railItem) bool { return it.kind == railDivider })
+}
+
 func (r *Rail) hit(x, y int) (railItem, bool) {
-	for _, it := range r.items() {
-		if it.kind != railDivider && y >= it.r.Y && y < it.r.Y+it.r.Height && x >= 0 && x < it.r.Width {
+	for _, it := range r.targets() {
+		if y >= it.r.Y && y < it.r.Y+it.r.Height && x >= 0 && x < it.r.Width {
 			return it, true
 		}
 	}
 	return railItem{}, false
+}
+
+// focusOn moves the focus ring to target i.
+func (r *Rail) focusOn(i int) {
+	ts := r.targets()
+	r.focus = min(i, len(ts)-1)
+	logErr("rail repaint", r.Invalidate())
+	if r.focus >= 0 {
+		announce(r, railName, r.describe(ts[r.focus]))
+	}
+}
+
+func (r *Rail) key(k walk.Key) bool {
+	ts := r.targets()
+	if k == walk.KeyReturn || k == walk.KeySpace {
+		if r.focus >= 0 && r.focus < len(ts) {
+			r.activate(ts[r.focus])
+		}
+		return true
+	}
+	next, ok := navigate(r.focus, len(ts), 1, k, true)
+	if ok && next >= 0 {
+		r.focusOn(next)
+	}
+	return ok
 }
 
 func (r *Rail) click(x, y int, button walk.MouseButton) {
@@ -228,6 +294,12 @@ func (r *Rail) click(x, y int, button walk.MouseButton) {
 	if !ok || button != walk.LeftButton {
 		return
 	}
+	r.focus = slices.IndexFunc(r.targets(), func(t railItem) bool { return t.r == it.r })
+	r.activate(it)
+}
+
+// activate does what clicking it does.
+func (r *Rail) activate(it railItem) {
 	switch it.kind {
 	case railAccount:
 		r.model.SetActive(it.account)
@@ -250,7 +322,8 @@ func (r *Rail) click(x, y int, button walk.MouseButton) {
 var railFg = theme.GetPalette(theme.ThemeDark)
 
 func (r *Rail) paint(c *walk.Canvas, _ walk.Rectangle) error {
-	s := scaler(r.DPI())
+	dpi := r.DPI()
+	s := scaler(dpi)
 	bg, err := brushFor(r.pal.Rail)
 	if err != nil {
 		return err
@@ -259,22 +332,29 @@ func (r *Rail) paint(c *walk.Canvas, _ walk.Rectangle) error {
 		return err
 	}
 	accent := theme.Color(r.pal.Accent)
+	focused, target := focusCues(r), -1
 	for _, it := range r.items() {
 		cx, cy := it.r.X+it.r.Width/2, it.r.Y+it.r.Height/2
 		var err error
-		switch it.kind {
-		case railAccount:
-			err = r.paintAccount(c, it.account, square(cx, cy, s(36)), s)
-		case railAdd:
+		if it.kind != railDivider {
+			if target++; focused && target == r.focus {
+				err = focusRing(c, cx, cy, s(48), s(2), theme.Color(railFg.Text), theme.Color(r.pal.Rail))
+			}
+		}
+		switch {
+		case err != nil:
+		case it.kind == railAccount:
+			err = r.paintAccount(c, dpi, it.account, square(cx, cy, s(36)), s)
+		case it.kind == railAdd:
 			if err = icons.Fill(c, square(cx, cy, s(36)), theme.Color(railFg.Header)); err == nil {
 				err = icons.Draw(c, icons.IconAdd, square(cx, cy, s(20)), theme.Color(railFg.TextSecondary))
 			}
-		case railDivider:
+		case it.kind == railDivider:
 			var line *walk.SolidColorBrush
 			if line, err = brushFor(railFg.Header); err == nil {
 				err = c.FillRectanglePixels(line, walk.Rectangle{X: s(14), Y: cy, Width: it.r.Width - s(28), Height: max(1, s(1))})
 			}
-		case railNav:
+		case it.kind == railNav:
 			fg := theme.Color(railFg.TextSecondary)
 			if it.nav == r.nav {
 				fg = theme.Color(railFg.Text)
@@ -297,8 +377,8 @@ func (r *Rail) paint(c *walk.Canvas, _ walk.Rectangle) error {
 	return nil
 }
 
-func (r *Rail) paintAccount(c *walk.Canvas, id string, av walk.Rectangle, s func(int) int) error {
-	if err := drawAvatar(c, av, "", id, 10); err != nil {
+func (r *Rail) paintAccount(c *walk.Canvas, dpi int, id string, av walk.Rectangle, s func(int) int) error {
+	if err := drawAvatar(c, dpi, av, "", id, 10); err != nil {
 		return err
 	}
 	dot := theme.Color(railFg.TextSecondary)
@@ -320,7 +400,7 @@ func (r *Rail) paintAccount(c *walk.Canvas, id string, av walk.Rectangle, s func
 	if n > 9 {
 		label = "9+" // the rail is narrow
 	}
-	return drawBadge(c, av.X+av.Width+s(6), av.Y-s(4), s(18), label, theme.Color(r.pal.Accent), theme.Color(r.pal.Sidebar), 7)
+	return drawBadge(c, dpi, av.X+av.Width+s(6), av.Y-s(4), s(18), label, theme.Color(r.pal.Accent), theme.Color(r.pal.Sidebar), 7)
 }
 
 // Shared painting helpers.
@@ -422,21 +502,33 @@ func initials(name, jid string) string {
 	return user[max(0, len(user)-2):]
 }
 
-func drawAvatar(c *walk.Canvas, r walk.Rectangle, name, jid string, pt int) error {
+func drawAvatar(c *walk.Canvas, dpi int, r walk.Rectangle, name, jid string, pt int) error {
 	if err := icons.Fill(c, r, avatarColor(jid)); err != nil {
 		return err
 	}
-	return c.DrawTextPixels(initials(name, jid), font(pt, 0), walk.RGB(255, 255, 255), r, centerText)
+	return drawText(c, dpi, initials(name, jid), pt, 0, walk.RGB(255, 255, 255), r, centerText)
 }
 
 // drawBadge paints an accent pill of height h holding label, right-aligned at right.
-func drawBadge(c *walk.Canvas, right, top, h int, label string, fill, text walk.Color, pt int) error {
+func drawBadge(c *walk.Canvas, dpi, right, top, h int, label string, fill, text walk.Color, pt int) error {
 	w := badgeWidth(h, label)
 	b := walk.Rectangle{X: right - w, Y: top, Width: w, Height: h}
 	if err := icons.Fill(c, b, fill); err != nil {
 		return err
 	}
-	return c.DrawTextPixels(label, font(pt, walk.FontBold), text, b, centerText)
+	return drawText(c, dpi, label, pt, walk.FontBold, text, b, centerText)
+}
+
+// drawText draws non-empty text in Segoe UI at pt points for a widget at dpi (DrawTextEx reports an
+// empty string as a failure). walk sizes fonts by the canvas DPI, and its buffered canvas is a memory
+// DC that reports the system DPI, not the window's: pt is rescaled so text matches the layout, which
+// uses the window DPI. walk caches each resulting size.
+func drawText(c *walk.Canvas, dpi int, text string, pt int, style walk.FontStyle, color walk.Color, r walk.Rectangle, format walk.DrawTextFormat) error {
+	if text == "" || r.Width <= 0 || r.Height <= 0 {
+		return nil
+	}
+	cdpi := c.DPI()
+	return c.DrawTextPixels(text, font(max(1, (pt*dpi+cdpi/2)/cdpi), style), color, r, format)
 }
 
 // badgeWidth estimates the pill width from the digit count: measuring text on walk's buffered
