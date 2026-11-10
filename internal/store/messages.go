@@ -1,5 +1,7 @@
 package store
 
+import "fmt"
+
 const (
 	// PageSize is the number of messages per page.
 	PageSize = 50
@@ -100,20 +102,30 @@ func (d *DB) GetChatMessages(accountID, chatJID string, page int) ([]Message, er
 	return out, rows.Err()
 }
 
-// UpdateMessageStatus sets the status of specific messages (delivery/read receipts).
+var statusRank = map[string]int{StatusReceived: 0, StatusSent: 1, StatusDelivered: 2, StatusRead: 3}
+
+// rankSQL must mirror statusRank; stored statuses outside it (e.g. ”) rank lowest.
+const rankSQL = `CASE status WHEN 'received' THEN 0 WHEN 'sent' THEN 1 WHEN 'delivered' THEN 2 WHEN 'read' THEN 3 ELSE -1 END`
+
+// UpdateMessageStatus raises the status of specific messages (delivery/read receipts).
+// Status never moves backwards (a late "delivered" cannot undo "read"); an unknown status is an error.
 func (d *DB) UpdateMessageStatus(accountID, chatJID string, ids []string, status string) error {
+	rank, ok := statusRank[status]
+	if !ok {
+		return fmt.Errorf("store: unknown message status %q", status)
+	}
 	tx, err := d.sql.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	st, err := tx.Prepare(`UPDATE messages SET status = ? WHERE account_id = ? AND chat_jid = ? AND id = ?`)
+	st, err := tx.Prepare(`UPDATE messages SET status = ? WHERE account_id = ? AND chat_jid = ? AND id = ? AND (` + rankSQL + `) < ?`)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
 	for _, id := range ids {
-		if _, err := st.Exec(status, accountID, chatJID, id); err != nil {
+		if _, err := st.Exec(status, accountID, chatJID, id, rank); err != nil {
 			return err
 		}
 	}

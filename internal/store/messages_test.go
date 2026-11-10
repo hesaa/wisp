@@ -169,3 +169,22 @@ func TestChatListOrderAndSnippet(t *testing.T) {
 		t.Fatalf("%+v", chats[0])
 	}
 }
+
+func TestStatusNeverRegresses(t *testing.T) {
+	db := openTest(t)
+	db.InsertMessagesBatch(msgs(acct, "c1", 1, false))
+	if err := db.UpdateMessageStatus(acct, "c1", []string{"m0"}, StatusRead); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpdateMessageStatus(acct, "c1", []string{"m0"}, StatusDelivered); err != nil {
+		t.Fatal(err)
+	}
+	page, _ := db.GetChatMessages(acct, "c1", 0)
+	chats, _ := db.ListChats(acct)
+	if page[0].Status != StatusRead || chats[0].Unread != 0 {
+		t.Fatalf("status=%s unread=%d", page[0].Status, chats[0].Unread)
+	}
+	if err := db.UpdateMessageStatus(acct, "c1", []string{"m0"}, "bogus"); err == nil {
+		t.Fatal("unknown status accepted")
+	}
+}
