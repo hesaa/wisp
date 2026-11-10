@@ -238,6 +238,44 @@ func TestScrollIntoView(t *testing.T) {
 	}
 }
 
+func TestClickTargetsTheItemUnderTheCursor(t *testing.T) {
+	// chat list after one wheel notch: offset 108 with 72px rows, row 1 half scrolled off the top
+	list := span{off: 108, size: 72, n: 10}
+	for y, want := range map[int]int{0: 1, 35: 1, 36: 2, 50: 2, 107: 2, 108: 3} {
+		if got := list.at(y); got != want {
+			t.Errorf("list click at y=%d: row %d, want %d", y, got, want)
+		}
+	}
+	if got := (span{off: 0, size: 72, n: 2}).at(150); got != -1 {
+		t.Errorf("click below the last row: %d, want -1", got)
+	}
+	// stories strip scrolled one notch: offset 68, 8px left padding, 68px slots
+	strip := span{off: 68, pad: 8, size: 68, n: 8}
+	for x, want := range map[int]int{0: 0, 7: 0, 8: 1, 100: 2} {
+		if got := strip.at(x); got != want {
+			t.Errorf("strip click at x=%d: story %d, want %d", x, got, want)
+		}
+	}
+	if got := (span{pad: 8, size: 68, n: 3}).at(3); got != -1 {
+		t.Errorf("click in the strip's left padding: %d, want -1", got)
+	}
+	// focus gained with nothing focused rests on the first fully visible item, so the scroll
+	// position the user saw (and is clicking into) does not move
+	for _, c := range []struct {
+		s    span
+		view int
+		want int
+	}{{list, 400, 2}, {strip, 280, 1}, {span{off: 0, size: 72, n: 5}, 400, 0}, {span{off: 144, size: 72, n: 3}, 400, 2}} {
+		i := c.s.firstFull()
+		if i != c.want || scrollIntoView(c.s.off, c.s.pad+i*c.s.size, c.s.size, c.view) != c.s.off {
+			t.Errorf("%+v: firstFull %d (want %d) moves the offset", c.s, i, c.want)
+		}
+	}
+	if got := (span{size: 72}).firstFull(); got != -1 {
+		t.Errorf("empty list firstFull %d", got)
+	}
+}
+
 // inkWidth draws "Yesterday" at 9pt for a widget at widgetDPI on a canvas that reports canvasDPI
 // (walk's buffered canvas reports the system DPI) and returns the drawn width in pixels.
 func inkWidth(t *testing.T, canvasDPI, widgetDPI int) int {

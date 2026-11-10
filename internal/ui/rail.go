@@ -290,12 +290,19 @@ func (r *Rail) key(k walk.Key) bool {
 }
 
 func (r *Rail) click(x, y int, button walk.MouseButton) {
-	it, ok := r.hit(x, y)
-	if !ok || button != walk.LeftButton {
+	if button != walk.LeftButton {
 		return
 	}
-	r.focus = slices.IndexFunc(r.targets(), func(t railItem) bool { return t.r == it.r })
-	r.activate(it)
+	// the clicked item becomes the focused, announced one before focus arrives (which would
+	// otherwise start on the active account)
+	it, ok := r.hit(x, y)
+	if ok {
+		r.focusOn(slices.IndexFunc(r.targets(), func(t railItem) bool { return t.r == it.r }))
+	}
+	logErr("focus", r.SetFocus())
+	if ok {
+		r.activate(it)
+	}
 }
 
 // activate does what clicking it does.

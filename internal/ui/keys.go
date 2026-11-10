@@ -57,6 +57,28 @@ func scrollIntoView(off, start, size, view int) int {
 	return off
 }
 
+// span is a scrolled one-dimensional list: n items of size pixels laid out from pad, seen through a
+// view scrolled to off.
+type span struct{ off, pad, size, n int }
+
+// at is the item under view position pos, -1 for none.
+func (s span) at(pos int) int {
+	p := pos + s.off - s.pad
+	if p < 0 || s.size <= 0 || p/s.size >= s.n {
+		return -1
+	}
+	return p / s.size
+}
+
+// firstFull is the first item wholly in view (-1 when there are none): where focus rests when a
+// widget gains it with nothing focused, so gaining focus never scrolls.
+func (s span) firstFull() int {
+	if s.n <= 0 || s.size <= 0 {
+		return -1
+	}
+	return min(max(0, (s.off-s.pad+s.size-1)/s.size), s.n-1)
+}
+
 // keyHook routes the keys of a custom-painted widget to Go.
 type keyHook struct {
 	prev  uintptr // the window procedure walk installed
@@ -73,11 +95,12 @@ func keyHookProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
 	case win.WM_GETDLGCODE:
 		// walk's message loop runs IsDialogMessage, which spends arrows and Enter on moving focus
-		// between controls unless the focused window asks for them; Tab keeps working.
+		// between controls, and typed characters on mnemonics, unless the focused window asks for
+		// them; Tab and Esc keep working.
 		if wParam == win.VK_RETURN {
-			return win.DLGC_WANTARROWS | win.DLGC_WANTALLKEYS
+			return win.DLGC_WANTARROWS | win.DLGC_WANTCHARS | win.DLGC_WANTALLKEYS
 		}
-		return win.DLGC_WANTARROWS
+		return win.DLGC_WANTARROWS | win.DLGC_WANTCHARS
 	case win.WM_KEYDOWN: // handled here, not via walk's KeyDown, which drops auto-repeat
 		if h.onKey(walk.Key(wParam)) {
 			showFocusCues(hwnd)
@@ -93,9 +116,10 @@ func keyHookProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 	return win.CallWindowProc(h.prev, hwnd, msg, wParam, lParam)
 }
 
-// focusable makes cw a tab stop with accessible role and name: a click focuses it, a focus change
-// repaints it (for its focus indicator), and key presses, auto-repeat included, go to onKey, which
-// reports whether it handled the key.
+// focusable makes cw a tab stop with accessible role and name: a focus change repaints it (for its
+// focus indicator), and key presses, auto-repeat included, go to onKey, which reports whether it
+// handled the key. The widget's own click handler calls SetFocus, after it has resolved the item
+// under the cursor (walk runs MouseDown handlers in attach order and WM_SETFOCUS synchronously).
 func focusable(cw *walk.CustomWidget, role walk.AccRole, name string, onKey func(walk.Key) bool) error {
 	h := cw.Handle()
 	keyHooks[h] = &keyHook{prev: win.GetWindowLongPtr(h, win.GWLP_WNDPROC), onKey: onKey}
@@ -106,7 +130,6 @@ func focusable(cw *walk.CustomWidget, role walk.AccRole, name string, onKey func
 	if win.SetWindowLong(h, win.GWL_STYLE, win.GetWindowLong(h, win.GWL_STYLE)|win.WS_TABSTOP) == 0 {
 		return fmt.Errorf("ui: SetWindowLong(GWL_STYLE) failed")
 	}
-	cw.MouseDown().Attach(func(int, int, walk.MouseButton) { logErr("focus", cw.SetFocus()) })
 	cw.FocusedChanged().Attach(func() { logErr("focus repaint", cw.Invalidate()) })
 	acc := cw.Accessibility()
 	return errors.Join(acc.SetRole(role), acc.SetName(name))

@@ -296,7 +296,11 @@ func (s *Sidebar) newHeader() (*walk.CustomWidget, error) {
 		return nil, err
 	}
 	h.MouseDown().Attach(func(x, _ int, b walk.MouseButton) {
-		if b == walk.LeftButton && onButton(x) {
+		if b != walk.LeftButton {
+			return
+		}
+		logErr("focus", h.SetFocus())
+		if onButton(x) {
 			newChat()
 		}
 	})
@@ -337,16 +341,22 @@ func newStoryStrip(parent walk.Container, pal *theme.Palette) (*storyStrip, erro
 		return nil, err
 	}
 	cw.MouseDown().Attach(func(x, _ int, b walk.MouseButton) {
-		s := scaler(cw.DPI())
-		pos := x + st.offset - s(8)
-		if i := pos / s(storyW); b == walk.LeftButton && pos >= 0 && i < len(st.stories) {
-			st.focus = i
+		if b != walk.LeftButton {
+			return
+		}
+		// resolve the story against the offset the user saw, then take focus, then open it
+		i := st.span().at(x)
+		if i >= 0 {
+			st.setFocus(i)
+		}
+		logErr("focus", cw.SetFocus())
+		if i >= 0 {
 			st.open(i)
 		}
 	})
 	cw.FocusedChanged().Attach(func() {
-		if cw.Focused() && st.focus < 0 && len(st.stories) > 0 {
-			st.focusOn(0)
+		if i := st.span().firstFull(); cw.Focused() && st.focus < 0 && i >= 0 {
+			st.setFocus(i) // no scrolling: a click may be resolving its story against this offset
 		}
 	})
 	cw.MouseWheel().Attach(func(_, _ int, b walk.MouseButton) {
@@ -369,14 +379,23 @@ func (st *storyStrip) open(i int) {
 	}
 }
 
-// focusOn moves the focus to story i and scrolls it into view.
-func (st *storyStrip) focusOn(i int) {
-	s := scaler(st.DPI())
+func (st *storyStrip) span() span {
+	return span{off: st.offset, pad: st.IntFrom96DPI(8), size: st.IntFrom96DPI(storyW), n: len(st.stories)}
+}
+
+// setFocus moves the focus to story i, without scrolling.
+func (st *storyStrip) setFocus(i int) {
 	st.focus = i
-	st.offset = st.clamp(scrollIntoView(st.offset, s(8)+i*s(storyW), s(storyW), st.ClientBoundsPixels().Width))
 	logErr("stories repaint", st.Invalidate())
 	story := st.stories[i]
 	announce(st, storyName, displayName(store.Chat{JID: story.SenderJID, Name: story.Name}))
+}
+
+// focusOn moves the focus to story i and scrolls it into view.
+func (st *storyStrip) focusOn(i int) {
+	st.setFocus(i)
+	g := st.span()
+	st.offset = st.clamp(scrollIntoView(st.offset, g.pad+i*g.size, g.size, st.ClientBoundsPixels().Width))
 }
 
 func (st *storyStrip) key(k walk.Key) bool {
@@ -547,8 +566,8 @@ func newChatList(parent walk.Container, pal *theme.Palette, name string) (*chatL
 		return nil, err
 	}
 	cw.FocusedChanged().Attach(func() {
-		if cw.Focused() && l.focusIndex() < 0 && len(l.rows) > 0 {
-			l.focusRow(l.firstVisible())
+		if i := l.span().firstFull(); cw.Focused() && l.focusIndex() < 0 && i >= 0 {
+			l.setFocus(i) // no scrolling: a click may be resolving its row against this offset
 		}
 	})
 	cw.MouseDown().Attach(l.mouseDown)
@@ -569,20 +588,25 @@ func (l *chatList) focusIndex() int {
 	return slices.IndexFunc(l.rows, func(c store.Chat) bool { return c.JID == l.focus })
 }
 
-// firstVisible is the row at the top of the view, -1 when there are none.
-func (l *chatList) firstVisible() int { return min(l.offset/l.rowH(), len(l.rows)-1) }
+func (l *chatList) span() span { return span{off: l.offset, size: l.rowH(), n: len(l.rows)} }
 
-// focusRow moves the keyboard focus to row i and scrolls it into view.
-func (l *chatList) focusRow(i int) {
-	row, rowH := l.rows[i], l.rowH()
+// setFocus moves the keyboard focus to row i, without scrolling.
+func (l *chatList) setFocus(i int) {
+	row := l.rows[i]
 	l.focus = row.JID
-	l.scrollTo(scrollIntoView(l.offset, i*rowH, rowH, l.ClientBoundsPixels().Height))
 	logErr("chat list repaint", l.Invalidate())
 	item := displayName(row)
 	if row.Unread > 0 {
 		item += ", " + strconv.Itoa(row.Unread) + " unread"
 	}
 	announce(l, l.name, item)
+}
+
+// focusRow moves the keyboard focus to row i and scrolls it into view.
+func (l *chatList) focusRow(i int) {
+	l.setFocus(i)
+	rowH := l.rowH()
+	l.scrollTo(scrollIntoView(l.offset, i*rowH, rowH, l.ClientBoundsPixels().Height))
 }
 
 func (l *chatList) open(i int) {
@@ -592,9 +616,9 @@ func (l *chatList) open(i int) {
 	}
 }
 
-// openFirstVisible opens the row at the top of the view (Enter in the search box).
+// openFirstVisible opens the first wholly visible row (Enter in the search box).
 func (l *chatList) openFirstVisible() {
-	if i := l.firstVisible(); i >= 0 {
+	if i := l.span().firstFull(); i >= 0 {
 		l.open(i)
 	}
 }
@@ -679,7 +703,13 @@ func (l *chatList) mouseDown(x, y int, b walk.MouseButton) {
 		l.dragY, l.dragFrom = y, l.offset
 		return
 	}
-	if i := (y + l.offset) / l.rowH(); y >= 0 && i < len(l.rows) {
+	// resolve the row against the offset the user saw, then take focus, then open it
+	i := l.span().at(y)
+	if i >= 0 {
+		l.setFocus(i)
+	}
+	logErr("focus", l.SetFocus())
+	if i >= 0 {
 		l.open(i)
 	}
 }
