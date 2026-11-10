@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -470,5 +471,94 @@ func TestGDIMeasurerMatchesDrawnText(t *testing.T) {
 	}
 	if long > 200 || longH < 3*h {
 		t.Errorf("an unbreakable 300-char word measured %dx%d at max width 200", long, longH)
+	}
+}
+
+// page is a store page (newest first) of n messages of chat, timestamps from ts up, ids prefix0..
+func page(chat, prefix string, ts int64, n int) []store.Message {
+	var out []store.Message
+	for i := n - 1; i >= 0; i-- {
+		out = append(out, store.Message{ID: prefix + strconv.Itoa(i), AccountID: acctA, ChatJID: chat, SenderJID: chat, Type: "text", Timestamp: ts + int64(i)})
+	}
+	return out
+}
+
+func TestLateHistoryAnswersForAnotherChatAreIgnored(t *testing.T) {
+	var m chatModel
+	m.open(acctA, alice, page(alice, "a", 1000, store.PageSize))
+	m.loading = true // Alice's previous page is being fetched...
+	m.open(acctA, bob, page(bob, "b", 1000, store.PageSize))
+	m.loading = true // ...when Bob's chat opens and asks too
+	if n := m.prepend(acctA, alice, nil); n != 0 || !m.loading || m.exhausted {
+		t.Errorf("late empty page for Alice: added %d, Bob loading %v exhausted %v", n, m.loading, m.exhausted)
+	}
+	if n := m.prepend(acctA, alice, page(alice, "x", 1, 3)); n != 0 || len(m.msgs) != store.PageSize {
+		t.Errorf("late page for Alice added %d messages to Bob's chat", n)
+	}
+	m.noMore(acctA, alice)
+	m.noMore(acctB, bob) // same chat JID, other account
+	if !m.loading || m.exhausted {
+		t.Errorf("NoMoreHistory for another chat: Bob loading %v exhausted %v", m.loading, m.exhausted)
+	}
+	if n := m.prepend(acctA, bob, page(bob, "old", 900, 10)); n != 10 || m.loading || !m.exhausted {
+		t.Errorf("Bob's short page: added %d, loading %v exhausted %v", n, m.loading, m.exhausted)
+	}
+	m.loading = true
+	m.exhausted = false
+	m.noMore(acctA, bob)
+	if m.loading || !m.exhausted {
+		t.Errorf("Bob's NoMoreHistory: loading %v exhausted %v", m.loading, m.exhausted)
+	}
+}
+
+func TestUpsertOfMessageOlderThanTheLoadedWindow(t *testing.T) {
+	var m chatModel
+	m.open(acctA, alice, page(alice, "a", 1000, store.PageSize)) // more history exists
+	old := store.Message{ID: "old7", AccountID: acctA, ChatJID: alice, Type: "revoked", Timestamp: 907}
+	if m.upsert(old) || len(m.msgs) != store.PageSize {
+		t.Fatal("a revision of a message above the loaded window was inserted above the gap")
+	}
+	// it arrives with its page, in order
+	m.prepend(acctA, alice, page(alice, "old", 900, store.PageSize))
+	for i := 1; i < len(m.msgs); i++ {
+		if m.msgs[i].Timestamp < m.msgs[i-1].Timestamp {
+			t.Fatalf("out of order at %d: %d after %d", i, m.msgs[i].Timestamp, m.msgs[i-1].Timestamp)
+		}
+	}
+	// newer messages and ones inside the window are placed by time
+	if !m.upsert(store.Message{ID: "new", AccountID: acctA, ChatJID: alice, Timestamp: 5000}) || m.msgs[len(m.msgs)-1].ID != "new" {
+		t.Error("new message not appended")
+	}
+	if !m.upsert(store.Message{ID: "mid", AccountID: acctA, ChatJID: alice, Timestamp: 1020}) || m.msgs[m.index("mid")-1].Timestamp != 1020 {
+		t.Error("message inside the window not placed by time")
+	}
+	// once the history is exhausted everything is loaded, so an older message really is the oldest
+	var short chatModel
+	short.open(acctA, alice, page(alice, "a", 1000, 5))
+	if !short.upsert(old) || short.msgs[0].ID != "old7" {
+		t.Error("older message of an exhausted history not inserted first")
+	}
+	if m.upsert(store.Message{ID: "z", AccountID: acctA, ChatJID: bob, Timestamp: 5000}) {
+		t.Error("message of another chat applied")
+	}
+}
+
+func TestUpsertKeepsTheDownloadedMediaPath(t *testing.T) {
+	var m chatModel
+	img := store.Message{ID: "img", AccountID: acctA, ChatJID: alice, Type: "image", FromMe: true, Status: store.StatusSent, Timestamp: 1, MediaPath: `C:\cache\a.jpg`}
+	m.open(acctA, alice, []store.Message{img})
+	receipt := img
+	receipt.Status, receipt.MediaPath = store.StatusRead, "" // built from an event: no path
+	if !m.upsert(receipt) {
+		t.Fatal("status change not applied")
+	}
+	if got := m.msgs[0]; got.Status != store.StatusRead || got.MediaPath != img.MediaPath {
+		t.Errorf("after the receipt: status %q path %q, want read and the downloaded path", got.Status, got.MediaPath)
+	}
+	moved := img
+	moved.MediaPath = `C:\cache\b.jpg`
+	m.upsert(moved)
+	if m.msgs[0].MediaPath != moved.MediaPath {
+		t.Errorf("a new path was not taken: %q", m.msgs[0].MediaPath)
 	}
 }

@@ -54,25 +54,102 @@ type ChatView struct {
 	pal    theme.Palette
 	cache  *media.Cache
 
-	account, chat, name string          // name: the chat's own name, "" when it has none
-	msgs                []store.Message // oldest first
-	lay                 chatLayout
-	stale               bool // msgs changed since the last layout
-	view                int  // canvas height the scroll offset was last fitted to
-	cdpi                int  // DPI of the paint canvas; text is measured with its fonts
-	loading, exhausted  bool
-	focus               string            // keyboard-focused message ID
-	requested           map[string]bool   // images whose download was requested on sight
-	thumbFiles          map[string]string // Cache.Thumbnail of a downloaded image; "" when it has none
-	thumbBusy           map[string]bool
-	bitmaps             *lru[thumbBitmap]
-	gen                 int // bumped per chat: thumbnails finished for an older chat are dropped
-	lastClickID         string
-	lastClickAt         time.Time
+	chatModel
+	name        string // the chat's own name, "" when it has none
+	lay         chatLayout
+	stale       bool              // msgs changed since the last layout
+	view        int               // canvas height the scroll offset was last fitted to
+	cdpi        int               // DPI of the paint canvas; text is measured with its fonts
+	focus       string            // keyboard-focused message ID
+	requested   map[string]bool   // images whose download was requested on sight
+	thumbFiles  map[string]string // Cache.Thumbnail of a downloaded image; "" when it has none
+	thumbBusy   map[string]bool
+	bitmaps     *lru[thumbBitmap]
+	gen         int // bumped per chat: thumbnails finished for an older chat are dropped
+	lastClickID string
+	lastClickAt time.Time
 
 	onLoadPrevious func()
 	onNeedMedia    func(store.Message)
 	onOpenMedia    func(path string)
+}
+
+// chatModel is the open chat's messages and paging state, kept apart from the window so its rules
+// are tested on their own. Answers and events carry their chat: those for another chat are ignored.
+type chatModel struct {
+	account, chat      string
+	msgs               []store.Message // oldest first
+	loading, exhausted bool            // an older page was asked for; there is none
+}
+
+// open shows a chat from its newest page (newest first); a short page is all of its history.
+func (m *chatModel) open(accountID, chatJID string, firstPage []store.Message) {
+	m.account, m.chat = accountID, chatJID
+	m.msgs = slices.Clone(firstPage)
+	slices.Reverse(m.msgs)
+	m.loading, m.exhausted = false, len(firstPage) < store.PageSize
+}
+
+func (m *chatModel) is(accountID, chatJID string) bool {
+	return accountID == m.account && chatJID == m.chat
+}
+
+func (m *chatModel) index(id string) int {
+	return slices.IndexFunc(m.msgs, func(x store.Message) bool { return x.ID == id })
+}
+
+// prepend answers a request for the page before the loaded messages with page (newest first) and
+// returns how many messages it added above them. A short page ends the history. Messages already
+// loaded are skipped: pages shift as new messages arrive.
+func (m *chatModel) prepend(accountID, chatJID string, page []store.Message) int {
+	if !m.is(accountID, chatJID) {
+		return 0 // a late answer for a chat no longer open
+	}
+	m.loading = false
+	if len(page) < store.PageSize {
+		m.exhausted = true
+	}
+	var older []store.Message
+	for i := len(page) - 1; i >= 0; i-- {
+		if m.index(page[i].ID) < 0 {
+			older = append(older, page[i])
+		}
+	}
+	m.msgs = append(older, m.msgs...)
+	return len(older)
+}
+
+// noMore answers a request for an older page of a chat that has none.
+func (m *chatModel) noMore(accountID, chatJID string) {
+	if m.is(accountID, chatJID) {
+		m.loading, m.exhausted = false, true
+	}
+}
+
+// upsert replaces a loaded message or adds a new one by time, and reports whether the chat changed.
+// A replacement without a media path keeps the known one (events don't carry downloads). An unknown
+// message older than the loaded ones, while older pages remain, is left to arrive with its page:
+// placed now it would sit above a gap and break the order once the page comes.
+func (m *chatModel) upsert(msg store.Message) bool {
+	if !m.is(msg.AccountID, msg.ChatJID) {
+		return false
+	}
+	if i := m.index(msg.ID); i >= 0 {
+		if msg.MediaPath == "" {
+			msg.MediaPath = m.msgs[i].MediaPath
+		}
+		m.msgs[i] = msg
+		return true
+	}
+	if !m.exhausted && len(m.msgs) > 0 && msg.Timestamp < m.msgs[0].Timestamp {
+		return false
+	}
+	at := len(m.msgs)
+	for at > 0 && m.msgs[at-1].Timestamp > msg.Timestamp {
+		at--
+	}
+	m.msgs = slices.Insert(m.msgs, at, msg)
+	return true
 }
 
 // thumbBitmap is a thumbnail decoded and scaled for its box.
@@ -139,8 +216,9 @@ func (v *ChatView) build() error {
 	return v.SetPalette(v.pal)
 }
 
-// OnLoadPrevious sets the handler called when the view nears the top of the loaded messages; it
-// fires once until PrependPage or NoMoreHistory answers it.
+// OnLoadPrevious sets the handler called when the view nears the top of the loaded messages. It
+// loads the next older page of the chat open at that moment and answers with PrependPage or
+// NoMoreHistory naming that chat; it fires once until answered for the open chat.
 func (v *ChatView) OnLoadPrevious(fn func()) { v.onLoadPrevious = fn }
 
 // OnNeedMedia sets the handler that downloads a message's media and then calls SetMediaPath. It
@@ -155,9 +233,8 @@ func (v *ChatView) OnOpenMedia(fn func(path string)) { v.onOpenMedia = fn }
 // SetChat shows a chat from its newest page (store.GetChatMessages page 0, newest first), scrolled
 // to the end. name is the chat's own name ("" for none).
 func (v *ChatView) SetChat(accountID, chatJID, name string, isGroup bool, firstPage []store.Message) {
-	v.account, v.chat, v.name = accountID, chatJID, name
-	v.msgs = slices.Clone(firstPage)
-	slices.Reverse(v.msgs)
+	v.open(accountID, chatJID, firstPage)
+	v.name = name
 	v.lay.reset()
 	v.lay.group = isGroup
 	v.bitmaps.clear()
@@ -165,32 +242,19 @@ func (v *ChatView) SetChat(accountID, chatJID, name string, isGroup bool, firstP
 	clear(v.thumbFiles)
 	clear(v.thumbBusy)
 	v.gen++
-	v.loading, v.exhausted = false, len(firstPage) < store.PageSize
 	v.focus, v.view, v.scroll.off, v.stale = "", 0, 0, true
 	logErr("chat layout", v.relayout(false))
 	logErr("chat repaint", errors.Join(v.header.Invalidate(), v.canvas.Invalidate()))
 	v.settle()
 }
 
-// PrependPage adds the next older page (newest first, as store.GetChatMessages returns it) above
-// the loaded messages, keeping the messages on screen where they are. A short page ends the history.
-func (v *ChatView) PrependPage(page []store.Message) {
-	if len(page) > 0 && (page[0].AccountID != v.account || page[0].ChatJID != v.chat) {
-		return // a late answer for a chat no longer open
-	}
-	v.loading = false
-	if len(page) < store.PageSize {
-		v.exhausted = true
-	}
-	var older []store.Message
-	for i := len(page) - 1; i >= 0; i-- { // oldest first; skip what is loaded (pages shift as messages arrive)
-		if m := page[i]; v.index(m.ID) < 0 {
-			older = append(older, m)
-		}
-	}
-	if len(older) > 0 {
-		logErr("chat layout", v.relayout(false)) // the total to anchor against
-		v.msgs = append(older, v.msgs...)
+// PrependPage answers OnLoadPrevious for accountID's chat chatJID with the next older page (newest
+// first, as store.GetChatMessages returns it), added above the loaded messages with the messages on
+// screen kept where they are. A short page ends the history. An answer for a chat that is no longer
+// open, empty or not, is ignored.
+func (v *ChatView) PrependPage(accountID, chatJID string, page []store.Message) {
+	logErr("chat layout", v.relayout(false)) // the total to anchor against
+	if v.prepend(accountID, chatJID, page) > 0 {
 		v.stale = true
 		logErr("chat layout", v.relayout(true))
 		logErr("chat repaint", v.canvas.Invalidate())
@@ -198,26 +262,24 @@ func (v *ChatView) PrependPage(page []store.Message) {
 	v.settle()
 }
 
-// NoMoreHistory answers OnLoadPrevious when there is nothing older.
-func (v *ChatView) NoMoreHistory() { v.loading, v.exhausted = false, true }
+// NoMoreHistory answers OnLoadPrevious for accountID's chat chatJID when there is nothing older; an
+// answer for a chat that is no longer open is ignored.
+func (v *ChatView) NoMoreHistory(accountID, chatJID string) { v.noMore(accountID, chatJID) }
 
-// Upsert adds a new message of the open chat or replaces a changed one (status, edit, deletion).
-// The view follows new messages only when it was showing the end. Other chats' messages are ignored.
+// Upsert adds a new message of the open chat or replaces a changed one (status, edit, deletion); an
+// empty MediaPath keeps the downloaded one. The view follows new messages only when it was showing
+// the end. Other chats' messages are ignored, and so are unknown ones older than the loaded messages
+// while older pages remain: they come with their page.
 func (v *ChatView) Upsert(msg store.Message) {
-	if msg.AccountID != v.account || msg.ChatJID != v.chat {
+	old := ""
+	if i := v.index(msg.ID); i >= 0 {
+		old = v.msgs[i].MediaPath
+	}
+	if !v.upsert(msg) {
 		return
 	}
-	if i := v.index(msg.ID); i >= 0 {
-		if v.msgs[i].MediaPath != msg.MediaPath {
-			delete(v.thumbFiles, msg.ID)
-		}
-		v.msgs[i] = msg
-	} else {
-		at := len(v.msgs)
-		for at > 0 && v.msgs[at-1].Timestamp > msg.Timestamp {
-			at--
-		}
-		v.msgs = slices.Insert(v.msgs, at, msg)
+	if msg.MediaPath != "" && msg.MediaPath != old {
+		delete(v.thumbFiles, msg.ID) // made from the old download
 	}
 	v.lay.forget(msg.ID)
 	v.stale = true
@@ -245,10 +307,6 @@ func (v *ChatView) SetMediaPath(id, path string) {
 func (v *ChatView) SetPalette(p theme.Palette) error {
 	v.pal = p
 	return errors.Join(setBg(v.Composite, p.ChatBg), v.header.Invalidate(), v.canvas.Invalidate())
-}
-
-func (v *ChatView) index(id string) int {
-	return slices.IndexFunc(v.msgs, func(m store.Message) bool { return m.ID == id })
 }
 
 func (v *ChatView) focusIndex() int {
@@ -336,7 +394,7 @@ func (v *ChatView) settle() {
 	}
 	if v.onLoadPrevious != nil && shouldLoadPrevious(v.scroll.off, v.canvas.IntFrom96DPI(loadAheadPx), v.loading, v.exhausted) {
 		v.loading = true
-		v.onLoadPrevious() // may prepend a page right away
+		v.onLoadPrevious() // may answer right away
 	}
 	first, last := v.visible()
 	for _, m := range slices.Clone(v.msgs[first:last]) {
