@@ -135,3 +135,33 @@ func TestDecodeFull(t *testing.T) {
 		t.Errorf("over the cap: %v, want ErrImageTooLarge", err)
 	}
 }
+
+func TestClickOpens(t *testing.T) {
+	photo := bubble{thumb: walk.Rectangle{X: 10, Y: 10, Width: 200, Height: 150}, text: walk.Rectangle{X: 10, Y: 165, Width: 200, Height: 20}}
+	card := bubble{card: walk.Rectangle{X: 10, Y: 10, Width: 240, Height: 60}}
+	cases := []struct {
+		name    string
+		typ     string
+		b       bubble
+		x, y    int
+		mods    walk.Modifiers
+		dragged bool
+		want    bool
+	}{
+		{"plain click on the photo", "image", photo, 50, 50, 0, false, true},
+		{"plain click on a sticker", "sticker", photo, 50, 50, 0, false, true},
+		{"plain click on a video card", "video", card, 50, 30, 0, false, true},
+		{"ctrl picks", "image", photo, 50, 50, walk.ModControl, false, false},
+		{"shift picks", "image", photo, 50, 50, walk.ModShift, false, false},
+		{"caption text", "image", photo, 50, 170, 0, false, false},
+		{"outside the media", "image", photo, 230, 50, 0, false, false},
+		{"end of a drag", "image", photo, 50, 50, 0, true, false},
+		{"document waits for a double-click", "document", card, 50, 30, 0, false, false},
+		{"audio waits for a double-click", "audio", card, 50, 30, 0, false, false},
+	}
+	for _, c := range cases {
+		if got := clickOpens(c.typ, c.b, c.x, c.y, c.mods, c.dragged); got != c.want {
+			t.Errorf("%s: %v, want %v", c.name, got, c.want)
+		}
+	}
+}

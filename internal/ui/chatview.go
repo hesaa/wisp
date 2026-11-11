@@ -696,7 +696,8 @@ func (v *ChatView) mouseDown(x, y int, b walk.MouseButton) {
 		v.setFocus(i)
 	}
 	focusOn(v.canvas)
-	switch mods := walk.ModifiersDown(); {
+	mods := walk.ModifiersDown()
+	switch {
 	case i >= 0 && mods == walk.ModControl:
 		v.setSel(textMark{}, textMark{})
 		v.togglePick(v.msgs[i].ID)
@@ -728,7 +729,17 @@ func (v *ChatView) mouseDown(x, y int, b walk.MouseButton) {
 	if n == 2 {
 		v.lastClickID = "" // a third click starts over
 	}
-	v.activate(m, n == 2)
+	v.activate(m, n == 2 || clickOpens(m.Type, v.lay.cache[m.ID], x, y-v.screenY(i), mods, v.dragging))
+}
+
+// clickOpens reports whether a press at (x, y) (y from the bubble's top) opens a message at once,
+// as Enter does: a plain click, not ending a drag, on the picture or card of a photo, sticker or
+// video. Documents and audio wait for a double-click; picks and text keep their own gestures.
+func clickOpens(typ string, b bubble, x, y int, mods walk.Modifiers, dragged bool) bool {
+	if mods != 0 || dragged || typ != "image" && typ != "sticker" && typ != "video" {
+		return false
+	}
+	return in(b.thumb, x, y) || in(b.card, x, y)
 }
 
 // pressText starts a selection for the nth press in a row on text at (x, y): the first sets the
