@@ -52,7 +52,7 @@ func NewDirectory(people []store.Person) *Directory {
 				continue
 			}
 		}
-		d.byJID[jid] = p
+		d.byJID[jid] = mergePerson(p, store.Person{})
 	}
 
 	// For JIDs linked through PNJID that had no row of their own in raw.
@@ -78,10 +78,7 @@ func pickPNJID(a, b string) string {
 	if strings.HasSuffix(b, "@s.whatsapp.net") {
 		return b
 	}
-	if a != "" {
-		return a
-	}
-	return b
+	return ""
 }
 
 // mergePerson merges two rows for the same person: a non-empty field of either fills
@@ -196,7 +193,7 @@ func (d *Directory) Name(jid, stored string) string {
 	var pn string
 	if strings.HasSuffix(jid, "@s.whatsapp.net") {
 		pn = jid
-	} else if ok && p.PNJID != "" {
+	} else if ok && strings.HasSuffix(p.PNJID, "@s.whatsapp.net") {
 		pn = p.PNJID
 	}
 	if pn != "" {

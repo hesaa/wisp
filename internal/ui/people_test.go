@@ -53,6 +53,17 @@ func TestNameRule(t *testing.T) {
 		t.Fatalf("LID alone not in directory: got %q, want 'Unknown'", got)
 	}
 
+	// 6b. LID with non-phone PNJID (e.g. another LID) ignored, never formatted as +<digits> → "Unknown"
+	dLIDPN := NewDirectory([]store.Person{
+		{JID: "777@lid", PNJID: "888@lid"},
+	})
+	if got := dLIDPN.Name("777@lid", ""); got != "Unknown" {
+		t.Fatalf("LID with non-phone PNJID: got %q, want 'Unknown'", got)
+	}
+	if p, ok := dLIDPN.Person("777@lid"); !ok || p.PNJID != "" {
+		t.Fatalf("Person with non-phone PNJID: ok=%v, PNJID=%q, want ''", ok, p.PNJID)
+	}
+
 	// 7. Group → stored, else "Group"
 	if got := d.Name("12345-67890@g.us", "My Group"); got != "My Group" {
 		t.Fatalf("group with stored: got %q, want 'My Group'", got)
@@ -115,6 +126,32 @@ func TestNameMergesLIDAndPhone(t *testing.T) {
 	}
 	if personP.AvatarID != "av99" || personP.AvatarTS != 12345 {
 		t.Fatalf("Person(%q) avatar = %s/%d, want av99/12345", pn, personP.AvatarID, personP.AvatarTS)
+	}
+}
+
+func TestNonPhonePNJIDIgnored(t *testing.T) {
+	// PNJID must strictly be a phone-number JID ending in @s.whatsapp.net.
+	// Non-phone JIDs (like @lid or @g.us) are ignored and never formatted as +<digits>.
+	d := NewDirectory([]store.Person{
+		{JID: "12345678901234@lid", PNJID: "98765432109876@lid"},
+		{JID: "22345678901234@lid", PNJID: "group123@g.us"},
+		{JID: "32345678901234@lid", PNJID: "invalid-jid"},
+	})
+
+	for _, jid := range []string{"12345678901234@lid", "22345678901234@lid", "32345678901234@lid"} {
+		if name := d.Name(jid, ""); name != "Unknown" {
+			t.Errorf("Name(%q) = %q, want 'Unknown'", jid, name)
+		}
+		if mention := d.Mention(jid); mention != "Unknown" {
+			t.Errorf("Mention(%q) = %q, want 'Unknown'", jid, mention)
+		}
+		p, ok := d.Person(jid)
+		if !ok {
+			t.Errorf("Person(%q) not found", jid)
+		}
+		if p.PNJID != "" {
+			t.Errorf("Person(%q).PNJID = %q, want ''", jid, p.PNJID)
+		}
 	}
 }
 
