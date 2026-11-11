@@ -8,14 +8,14 @@ import (
 )
 
 func TestInstanceNamePerDataFolder(t *testing.T) {
-	a, b := instanceName(`C:\Users\x\AppData\Local\wa-go`), instanceName(`c:\users\x\appdata\local\wa-go\`)
+	a, b := instanceName(`C:\Users\x\AppData\Local\Wisp`), instanceName(`c:\users\x\appdata\local\wisp\`)
 	if a != b {
 		t.Fatalf("same folder, different names: %q %q", a, b)
 	}
-	if !strings.HasPrefix(a, `Local\wa-go-`) || strings.ContainsAny(a[len(`Local\`):], `\:`) {
+	if !strings.HasPrefix(a, `Local\wisp-`) || strings.ContainsAny(a[len(`Local\`):], `\:`) {
 		t.Fatalf("name %q: want the session namespace and no path characters", a)
 	}
-	if a == instanceName(`D:\scratch\wa-go`) {
+	if a == instanceName(`D:\scratch\Wisp`) {
 		t.Fatal("two data folders share one instance")
 	}
 }

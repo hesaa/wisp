@@ -51,7 +51,7 @@ func fetchGIF(ctx context.Context, c *http.Client, rawURL string, limit int64) (
 	case resp.ContentLength > limit:
 		return "", tooBig
 	}
-	f, err := os.CreateTemp("", "wa-go-gif-*.mp4")
+	f, err := os.CreateTemp("", "wisp-gif-*.mp4")
 	if err != nil {
 		return "", err
 	}

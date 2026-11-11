@@ -22,6 +22,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	waStore "go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
@@ -114,6 +115,7 @@ type Manager struct {
 // New opens (creating if needed) the whatsmeow session database at sessionPath, which holds every
 // paired device. Call Start to connect them.
 func New(ctx context.Context, sessionPath string, db *store.DB, cache *media.Cache) (*Manager, error) {
+	waStore.DeviceProps.Os = proto.String("Wisp") // the name the phone lists under Linked devices
 	q := url.Values{}
 	q.Add("_pragma", "foreign_keys(1)") // sqlstore refuses to run without it
 	q.Add("_pragma", "busy_timeout(5000)")
@@ -311,7 +313,7 @@ func (m *Manager) upload(ctx context.Context, cli waClient, accountID, path, ext
 		return whatsmeow.UploadResponse{}, "", err
 	}
 	defer f.Close()
-	tmp, err := os.CreateTemp("", "wa-go-upload-*")
+	tmp, err := os.CreateTemp("", "wisp-upload-*")
 	if err != nil {
 		return whatsmeow.UploadResponse{}, "", err
 	}
@@ -570,7 +572,7 @@ func (m *Manager) DownloadMedia(ctx context.Context, msg store.Message) (string,
 	if err := proto.Unmarshal(msg.MediaMeta, dl); err != nil {
 		return "", fmt.Errorf("whatsapp: media keys of %s: %w", msg.ID, err)
 	}
-	tmp, err := os.CreateTemp("", "wa-go-download-*")
+	tmp, err := os.CreateTemp("", "wisp-download-*")
 	if err != nil {
 		return "", err
 	}

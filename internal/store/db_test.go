@@ -19,7 +19,7 @@ func TestOpenRefusesANewerSchema(t *testing.T) {
 	db, err = Open(path)
 	if err == nil {
 		db.Close()
-		t.Fatal("a database from a newer wa-go was opened")
+		t.Fatal("a database from a newer Wisp was opened")
 	}
 	if !strings.Contains(err.Error(), "newer") {
 		t.Fatalf("unclear error: %v", err)

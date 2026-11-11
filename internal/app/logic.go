@@ -118,11 +118,11 @@ func unreadIncoming(msgs []store.Message) []store.Message {
 	return out
 }
 
-// windowState is how the user sees wa-go.
+// windowState is how the user sees Wisp.
 type windowState int
 
 const (
-	windowForeground windowState = iota // in front: the user is in wa-go (any of its windows)
+	windowForeground windowState = iota // in front: the user is in Wisp (any of its windows)
 	windowBackground                    // on screen behind another program, past the grace period
 	windowMinimized                     // on the taskbar
 	windowHidden                        // closed to the tray
@@ -130,7 +130,7 @@ const (
 )
 
 // stateOf names the window's state from what Windows reports (visible, iconic), session lock
-// notifications (locked), whether wa-go has the foreground (active) and whether the grace period
+// notifications (locked), whether Wisp has the foreground (active) and whether the grace period
 // after the user switched away still runs.
 func stateOf(visible, iconic, locked, active, grace bool) windowState {
 	switch {
@@ -146,7 +146,7 @@ func stateOf(visible, iconic, locked, active, grace bool) windowState {
 	return windowBackground
 }
 
-// presenceFor is the presence every account shows: available only while wa-go is in front and the
+// presenceFor is the presence every account shows: available only while Wisp is in front and the
 // user does not appear offline.
 func presenceFor(w windowState, appearOffline bool) types.Presence {
 	if w == windowForeground && !appearOffline {
@@ -198,7 +198,7 @@ type presenceCtl struct {
 	window        func() (visible, iconic bool)
 	appearOffline func() bool
 	send          func(types.Presence)
-	active        bool // wa-go has the foreground (WM_ACTIVATEAPP)
+	active        bool // Wisp has the foreground (WM_ACTIVATEAPP)
 	locked        bool // the session is locked
 	grace         grace
 	last          presenceState
@@ -214,7 +214,7 @@ func (p *presenceCtl) update(force bool) {
 	}
 }
 
-// activated follows the user switching to wa-go or to another program: back, presence follows at
+// activated follows the user switching to Wisp or to another program: back, presence follows at
 // once; away, it drops once graceDelay passes unless they come back first.
 func (p *presenceCtl) activated(active bool) {
 	p.active = active

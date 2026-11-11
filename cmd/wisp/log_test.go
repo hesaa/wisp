@@ -8,7 +8,7 @@ import (
 )
 
 func TestLogAppendsAndStartsOverPastTheLimit(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "wa-go.log")
+	path := filepath.Join(t.TempDir(), "wisp.log")
 	write := func(s string) {
 		t.Helper()
 		f, err := openLog(path, 10)

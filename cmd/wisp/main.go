@@ -1,7 +1,7 @@
-// Command wa-go is a native Windows WhatsApp client for several accounts at once.
+// Command wisp builds Wisp, a native Windows WhatsApp client for several accounts at once.
 //
-// Data lives in %LOCALAPPDATA%\wa-go: wa-go.db (messages and settings), session.db (whatsmeow's
-// paired devices), cache\ (media) and wa-go.log.
+// Data lives in %LOCALAPPDATA%\Wisp: wisp.db (messages and settings), session.db (whatsmeow's
+// paired devices), cache\ (media) and wisp.log.
 package main
 
 import (
@@ -32,26 +32,26 @@ const logLimit = 1 << 20
 
 func main() {
 	if err := run(); err != nil {
-		walk.MsgBox(nil, "wa-go", "wa-go could not start: "+err.Error(), walk.MsgBoxIconError|walk.MsgBoxOK)
+		walk.MsgBox(nil, "Wisp", "Wisp could not start: "+err.Error(), walk.MsgBoxIconError|walk.MsgBoxOK)
 		os.Exit(1)
 	}
 }
 
-// run starts wa-go and returns once it exits; an error is logged before the log closes.
+// run starts Wisp and returns once it exits; an error is logged before the log closes.
 func run() (err error) {
 	base, err := os.UserCacheDir() // %LOCALAPPDATA%
 	if err != nil {
 		return err
 	}
-	dir := filepath.Join(base, "wa-go")
+	dir := filepath.Join(base, "Wisp")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	if f, ferr := openLog(filepath.Join(dir, "wa-go.log"), logLimit); ferr == nil {
+	if f, ferr := openLog(filepath.Join(dir, "wisp.log"), logLimit); ferr == nil {
 		log.SetOutput(f)
 		defer func() {
 			if err != nil {
-				log.Printf("wa-go: %v", err)
+				log.Printf("wisp: %v", err)
 			}
 			f.Close()
 		}()
@@ -62,12 +62,12 @@ func run() (err error) {
 		return err
 	}
 	if !first {
-		log.Printf("wa-go: already running; brought it to the front")
+		log.Printf("wisp: already running; brought it to the front")
 		return nil
 	}
 	defer windows.CloseHandle(show)
 
-	db, err := store.Open(filepath.Join(dir, "wa-go.db"))
+	db, err := store.Open(filepath.Join(dir, "wisp.db"))
 	if err != nil {
 		return err
 	}
@@ -86,10 +86,10 @@ func run() (err error) {
 		return err
 	}
 	a.Attach(mgr)
-	go func() { // another wa-go asked for the window
+	go func() { // another Wisp asked for the window
 		for {
 			if ev, err := windows.WaitForSingleObject(show, windows.INFINITE); ev != windows.WAIT_OBJECT_0 {
-				log.Printf("wa-go: instance signal: %v", err)
+				log.Printf("wisp: instance signal: %v", err)
 				return
 			}
 			a.Restore()
@@ -98,14 +98,14 @@ func run() (err error) {
 	return a.Run()
 }
 
-// instanceName names the per-session event that keeps one wa-go per data folder: two would share
+// instanceName names the per-session event that keeps one Wisp per data folder: two would share
 // the database and connect the same accounts twice.
 func instanceName(dataDir string) string {
 	sum := sha256.Sum256([]byte(strings.ToLower(filepath.Clean(dataDir))))
-	return `Local\wa-go-` + hex.EncodeToString(sum[:16])
+	return `Local\wisp-` + hex.EncodeToString(sum[:16])
 }
 
-// claimInstance makes this the running wa-go for dataDir and returns the event other instances set
+// claimInstance makes this the running Wisp for dataDir and returns the event other instances set
 // to bring it to the front. When one already runs, it is signalled instead and first is false.
 func claimInstance(dataDir string) (show windows.Handle, first bool, err error) {
 	name, err := windows.UTF16PtrFromString(instanceName(dataDir))

@@ -1,4 +1,4 @@
-// Package app is wa-go's main window: it composes the account rail, sidebar, chat view, input bar,
+// Package app is Wisp's main window: it composes the account rail, sidebar, chat view, input bar,
 // tray and dialogs, and wires them to the WhatsApp manager, the message store and the media cache.
 //
 // Everything here runs on the UI thread except the goroutines it starts for store reads and network
@@ -134,7 +134,7 @@ func (a *App) build() error {
 		a.icon = walk.IconApplication()
 	}
 	l := walk.NewHBoxLayout()
-	if err := errors.Join(l.SetMargins(walk.Margins{}), l.SetSpacing(0), mw.SetLayout(l), mw.SetTitle("wa-go"), mw.SetIcon(a.icon),
+	if err := errors.Join(l.SetMargins(walk.Margins{}), l.SetSpacing(0), mw.SetLayout(l), mw.SetTitle("Wisp"), mw.SetIcon(a.icon),
 		mw.SetMinMaxSize(walk.Size{Width: 820, Height: 560}, walk.Size{}), mw.SetSize(walk.Size{Width: 1180, Height: 760})); err != nil {
 		return err
 	}
@@ -219,7 +219,7 @@ func (a *App) Attach(mgr Backend) {
 // Run shows the window and the tray icon and returns after Exit, once every account has been set
 // unavailable and disconnected. Call Attach first.
 func (a *App) Run() error {
-	tray, err := notify.NewTray(a.mw, a.icon, "wa-go", a.restore, a.exit)
+	tray, err := notify.NewTray(a.mw, a.icon, "Wisp", a.restore, a.exit)
 	if err != nil {
 		return err
 	}
@@ -264,7 +264,7 @@ func (a *App) exit() {
 	})
 }
 
-// Restore brings the window to the front from any goroutine (another wa-go was started).
+// Restore brings the window to the front from any goroutine (another Wisp was started).
 func (a *App) Restore() { a.mw.Synchronize(a.restore) }
 
 // restore brings the window back from the tray (or a minimised state) to the front.
@@ -412,7 +412,7 @@ func (a *App) alert(text string) {
 	if f := walk.App().ActiveForm(); f != nil {
 		owner = f
 	}
-	walk.MsgBox(owner, "wa-go", text, walk.MsgBoxIconWarning|walk.MsgBoxOK)
+	walk.MsgBox(owner, "Wisp", text, walk.MsgBoxIconWarning|walk.MsgBoxOK)
 }
 
 // logErr logs a failure that has no caller to return it to.

@@ -49,13 +49,13 @@ type Cache struct{ root string }
 // New returns a cache using root (created lazily on first save).
 func New(root string) *Cache { return &Cache{root: root} }
 
-// DefaultRoot returns %LOCALAPPDATA%\wa-go\cache.
+// DefaultRoot returns %LOCALAPPDATA%\Wisp\cache.
 func DefaultRoot() (string, error) {
 	d, err := os.UserCacheDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(d, "wa-go", "cache"), nil
+	return filepath.Join(d, "Wisp", "cache"), nil
 }
 
 // Save streams r to disk, content-addressed by SHA-256, and returns the final path.

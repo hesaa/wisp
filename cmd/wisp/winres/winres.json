@@ -17,10 +17,10 @@
     "#1": {
       "0409": {
         "identity": {
-          "name": "wa-go",
+          "name": "Wisp",
           "version": "0.1.0.0"
         },
-        "description": "wa-go WhatsApp client",
+        "description": "Wisp",
         "minimum-os": "win10",
         "execution-level": "as invoker",
         "ui-access": false,
@@ -49,14 +49,14 @@
           "0409": {
             "Comments": "",
             "CompanyName": "",
-            "FileDescription": "wa-go WhatsApp client",
+            "FileDescription": "Wisp",
             "FileVersion": "0.1.0.0",
-            "InternalName": "wa-go",
+            "InternalName": "wisp",
             "LegalCopyright": "",
             "LegalTrademarks": "",
-            "OriginalFilename": "wa-go.exe",
+            "OriginalFilename": "wisp.exe",
             "PrivateBuild": "",
-            "ProductName": "wa-go",
+            "ProductName": "Wisp",
             "ProductVersion": "0.1.0.0",
             "SpecialBuild": ""
           }

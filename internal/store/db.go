@@ -79,7 +79,7 @@ func (d *DB) migrate() error {
 		return err
 	}
 	if v > schemaVersion {
-		return fmt.Errorf("the database was made by a newer wa-go (schema %d, this one knows %d): run the newer wa-go, or delete it to start over", v, schemaVersion)
+		return fmt.Errorf("the database was made by a newer Wisp (schema %d, this one knows %d): run the newer Wisp, or delete it to start over", v, schemaVersion)
 	}
 	if v == schemaVersion {
 		return nil

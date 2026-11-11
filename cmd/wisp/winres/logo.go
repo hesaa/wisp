@@ -1,7 +1,7 @@
 //go:build ignore
 
-// logo renders the wa-go app icon, a teal speech bubble with a white rounded "w", into the PNGs that
-// winres.json packs into the exe. Regenerate after changing it, from cmd/wa-go/winres:
+// logo renders the Wisp app icon, a teal speech bubble with a white rounded "w", into the PNGs that
+// winres.json packs into the exe. Regenerate after changing it, from cmd/wisp/winres:
 //
 //	go run logo.go
 //	cd .. && go tool go-winres make --arch amd64

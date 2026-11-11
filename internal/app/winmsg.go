@@ -9,7 +9,7 @@ import (
 )
 
 // The main window's messages walk does not publish, both for presence: WM_ACTIVATEAPP (the user
-// switched to wa-go, any of its windows, or away to another program) and session lock notifications.
+// switched to Wisp, any of its windows, or away to another program) and session lock notifications.
 
 const (
 	wmWTSSessionChange   = 0x02B1

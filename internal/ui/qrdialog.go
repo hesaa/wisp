@@ -56,7 +56,7 @@ func qrStep(it whatsmeow.QRChannelItem) (v qrView, ok bool) {
 		}
 		return failed("Linking failed: " + it.Error.Error())
 	case whatsmeow.QRChannelClientOutdated.Event:
-		return failed("This version of wa-go is too old to link a phone.")
+		return failed("This version of Wisp is too old to link a phone.")
 	case whatsmeow.QRChannelScannedWithoutMultidevice.Event:
 		return failed("Turn on multi-device on your phone, then try again.")
 	case whatsmeow.QRChannelErrUnexpectedEvent.Event:

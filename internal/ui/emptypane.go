@@ -54,6 +54,6 @@ func (e *EmptyPane) paint(c *walk.Canvas, _ walk.Rectangle) error {
 	cx, cy := b.Width/2, b.Height/2
 	return errors.Join(c.FillRectanglePixels(bg, b),
 		icons.Draw(c, icons.IconChat, square(cx, cy-s(52), s(64)), theme.Color(p.TextSecondary)),
-		drawText(c, dpi, "wa-go", 20, 0, theme.Color(p.Text), walk.Rectangle{X: s(24), Y: cy - s(12), Width: b.Width - s(48), Height: s(40)}, centerText),
+		drawText(c, dpi, "Wisp", 20, 0, theme.Color(p.Text), walk.Rectangle{X: s(24), Y: cy - s(12), Width: b.Width - s(48), Height: s(40)}, centerText),
 		drawText(c, dpi, e.hint, 10, 0, theme.Color(p.TextSecondary), walk.Rectangle{X: s(24), Y: cy + s(32), Width: b.Width - s(48), Height: s(24)}, centerText))
 }
