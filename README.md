@@ -43,8 +43,8 @@ but notifications show only "New message", and you count as not using Wisp, so y
 online. After 5 wrong PINs the box is disabled for 30 seconds, doubling after every further 5.
 
 **Forgot your PIN?** **Reset Wisp** on the lock page, after a confirmation, logs out every account,
-deletes the chats, sessions and downloaded media from this PC and starts Wisp afresh on the link
-page. It keeps `wisp.log`. If the logout can't reach WhatsApp, the phone may still list the device:
+deletes the chats, sessions, downloaded media and settings from this PC, which also removes the PIN
+and turns the app lock off, and starts Wisp afresh on the link page. It keeps `wisp.log`. If the logout can't reach WhatsApp, the phone may still list the device:
 remove it under Linked devices.
 
 The lock hides Wisp's window; it doesn't encrypt Wisp's files.
