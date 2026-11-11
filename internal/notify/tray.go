@@ -153,7 +153,7 @@ func badgeLabel(n int) string {
 
 const iconPx, badgePx = 32, 16
 
-// badgedIcon draws base plus an accent-green circle with label at the bottom right.
+// badgedIcon draws base plus a white-ringed accent-green circle with label at the bottom right.
 func badgedIcon(base walk.Image, label string) (*walk.Icon, error) {
 	bmp, err := walk.NewBitmapFromImageWithSize(base, walk.Size{Width: iconPx, Height: iconPx})
 	if err != nil {
@@ -193,11 +193,15 @@ func badgeImage(label string) *image.RGBA {
 	accent := theme.Color("#00a884")
 	green := color.RGBA{R: accent.R(), G: accent.G(), B: accent.B(), A: 0xff}
 	r := float64(badgePx) / 2
+	ring := r - 2 // 2 px here, 1 px once the tray shrinks the icon to 16 px: keeps the badge off the teal logo
 	for y := 0; y < badgePx; y++ {
 		for x := 0; x < badgePx; x++ {
 			dx, dy := float64(x)+0.5-r, float64(y)+0.5-r
-			if dx*dx+dy*dy <= r*r {
+			switch d := dx*dx + dy*dy; {
+			case d <= ring*ring:
 				img.SetRGBA(x, y, green)
+			case d <= r*r:
+				img.SetRGBA(x, y, color.RGBA{255, 255, 255, 255})
 			}
 		}
 	}
