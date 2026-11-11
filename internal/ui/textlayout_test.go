@@ -54,8 +54,35 @@ func TestWrapTextSplitsLongWords(t *testing.T) {
 }
 
 func TestWrapTextKeepsSurrogatePairs(t *testing.T) {
-	wantLines(t, "ab😀cd", 30, "ab", "😀c", "d")
-	wantLines(t, "😀😀", 10, "😀", "😀") // a pair wider than the line still makes a line
+	wantLines(t, "ab😀cd", 30, "ab", "😀", "cd") // split before the pair, then break after the emoji
+	wantLines(t, "😀😀", 10, "😀", "😀")           // a pair wider than the line still makes a line
+}
+
+func TestWrapTextBreaksBetweenEmoji(t *testing.T) {
+	wantLines(t, "😀😀😀😀😀😀", 60, "😀😀😀", "😀😀😀")
+	wantLines(t, "ok 😀😀😀", 70, "ok 😀😀", "😀") // as DrawText: the run breaks, not the space
+	wantLines(t, "x ok😀", 50, "x ", "ok😀")   // but not between a letter and an emoji
+	wantLines(t, "😀ok", 30, "😀", "ok")       // after an emoji it may
+	wantLines(t, "😀😀!", 40, "😀", "😀!")       // never before closing punctuation
+}
+
+func TestWrapTextKeepsEmojiSequencesWhole(t *testing.T) {
+	zwj, vs16, keycap := string(rune(0x200d)), string(rune(0xfe0f)), string(rune(0x20e3))
+	family := "👨" + zwj + "👩" + zwj + "👧" + zwj + "👦" // 11 units, 110px
+	wantLines(t, family+family, 120, family, family)
+	wantLines(t, family+family, 50, family, family) // wider than the line, still whole
+	wantLines(t, "👍🏽👍🏽", 30, "👍🏽", "👍🏽")            // skin tone
+	heart := "❤" + vs16
+	wantLines(t, heart+heart, 10, heart, heart) // variation selector
+	wantLines(t, "1"+vs16+keycap+"#"+keycap, 20, "1"+vs16+keycap, "#"+keycap)
+	wantLines(t, "🇮🇩🇯🇵", 30, "🇮🇩", "🇯🇵") // flags: no break between them, but never split
+}
+
+func TestWrapTextBreaksBetweenCJK(t *testing.T) {
+	wantLines(t, "漢字漢字漢字", 40, "漢字漢字", "漢字")
+	wantLines(t, "ab 漢字漢字漢字", 60, "ab 漢字漢", "字漢字") // fills the line instead of moving the run
+	wantLines(t, "かなカナ한글", 30, "かなカ", "ナ한글")
+	wantLines(t, "漢字漢。", 30, "漢字", "漢。") // no line starts with closing punctuation
 }
 
 func TestTextWidthCountsTrailingSpacesThatFit(t *testing.T) {

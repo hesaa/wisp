@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"strings"
 	"unicode"
 	"unicode/utf16"
 )
@@ -10,17 +11,18 @@ import (
 type textLine struct{ start, end int }
 
 // wrapText breaks units into lines at most maxW pixels wide, as DrawText's word break does: at
-// newlines ("\r\n" counts as one), after the last space that fits, and inside a word wider than the
-// line, never between the halves of a surrogate pair; every line holds at least one character.
-// Trailing spaces never push a line past maxW. adv is called once, with all of units, and returns
-// the cumulative width after each unit.
+// newlines ("\r\n" counts as one), after the last space or other break opportunity (breakBetween)
+// that fits, and inside a word wider than the line, never inside a character (cluster); every line
+// holds at least one. Trailing spaces never push a line past maxW. adv is called once, with all of
+// units, and returns the cumulative width after each unit.
 func wrapText(units []uint16, maxW int, adv func(u []uint16) []int) []textLine {
 	if len(units) == 0 {
 		return nil
 	}
 	x := adv(units)
 	var lines []textLine
-	start, brk := 0, 0 // brk: just after the line's last space; at or before start when it has none
+	start, brk := 0, 0 // brk: the line's last break opportunity; at or before start when it has none
+	prev := rune(' ')  // the character before i
 	for i := 0; i < len(units); {
 		switch u := units[i]; {
 		case u == '\n':
@@ -33,13 +35,13 @@ func wrapText(units []uint16, maxW int, adv func(u []uint16) []int) []textLine {
 			start = i
 		case u == ' ':
 			i++
-			brk = i
+			brk, prev = i, ' '
 		case u == '\r' && i+1 < len(units) && units[i+1] == '\n':
 			i++ // part of the newline, not of the line's width
 		default:
-			n := 1
-			if i+1 < len(units) && utf16.DecodeRune(rune(u), rune(units[i+1])) != unicode.ReplacementChar {
-				n = 2
+			r, n := cluster(units, i)
+			if i > start && breakBetween(prev, r) {
+				brk = i
 			}
 			if i > start && widthOf(x, start, i+n) > maxW {
 				if brk <= start {
@@ -47,13 +49,75 @@ func wrapText(units []uint16, maxW int, adv func(u []uint16) []int) []textLine {
 				}
 				lines = append(lines, textLine{start, brk})
 				start = brk
-				continue // unit i again, on the new line
+				continue // cluster i again, on the new line
 			}
 			i += n
+			prev = r
 		}
 	}
 	return append(lines, textLine{start, len(units)})
 }
+
+// cluster is the character at units[i] with what stays with it: combining marks and variation
+// selectors, skin tones, emoji tags, ZWJ joins and the second half of a flag. It returns the
+// character's first rune and the cluster's length in units.
+func cluster(units []uint16, i int) (rune, int) {
+	first, n := runeAt(units, i)
+	for i+n < len(units) {
+		r, m := runeAt(units, i+n)
+		switch {
+		case unicode.In(r, unicode.Mn, unicode.Me), r >= 0x1f3fb && r <= 0x1f3ff, r >= 0xe0020 && r <= 0xe007f:
+		case r == 0x200d: // zero width joiner: the next character joins too
+			if j := i + n + m; j < len(units) && units[j] > ' ' {
+				_, k := runeAt(units, j)
+				m += k
+			}
+		case flag(first) && flag(r) && n == 2:
+		default:
+			return first, n
+		}
+		n += m
+	}
+	return first, n
+}
+
+// runeAt is the rune at units[i] and its length in units; a lone surrogate is its own rune.
+func runeAt(units []uint16, i int) (rune, int) {
+	if i+1 < len(units) {
+		if r := utf16.DecodeRune(rune(units[i]), rune(units[i+1])); r != unicode.ReplacementChar {
+			return r, 2
+		}
+	}
+	return rune(units[i]), 1
+}
+
+// breakBetween reports whether DrawText may break a line between characters p and c besides at
+// spaces: around CJK characters and emoji, but never before closing punctuation, between two flags,
+// or before an emoji that follows a letter or opening punctuation.
+func breakBetween(p, c rune) bool {
+	switch {
+	case unicode.In(c, unicode.Pe, unicode.Pf) || strings.ContainsRune(",.!?:;、。，．！？：；々", c) || flag(p) && flag(c):
+		return false
+	case cjk(p) || cjk(c) || emoji(p):
+		return true
+	case emoji(c):
+		return !unicode.In(p, unicode.L, unicode.M, unicode.Ps, unicode.Pi)
+	}
+	return false
+}
+
+// cjk reports whether r is a CJK ideograph, kana or hangul syllable.
+func cjk(r rune) bool {
+	return unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana) || r >= 0xac00 && r <= 0xd7a3
+}
+
+// emoji reports whether r is a pictograph DrawText breaks around: those of the supplementary planes
+// but the enclosed letters. shortcut: BMP emoji DrawText also breaks around (☺ ✌ ☕ ⚽ ⌚) are not
+// included, nor are its gaps (💯 🎵 🔗); add Windows' table if they matter.
+func emoji(r rune) bool { return r >= 0x1f000 && r <= 0x1faff && (r < 0x1f100 || r > 0x1f1e5) }
+
+// flag reports whether r is a regional indicator, half of a flag.
+func flag(r rune) bool { return r >= 0x1f1e6 && r <= 0x1f1ff }
 
 // textWidth is the width of the widest of lines as DrawText reports it: a line's trailing spaces
 // count as far as they fit in maxW. x holds the cumulative advances of all of units, as wrapText's
