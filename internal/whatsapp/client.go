@@ -10,6 +10,7 @@ import (
 	"math"
 	"runtime/debug"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -60,6 +61,8 @@ type waClient interface {
 	ContactName(ctx context.Context, jid types.JID) (string, error) // address-book name, "" when unknown
 	AllContacts(ctx context.Context) (map[types.JID]types.ContactInfo, error)
 	GetGroupInfo(ctx context.Context, jid types.JID) (*types.GroupInfo, error)
+	GetProfilePictureInfo(ctx context.Context, jid types.JID, params *whatsmeow.GetProfilePictureParams) (*types.ProfilePictureInfo, error)
+	GetUserInfo(ctx context.Context, jids []types.JID) (map[types.JID]types.UserInfo, error)
 }
 
 // liveClient adds the device-store lookups to a real client.
@@ -127,6 +130,21 @@ func (m *Manager) handleEvent(ctx context.Context, id string, cli waClient, evt 
 	switch e := evt.(type) {
 	case *events.Message:
 		info := e.Info
+		rawSender := info.Sender.ToNonAD()
+		if rawSender.IsEmpty() && isDM(info.Chat) {
+			rawSender = info.Chat.ToNonAD()
+		}
+		var pnJID string
+		if rawSender.Server == types.HiddenUserServer {
+			if info.SenderAlt.Server == types.DefaultUserServer && info.SenderAlt.User != "" {
+				pnJID = info.SenderAlt.ToNonAD().String()
+			} else {
+				pn, err := cli.PNForLID(ctx, rawSender)
+				if err == nil && !pn.IsEmpty() {
+					pnJID = pn.ToNonAD().String()
+				}
+			}
+		}
 		var err error
 		if info.MessageSource, err = pnSource(ctx, cli, info.MessageSource); err != nil {
 			return err
@@ -147,6 +165,20 @@ func (m *Manager) handleEvent(ctx context.Context, id string, cli waClient, evt 
 		}
 		if info.Chat.Server == types.GroupServer {
 			m.nameGroupOnce(id, cli, info.Chat)
+		}
+		if !info.IsFromMe && rawSender.User != "" {
+			pushName := info.PushName
+			if pushName == "-" {
+				pushName = ""
+			}
+			p := store.Person{
+				JID:      rawSender.String(),
+				PNJID:    pnJID,
+				PushName: pushName,
+			}
+			if err := m.upsertPeople(id, []store.Person{p}); err != nil {
+				return err
+			}
 		}
 		return m.persist(msg)
 	case *events.Receipt:
@@ -173,6 +205,12 @@ func (m *Manager) handleEvent(ctx context.Context, id string, cli waClient, evt 
 		}
 	case *events.PushNameSetting:
 		m.emit(PushNameEvent{AccountID: id})
+	case *events.Picture:
+		jid := e.JID.ToNonAD().String()
+		if err := m.store.SetAvatar(id, jid, "", 0); err != nil {
+			return err
+		}
+		m.emit(AvatarEvent{AccountID: id, JID: jid})
 	case *events.HistorySync:
 		err := m.ingestHistory(ctx, id, cli, e)
 		// whatsmeow decoded the whole blob before this event; drop our handle (we are its only
@@ -184,6 +222,7 @@ func (m *Manager) handleEvent(ctx context.Context, id string, cli waClient, evt 
 		m.add(id, cli)
 		m.emit(ConnectionEvent{AccountID: id, State: StatePaired})
 	case *events.Connected:
+		m.syncContacts(ctx, id, cli)
 		m.emit(ConnectionEvent{AccountID: id, State: StateConnected})
 	case *events.Disconnected:
 		m.emit(ConnectionEvent{AccountID: id, State: StateDisconnected})
@@ -278,20 +317,60 @@ func (m *Manager) nameGroupOnce(id string, cli waClient, group types.JID) {
 	})
 }
 
+// syncContacts upserts contacts from AllContacts into people once per connect.
+func (m *Manager) syncContacts(ctx context.Context, id string, cli waClient) {
+	all, err := cli.AllContacts(ctx)
+	if err != nil || len(all) == 0 {
+		return
+	}
+	people := make([]store.Person, 0, len(all))
+	for jid, c := range all {
+		if c.FullName != "" && !maskedName(c.FullName) {
+			people = append(people, store.Person{
+				JID:      jid.ToNonAD().String(),
+				FullName: c.FullName,
+			})
+		}
+	}
+	if len(people) > 0 {
+		_ = m.upsertPeople(id, people)
+	}
+}
+
 // nameDM records the best name for a 1:1 chat: the address-book name always wins; a push name only
-// names a chat that has none ("-" means no name, as in whatsmeow).
+// names a chat that has none ("-" means no name, as in whatsmeow). Masked names are never stored.
 func (m *Manager) nameDM(ctx context.Context, id string, cli waClient, chat types.JID, pushName string) error {
 	full, err := cli.ContactName(ctx, chat)
 	if err != nil {
 		return err
 	}
-	if full != "" {
+	if full != "" && !maskedName(full) {
 		return m.store.UpsertChat(id, chat.String(), full, 0)
 	}
-	if pushName == "" || pushName == "-" {
+	if pushName == "" || pushName == "-" || maskedName(pushName) {
 		return nil
 	}
 	return m.store.NameChatIfUnnamed(id, chat.String(), pushName)
+}
+
+// maskedName reports whether s is a masked number (+, then only digits, spaces and at least one
+// of •, ·, *, ., ∙).
+func maskedName(s string) bool {
+	if !strings.HasPrefix(s, "+") {
+		return false
+	}
+	hasMask := false
+	for _, r := range s[1:] {
+		switch r {
+		case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ' ':
+			// valid digit or space
+		case '•', '·', '*', '.', '∙':
+			hasMask = true
+		default:
+			return false
+		}
+	}
+	return hasMask
 }
 
 // revise applies an edit or a delete-for-everyone sent by the target message's own author; anything
@@ -414,7 +493,18 @@ func (m *Manager) ingestHistory(ctx context.Context, id string, cli waClient, h 
 		batch = batch[:0]
 		return &evt.Info, err
 	}
+	var people []store.Person
 	for _, conv := range h.Data.GetConversations() {
+		if convID, pnJID := conv.GetID(), conv.GetPnJID(); convID != "" && pnJID != "" {
+			cID, err1 := types.ParseJID(convID)
+			pJID, err2 := types.ParseJID(pnJID)
+			if err1 == nil && err2 == nil {
+				people = append(people, store.Person{
+					JID:   cID.ToNonAD().String(),
+					PNJID: pJID.ToNonAD().String(),
+				})
+			}
+		}
 		chat, err := types.ParseJID(conv.GetID())
 		if err == nil {
 			alt, _ := types.ParseJID(conv.GetPnJID()) // unusable alts are ignored by toPN
@@ -440,6 +530,9 @@ func (m *Manager) ingestHistory(ctx context.Context, id string, cli waClient, h 
 			continue
 		}
 		name := cmp.Or(conv.GetName(), conv.GetDisplayName())
+		if maskedName(name) {
+			name = ""
+		}
 		if err := m.store.UpsertChat(id, chat.String(), name, int64(conv.GetConversationTimestamp())); err != nil {
 			return err
 		}
@@ -456,6 +549,11 @@ func (m *Manager) ingestHistory(ctx context.Context, id string, cli waClient, h 
 	}
 	if err := m.store.InsertMessagesBatch(batch); err != nil {
 		return err
+	}
+	if len(people) > 0 {
+		if err := m.upsertPeople(id, people); err != nil {
+			return err
+		}
 	}
 	m.emit(HistorySyncEvent{AccountID: id})
 	if skipped > 0 {
@@ -504,8 +602,21 @@ func toStoreMessage(id string, info types.MessageInfo, m *waE2E.Message) (msg st
 		SenderJID: info.Sender.ToNonAD().String(), Timestamp: info.Timestamp.Unix(),
 		Type: typ, Body: body, FromMe: info.IsFromMe, Status: store.StatusReceived,
 	}
-	if exp := contextInfo(m).GetExpiration(); exp > 0 { // disappearing messages: honoured here too
-		msg.ExpiresAt = msg.Timestamp + int64(exp)
+	if ci := contextInfo(m); ci != nil {
+		if mentioned := ci.GetMentionedJID(); len(mentioned) > 0 {
+			var valid []string
+			for _, j := range mentioned {
+				if j != "" {
+					valid = append(valid, j)
+				}
+			}
+			if len(valid) > 0 {
+				msg.Mentions = strings.Join(valid, " ")
+			}
+		}
+		if exp := ci.GetExpiration(); exp > 0 { // disappearing messages: honoured here too
+			msg.ExpiresAt = msg.Timestamp + int64(exp)
+		}
 	}
 	switch {
 	case typ == TypeUnsupported:

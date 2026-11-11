@@ -36,7 +36,7 @@ type Backend interface {
 	Contacts(ctx context.Context, accountID string) ([]whatsapp.Contact, error)
 	SendText(ctx context.Context, accountID, chatJID, text string) (store.Message, error)
 	SendMedia(ctx context.Context, accountID, chatJID, path, caption string) (store.Message, error)
-	SendGIF(ctx context.Context, accountID, chatJID, mp4Path string) (store.Message, error)
+	SendGIF(ctx context.Context, accountID, chatJID, mp4Path string, preview []byte, w, h int) (store.Message, error)
 	SetTyping(ctx context.Context, accountID, chatJID string, composing bool) error
 	SetPresenceAll(ctx context.Context, p types.Presence) error
 	MarkRead(ctx context.Context, msgs []store.Message, selfOnly bool) error

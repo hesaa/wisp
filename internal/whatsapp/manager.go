@@ -10,6 +10,7 @@ import (
 	"maps"
 	"math"
 	"mime"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -72,12 +73,38 @@ type (
 	HistorySyncEvent struct{ AccountID string }
 	// ConnectionEvent: the account's connection state changed (State* constants).
 	ConnectionEvent struct{ AccountID, State, Detail string }
+	// PeopleEvent: contact or group member information changed; reload the account's people directory.
+	PeopleEvent struct{ AccountID string }
+	// AvatarEvent: JID's profile picture changed or was cleared.
+	AvatarEvent struct{ AccountID, JID string }
 	// ErrorEvent: an incoming event could not be fully handled (for example a store write failed).
 	ErrorEvent struct {
 		AccountID string
 		Err       error
 	}
 )
+
+// Picture is a WhatsApp profile or group picture location.
+type Picture struct {
+	ID  string
+	URL string
+}
+
+// ErrNoPicture is returned when a contact or group has no profile picture or it is hidden.
+var ErrNoPicture = errors.New("whatsapp: no profile picture")
+
+// Member is a participant in a WhatsApp group.
+type Member struct {
+	JID   string
+	Admin bool
+}
+
+// GroupDetails describes a WhatsApp group's metadata and participants.
+type GroupDetails struct {
+	Subject     string
+	Description string
+	Members     []Member
+}
 
 // msgStore is the part of *store.DB the manager writes to.
 type msgStore interface {
@@ -92,6 +119,8 @@ type msgStore interface {
 	ReviseMessage(accountID, chatJID, id, msgType, body string) (bool, error)
 	MessageSender(accountID, chatJID, id string) (string, error)
 	SetMediaPath(accountID, chatJID, id, path string) error
+	UpsertPeople(accountID string, people []store.Person) error
+	SetAvatar(accountID, jid, avatarID string, ts int64) error
 }
 
 // Manager runs every paired account. It is safe for concurrent use and never touches the UI.
@@ -110,6 +139,9 @@ type Manager struct {
 	groupsAsked  map[string]bool               // "account chat" of unnamed groups whose name was asked for this run
 	groupSlots   chan struct{}                 // bounds the group-name lookups under way
 	groupFetches sync.WaitGroup                // the lookups under way
+
+	peopleMu sync.RWMutex
+	people   map[string]store.Person // key: accountID + " " + jid
 }
 
 // New opens (creating if needed) the whatsmeow session database at sessionPath, which holds every
@@ -125,7 +157,8 @@ func New(ctx context.Context, sessionPath string, db *store.DB, cache *media.Cac
 		return nil, fmt.Errorf("whatsapp: open sessions: %w", err)
 	}
 	return &Manager{store: db, media: cache, container: container, accounts: map[string]waClient{},
-		connect: (*whatsmeow.Client).Connect, groupsAsked: map[string]bool{}, groupSlots: make(chan struct{}, 2)}, nil
+		connect: (*whatsmeow.Client).Connect, groupsAsked: map[string]bool{}, groupSlots: make(chan struct{}, 2),
+		people: map[string]store.Person{}}, nil
 }
 
 // Start registers a client for every saved device and returns: Accounts lists them at once, while
@@ -274,8 +307,9 @@ func (m *Manager) SendMedia(ctx context.Context, accountID, chatJID, path, capti
 }
 
 // SendGIF sends the MP4 at mp4Path to chatJID as a GIF: a video the recipient's app loops silently.
+// Sets JPEGThumbnail, Width, Height when preview != nil.
 // Like SendMedia it streams the file into the media cache and uploads the cached copy.
-func (m *Manager) SendGIF(ctx context.Context, accountID, chatJID, mp4Path string) (store.Message, error) {
+func (m *Manager) SendGIF(ctx context.Context, accountID, chatJID, mp4Path string, preview []byte, w, h int) (store.Message, error) {
 	cli, err := m.client(accountID)
 	if err != nil {
 		return store.Message{}, err
@@ -288,12 +322,198 @@ func (m *Manager) SendGIF(ctx context.Context, accountID, chatJID, mp4Path strin
 	if err != nil {
 		return store.Message{}, err
 	}
-	msg := &waE2E.Message{VideoMessage: &waE2E.VideoMessage{
+	vm := &waE2E.VideoMessage{
 		GifPlayback: proto.Bool(true), Mimetype: proto.String("video/mp4"),
 		URL: &up.URL, DirectPath: &up.DirectPath, MediaKey: up.MediaKey,
 		FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: &up.FileLength,
-	}}
+	}
+	if preview != nil {
+		vm.JPEGThumbnail = preview
+		vm.Width = proto.Uint32(uint32(w))
+		vm.Height = proto.Uint32(uint32(h))
+	}
+	msg := &waE2E.Message{VideoMessage: vm}
 	return m.send(ctx, cli, accountID, chat, msg, cached)
+}
+
+// ProfilePicture queries the profile picture of jid. It reports ok false with nil error
+// when knownID is still current (unchanged). It returns ErrNoPicture when no picture is set
+// or it is hidden by privacy settings.
+func (m *Manager) ProfilePicture(ctx context.Context, accountID, jid, knownID string, full bool) (Picture, bool, error) {
+	cli, err := m.client(accountID)
+	if err != nil {
+		return Picture{}, false, err
+	}
+	target, err := types.ParseJID(jid)
+	if err != nil {
+		return Picture{}, false, err
+	}
+	info, err := cli.GetProfilePictureInfo(ctx, target, &whatsmeow.GetProfilePictureParams{
+		Preview:    !full,
+		ExistingID: knownID,
+	})
+	if err != nil {
+		if errors.Is(err, whatsmeow.ErrProfilePictureNotSet) || errors.Is(err, whatsmeow.ErrProfilePictureUnauthorized) {
+			return Picture{}, false, ErrNoPicture
+		}
+		return Picture{}, false, fmt.Errorf("whatsapp: profile picture: %w", err)
+	}
+	if info == nil {
+		return Picture{}, false, nil
+	}
+	return Picture{ID: info.ID, URL: info.URL}, true, nil
+}
+
+// FetchPicture downloads picture bytes through the configured proxy, capped at 2 MB,
+// with a 20-second timeout.
+func (m *Manager) FetchPicture(ctx context.Context, rawURL string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
+	tr := &http.Transport{}
+	if proxyAddr := m.proxyAddress(); proxyAddr != "" {
+		pu, err := url.Parse(proxyAddr)
+		if err != nil {
+			return nil, fmt.Errorf("whatsapp: fetch picture: parse proxy: %w", err)
+		}
+		tr.Proxy = http.ProxyURL(pu)
+	}
+	client := &http.Client{Transport: tr}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("whatsapp: fetch picture: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("whatsapp: fetch picture: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("whatsapp: fetch picture: HTTP %d", resp.StatusCode)
+	}
+	const maxBytes = 2 << 20 // 2 MB
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("whatsapp: fetch picture: %w", err)
+	}
+	if len(data) > maxBytes {
+		return nil, errors.New("whatsapp: picture exceeds 2 MB")
+	}
+	return data, nil
+}
+
+// About queries the status text of jid.
+func (m *Manager) About(ctx context.Context, accountID, jid string) (string, error) {
+	cli, err := m.client(accountID)
+	if err != nil {
+		return "", err
+	}
+	target, err := types.ParseJID(jid)
+	if err != nil {
+		return "", err
+	}
+	res, err := cli.GetUserInfo(ctx, []types.JID{target})
+	if err != nil {
+		return "", fmt.Errorf("whatsapp: user info: %w", err)
+	}
+	if info, ok := res[target]; ok {
+		return info.Status, nil
+	}
+	if info, ok := res[target.ToNonAD()]; ok {
+		return info.Status, nil
+	}
+	return "", nil
+}
+
+// GroupDetails queries metadata and participants of group jid, and upserts group members into the people store.
+func (m *Manager) GroupDetails(ctx context.Context, accountID, jid string) (GroupDetails, error) {
+	cli, err := m.client(accountID)
+	if err != nil {
+		return GroupDetails{}, err
+	}
+	group, err := types.ParseJID(jid)
+	if err != nil {
+		return GroupDetails{}, err
+	}
+	info, err := cli.GetGroupInfo(ctx, group)
+	if err != nil {
+		return GroupDetails{}, fmt.Errorf("whatsapp: group info: %w", err)
+	}
+	members := make([]Member, len(info.Participants))
+	people := make([]store.Person, len(info.Participants))
+	for i, p := range info.Participants {
+		mJID := p.JID.ToNonAD().String()
+		members[i] = Member{
+			JID:   mJID,
+			Admin: p.IsAdmin || p.IsSuperAdmin,
+		}
+		var pnJID string
+		if p.PhoneNumber.Server == types.DefaultUserServer && p.PhoneNumber.User != "" {
+			pnJID = p.PhoneNumber.ToNonAD().String()
+		} else if p.JID.Server == types.DefaultUserServer {
+			pnJID = p.JID.ToNonAD().String()
+		}
+		people[i] = store.Person{
+			JID:   mJID,
+			PNJID: pnJID,
+		}
+	}
+	if len(people) > 0 {
+		if err := m.upsertPeople(accountID, people); err != nil {
+			return GroupDetails{}, err
+		}
+	}
+	return GroupDetails{
+		Subject:     info.Name,
+		Description: info.Topic,
+		Members:     members,
+	}, nil
+}
+
+// upsertPeople inserts or updates people in the store and emits PeopleEvent if anything changed.
+func (m *Manager) upsertPeople(accountID string, people []store.Person) error {
+	if len(people) == 0 {
+		return nil
+	}
+	m.peopleMu.Lock()
+	defer m.peopleMu.Unlock()
+	if m.people == nil {
+		m.people = make(map[string]store.Person)
+	}
+	var changed []store.Person
+	for _, p := range people {
+		key := accountID + " " + p.JID
+		cur, exists := m.people[key]
+		isChanged := false
+		if !exists {
+			isChanged = true
+			cur.JID = p.JID
+		}
+		if p.PNJID != "" && p.PNJID != cur.PNJID {
+			cur.PNJID = p.PNJID
+			isChanged = true
+		}
+		if p.FullName != "" && p.FullName != cur.FullName {
+			cur.FullName = p.FullName
+			isChanged = true
+		}
+		if p.PushName != "" && p.PushName != cur.PushName {
+			cur.PushName = p.PushName
+			isChanged = true
+		}
+		if isChanged {
+			m.people[key] = cur
+			changed = append(changed, p)
+		}
+	}
+	if len(changed) == 0 {
+		return nil
+	}
+	if err := m.store.UpsertPeople(accountID, changed); err != nil {
+		return err
+	}
+	m.emit(PeopleEvent{AccountID: accountID})
+	return nil
 }
 
 // upload copies the file at path into the media cache (as ext) and uploads the cached copy as kind,

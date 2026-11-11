@@ -335,7 +335,7 @@ func (a *App) sendGIF(mp4URL string) {
 			return err
 		}
 		defer func() { logErr("remove GIF", os.Remove(tmp)) }()
-		_, err = a.mgr.SendGIF(ctx, c.acct, c.jid, tmp)
+		_, err = a.mgr.SendGIF(ctx, c.acct, c.jid, tmp, nil, 0, 0)
 		return err
 	}, mediaTimeout, nil)
 }

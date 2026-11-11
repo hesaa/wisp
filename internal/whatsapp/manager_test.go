@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -56,15 +58,57 @@ type fakeClient struct {
 	timers      []time.Duration
 	proxies     []string
 	groupNames  map[types.JID]string // GetGroupInfo answers
+	groups      map[types.JID]*types.GroupInfo
 	groupMu     sync.Mutex
 	groupN      int // GetGroupInfo calls
+	picInfo     map[types.JID]*types.ProfilePictureInfo
+	picErr      map[types.JID]error
+	userInfo    map[types.JID]types.UserInfo
+	userInfoErr error
 }
 
 func (f *fakeClient) GetGroupInfo(_ context.Context, jid types.JID) (*types.GroupInfo, error) {
 	f.groupMu.Lock()
 	f.groupN++
 	f.groupMu.Unlock()
+	if f.groups != nil {
+		if g, ok := f.groups[jid]; ok {
+			return g, nil
+		}
+	}
 	return &types.GroupInfo{JID: jid, GroupName: types.GroupName{Name: f.groupNames[jid]}}, nil
+}
+
+func (f *fakeClient) GetProfilePictureInfo(_ context.Context, jid types.JID, params *whatsmeow.GetProfilePictureParams) (*types.ProfilePictureInfo, error) {
+	if f.picErr != nil {
+		if err, ok := f.picErr[jid]; ok {
+			return nil, err
+		}
+	}
+	if f.picInfo != nil {
+		if p, ok := f.picInfo[jid]; ok {
+			if params != nil && params.ExistingID != "" && p != nil && params.ExistingID == p.ID {
+				return nil, nil
+			}
+			return p, nil
+		}
+	}
+	return nil, whatsmeow.ErrProfilePictureNotSet
+}
+
+func (f *fakeClient) GetUserInfo(_ context.Context, jids []types.JID) (map[types.JID]types.UserInfo, error) {
+	if f.userInfoErr != nil {
+		return nil, f.userInfoErr
+	}
+	out := make(map[types.JID]types.UserInfo)
+	for _, j := range jids {
+		if f.userInfo != nil {
+			if u, ok := f.userInfo[j]; ok {
+				out[j] = u
+			}
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeClient) groupCalls() int {
@@ -235,8 +279,12 @@ func TestRoutesMessageToItsAccountOnly(t *testing.T) {
 	if got := m.Accounts(); !slices.Equal(got, []string{acctA, acctB}) {
 		t.Fatalf("accounts %v", got)
 	}
-	var got []any
-	m.AddListener(func(e any) { got = append(got, e) })
+	var got []MessageEvent
+	m.AddListener(func(e any) {
+		if me, ok := e.(MessageEvent); ok {
+			got = append(got, me)
+		}
+	})
 
 	for range 2 { // the second is a redelivery
 		if err := m.handleEvent(ctx, acctA, fa, incoming(alice, "m1", "hi")); err != nil {
@@ -246,8 +294,8 @@ func TestRoutesMessageToItsAccountOnly(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("listener got %d events, want 1 (a redelivery must not re-emit)", len(got))
 	}
-	ev, ok := got[0].(MessageEvent)
-	if !ok || ev.AccountID != acctA || ev.Message.AccountID != acctA || ev.Message.Body != "hi" ||
+	ev := got[0]
+	if ev.AccountID != acctA || ev.Message.AccountID != acctA || ev.Message.Body != "hi" ||
 		ev.Message.Status != store.StatusReceived || ev.Message.FromMe {
 		t.Fatalf("event %#v", got[0])
 	}
@@ -408,7 +456,7 @@ func TestUnknownAccountIsAnError(t *testing.T) {
 	ops := map[string]func() error{
 		"SendText":  func() error { _, err := m.SendText(ctx, "nope", alice.String(), "x"); return err },
 		"Logout":    func() error { return m.Logout(ctx, "nope") },
-		"SendGIF":   func() error { _, err := m.SendGIF(ctx, "nope", alice.String(), "x.mp4"); return err },
+		"SendGIF":   func() error { _, err := m.SendGIF(ctx, "nope", alice.String(), "x.mp4", nil, 0, 0); return err },
 		"SetTyping": func() error { return m.SetTyping(ctx, "nope", alice.String(), true) },
 		"DownloadMedia": func() error {
 			_, err := m.DownloadMedia(ctx, store.Message{AccountID: "nope", Type: TypeImage})
@@ -531,7 +579,7 @@ func TestSendGIFIsALoopingVideo(t *testing.T) {
 	if err := os.WriteFile(mp4, []byte("mp4 bytes"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	got, err := m.SendGIF(ctx, acctA, alice.String(), mp4)
+	got, err := m.SendGIF(ctx, acctA, alice.String(), mp4, nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -886,5 +934,445 @@ func TestValidateProxy(t *testing.T) {
 		if err := ValidateProxy(bad); !errors.Is(err, ErrBadProxy) {
 			t.Errorf("%q accepted (%v)", bad, err)
 		}
+	}
+}
+
+func TestMentionsStoredFromText(t *testing.T) {
+	m, db := newTestManager(t)
+	fa := &fakeClient{}
+	m.add(acctA, fa)
+
+	// ExtendedTextMessage with MentionedJID
+	evtText := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{Chat: alice, Sender: alice},
+			ID:            "m1",
+			Timestamp:     time.Unix(1000, 0),
+		},
+		Message: &waE2E.Message{
+			ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+				Text: proto.String("hello @a @b"),
+				ContextInfo: &waE2E.ContextInfo{
+					MentionedJID: []string{"a@lid", "b@s.whatsapp.net"},
+				},
+			},
+		},
+	}
+	if err := m.handleEvent(ctx, acctA, fa, evtText); err != nil {
+		t.Fatal(err)
+	}
+
+	// ImageMessage caption with ContextInfo
+	evtImg := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{Chat: alice, Sender: alice},
+			ID:            "m2",
+			Timestamp:     time.Unix(1001, 0),
+		},
+		Message: &waE2E.Message{
+			ImageMessage: &waE2E.ImageMessage{
+				Caption: proto.String("photo of @c"),
+				ContextInfo: &waE2E.ContextInfo{
+					MentionedJID: []string{"c@s.whatsapp.net"},
+				},
+			},
+		},
+	}
+	if err := m.handleEvent(ctx, acctA, fa, evtImg); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, err := db.GetChatMessages(acctA, alice.String(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var msg1, msg2 store.Message
+	for _, msg := range msgs {
+		if msg.ID == "m1" {
+			msg1 = msg
+		} else if msg.ID == "m2" {
+			msg2 = msg
+		}
+	}
+	if msg1.Mentions != "a@lid b@s.whatsapp.net" {
+		t.Errorf("m1 Mentions = %q, want %q", msg1.Mentions, "a@lid b@s.whatsapp.net")
+	}
+	if msg2.Mentions != "c@s.whatsapp.net" {
+		t.Errorf("m2 Mentions = %q, want %q", msg2.Mentions, "c@s.whatsapp.net")
+	}
+}
+
+func TestGroupSenderPushNameStored(t *testing.T) {
+	m, db := newTestManager(t)
+	lid := types.NewJID("123456789012345", types.HiddenUserServer)
+	pn := types.NewJID("628123456789", types.DefaultUserServer)
+	group := types.NewJID("1234567-987654", types.GroupServer)
+	fa := &fakeClient{groupNames: map[types.JID]string{group: "Test Group"}}
+	m.add(acctA, fa)
+
+	var peopleEvents []PeopleEvent
+	m.AddListener(func(e any) {
+		if pe, ok := e.(PeopleEvent); ok {
+			peopleEvents = append(peopleEvents, pe)
+		}
+	})
+
+	evt := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:      group,
+				Sender:    lid,
+				SenderAlt: pn,
+			},
+			ID:        "g1",
+			PushName:  "Sinta",
+			Timestamp: time.Unix(1000, 0),
+		},
+		Message: &waE2E.Message{
+			Conversation: proto.String("hi all"),
+		},
+	}
+
+	if err := m.handleEvent(ctx, acctA, fa, evt); err != nil {
+		t.Fatal(err)
+	}
+
+	people, err := db.People(acctA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found *store.Person
+	for i := range people {
+		if people[i].JID == lid.String() {
+			found = &people[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("person with JID %s not found in people table; got %+v", lid.String(), people)
+	}
+	if found.PNJID != pn.String() || found.PushName != "Sinta" {
+		t.Errorf("person = %+v, want JID=%s, PNJID=%s, PushName=Sinta", *found, lid.String(), pn.String())
+	}
+	if len(peopleEvents) != 1 || peopleEvents[0].AccountID != acctA {
+		t.Errorf("PeopleEvent count = %d, got events %+v; want exactly 1 for account %s", len(peopleEvents), peopleEvents, acctA)
+	}
+}
+
+func TestMaskedNameNotStored(t *testing.T) {
+	m, db := newTestManager(t)
+	contact := types.NewJID("628123456732", types.DefaultUserServer)
+	fa := &fakeClient{}
+	m.add(acctA, fa)
+
+	evt := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{Chat: contact, Sender: contact},
+			ID:            "m1",
+			PushName:      "+62••••••32",
+			Timestamp:     time.Unix(1000, 0),
+		},
+		Message: &waE2E.Message{Conversation: proto.String("hey")},
+	}
+	if err := m.handleEvent(ctx, acctA, fa, evt); err != nil {
+		t.Fatal(err)
+	}
+
+	name, err := db.ChatName(acctA, contact.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "" {
+		t.Errorf("chats.name = %q, want empty string", name)
+	}
+}
+
+func TestProfilePictureUnchangedAndMissing(t *testing.T) {
+	m, _ := newTestManager(t)
+	userA := types.NewJID("628111111111", types.DefaultUserServer)
+	userB := types.NewJID("628222222222", types.DefaultUserServer)
+	userC := types.NewJID("628333333333", types.DefaultUserServer)
+	userD := types.NewJID("628444444444", types.DefaultUserServer)
+
+	fa := &fakeClient{
+		picInfo: map[types.JID]*types.ProfilePictureInfo{
+			userA: {ID: "pic123", URL: "https://example.com/pic123.jpg"},
+			userB: {ID: "pic456", URL: "https://example.com/pic456.jpg"},
+		},
+		picErr: map[types.JID]error{
+			userC: whatsmeow.ErrProfilePictureNotSet,
+			userD: whatsmeow.ErrProfilePictureUnauthorized,
+		},
+	}
+	m.add(acctA, fa)
+
+	// 1. Fetching known ID "pic123" for userA -> unchanged (ok false, nil error)
+	pic, ok, err := m.ProfilePicture(ctx, acctA, userA.String(), "pic123", false)
+	if err != nil {
+		t.Fatalf("ProfilePicture userA known ID: %v", err)
+	}
+	if ok {
+		t.Fatalf("ProfilePicture userA: expected ok=false (unchanged), got ok=true, pic=%+v", pic)
+	}
+
+	// 2. Fetching with empty known ID for userB -> changed (ok true, pic returned)
+	pic, ok, err = m.ProfilePicture(ctx, acctA, userB.String(), "", true)
+	if err != nil {
+		t.Fatalf("ProfilePicture userB: %v", err)
+	}
+	if !ok || pic.ID != "pic456" || pic.URL != "https://example.com/pic456.jpg" {
+		t.Fatalf("ProfilePicture userB: got ok=%v, pic=%+v; want ok=true, ID=pic456", ok, pic)
+	}
+
+	// 3. User with ErrProfilePictureNotSet -> ErrNoPicture
+	_, _, err = m.ProfilePicture(ctx, acctA, userC.String(), "", false)
+	if !errors.Is(err, ErrNoPicture) {
+		t.Fatalf("ProfilePicture userC: got err=%v, want ErrNoPicture", err)
+	}
+
+	// 4. User with ErrProfilePictureUnauthorized -> ErrNoPicture
+	_, _, err = m.ProfilePicture(ctx, acctA, userD.String(), "", false)
+	if !errors.Is(err, ErrNoPicture) {
+		t.Fatalf("ProfilePicture userD: got err=%v, want ErrNoPicture", err)
+	}
+}
+
+func TestGroupDetailsUpsertsMembers(t *testing.T) {
+	m, db := newTestManager(t)
+	group := types.NewJID("12345-67890", types.GroupServer)
+	member1 := types.NewJID("6281111111", types.DefaultUserServer)
+	member2LID := types.NewJID("9988776655", types.HiddenUserServer)
+	member2PN := types.NewJID("6282222222", types.DefaultUserServer)
+
+	fa := &fakeClient{
+		groups: map[types.JID]*types.GroupInfo{
+			group: {
+				JID:        group,
+				GroupName:  types.GroupName{Name: "Book Club"},
+				GroupTopic: types.GroupTopic{Topic: "Reading books"},
+				Participants: []types.GroupParticipant{
+					{
+						JID:     member1,
+						IsAdmin: true,
+					},
+					{
+						JID:         member2LID,
+						PhoneNumber: member2PN,
+						IsAdmin:     false,
+					},
+				},
+			},
+		},
+	}
+	m.add(acctA, fa)
+
+	details, err := m.GroupDetails(ctx, acctA, group.String())
+	if err != nil {
+		t.Fatalf("GroupDetails: %v", err)
+	}
+	if details.Subject != "Book Club" || details.Description != "Reading books" {
+		t.Errorf("GroupDetails subject/desc = %q / %q; want %q / %q", details.Subject, details.Description, "Book Club", "Reading books")
+	}
+	if len(details.Members) != 2 {
+		t.Fatalf("GroupDetails members len = %d, want 2", len(details.Members))
+	}
+	if details.Members[0].JID != member1.String() || !details.Members[0].Admin {
+		t.Errorf("Member 0 = %+v, want JID=%s Admin=true", details.Members[0], member1.String())
+	}
+	if details.Members[1].JID != member2LID.String() || details.Members[1].Admin {
+		t.Errorf("Member 1 = %+v, want JID=%s Admin=false", details.Members[1], member2LID.String())
+	}
+
+	people, err := db.People(acctA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peopleMap := make(map[string]store.Person)
+	for _, p := range people {
+		peopleMap[p.JID] = p
+	}
+	p1, ok1 := peopleMap[member1.String()]
+	if !ok1 {
+		t.Errorf("member1 not found in people table")
+	} else if p1.PNJID != member1.String() {
+		// p1 is phone JID
+	}
+	p2, ok2 := peopleMap[member2LID.String()]
+	if !ok2 {
+		t.Errorf("member2 not found in people table")
+	} else if p2.PNJID != member2PN.String() {
+		t.Errorf("member2 PNJID = %q, want %q", p2.PNJID, member2PN.String())
+	}
+}
+
+func TestSendGIFCarriesPreview(t *testing.T) {
+	m, _ := newTestManager(t)
+	fa := &fakeClient{}
+	m.add(acctA, fa)
+	mp4 := filepath.Join(t.TempDir(), "test.mp4")
+	if err := os.WriteFile(mp4, []byte("mp4 bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	preview := []byte("jpeg preview bytes")
+	_, err := m.SendGIF(ctx, acctA, alice.String(), mp4, preview, 320, 240)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fa.sent) != 1 {
+		t.Fatalf("sent messages count = %d, want 1", len(fa.sent))
+	}
+	v := fa.sent[0].GetVideoMessage()
+	if v == nil {
+		t.Fatal("sent message has no VideoMessage")
+	}
+	if !v.GetGifPlayback() {
+		t.Errorf("GifPlayback = false, want true")
+	}
+	if string(v.GetJPEGThumbnail()) != "jpeg preview bytes" {
+		t.Errorf("JPEGThumbnail = %q, want %q", string(v.GetJPEGThumbnail()), "jpeg preview bytes")
+	}
+	if v.GetWidth() != 320 || v.GetHeight() != 240 {
+		t.Errorf("Width x Height = %d x %d, want 320 x 240", v.GetWidth(), v.GetHeight())
+	}
+}
+
+func TestPictureEventResetsAvatarAndEmits(t *testing.T) {
+	m, db := newTestManager(t)
+	fa := &fakeClient{}
+	m.add(acctA, fa)
+
+	// Pre-seed an avatar
+	if err := db.SetAvatar(acctA, alice.String(), "old_pic", 123456); err != nil {
+		t.Fatal(err)
+	}
+
+	var avatarEvents []AvatarEvent
+	m.AddListener(func(e any) {
+		if ae, ok := e.(AvatarEvent); ok {
+			avatarEvents = append(avatarEvents, ae)
+		}
+	})
+
+	evt := &events.Picture{
+		JID: alice,
+	}
+	if err := m.handleEvent(ctx, acctA, fa, evt); err != nil {
+		t.Fatal(err)
+	}
+
+	people, err := db.People(acctA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(people) != 1 || people[0].AvatarID != "" || people[0].AvatarTS != 0 {
+		t.Errorf("expected avatar cleared; got %+v", people)
+	}
+	if len(avatarEvents) != 1 || avatarEvents[0] != (AvatarEvent{AccountID: acctA, JID: alice.String()}) {
+		t.Errorf("expected AvatarEvent; got %+v", avatarEvents)
+	}
+}
+
+func TestAboutReturnsStatus(t *testing.T) {
+	m, _ := newTestManager(t)
+	fa := &fakeClient{
+		userInfo: map[types.JID]types.UserInfo{
+			alice: {Status: "Busy coding"},
+		},
+	}
+	m.add(acctA, fa)
+
+	status, err := m.About(ctx, acctA, alice.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "Busy coding" {
+		t.Errorf("About = %q, want %q", status, "Busy coding")
+	}
+}
+
+func TestFetchPictureAndLimit(t *testing.T) {
+	m, _ := newTestManager(t)
+
+	// 1. Success fetch
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("image-data"))
+	}))
+	defer srv.Close()
+
+	data, err := m.FetchPicture(ctx, srv.URL)
+	if err != nil {
+		t.Fatalf("FetchPicture: %v", err)
+	}
+	if string(data) != "image-data" {
+		t.Errorf("got %q, want %q", string(data), "image-data")
+	}
+
+	// 2. HTTP error
+	errSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer errSrv.Close()
+
+	_, err = m.FetchPicture(ctx, errSrv.URL)
+	if err == nil {
+		t.Fatal("expected error on 404, got nil")
+	}
+
+	// 3. Exceeds 2 MB limit
+	bigSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(make([]byte, (2<<20)+10))
+	}))
+	defer bigSrv.Close()
+
+	_, err = m.FetchPicture(ctx, bigSrv.URL)
+	if err == nil || !strings.Contains(err.Error(), "exceeds 2 MB") {
+		t.Fatalf("expected exceeds 2 MB error, got: %v", err)
+	}
+}
+
+func TestContactsSyncOnConnect(t *testing.T) {
+	m, db := newTestManager(t)
+	bob := types.NewJID("6285555555", types.DefaultUserServer)
+	masked := types.NewJID("6286666666", types.DefaultUserServer)
+
+	fa := &fakeClient{
+		contacts: map[types.JID]types.ContactInfo{
+			alice:  {FullName: "Alice Wonderland"},
+			bob:    {FullName: "Bob Builder"},
+			masked: {FullName: "+62••••••66"},
+		},
+	}
+	m.add(acctA, fa)
+
+	var peopleEvents []PeopleEvent
+	m.AddListener(func(e any) {
+		if pe, ok := e.(PeopleEvent); ok {
+			peopleEvents = append(peopleEvents, pe)
+		}
+	})
+
+	if err := m.handleEvent(ctx, acctA, fa, &events.Connected{}); err != nil {
+		t.Fatal(err)
+	}
+
+	people, err := db.People(acctA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peopleMap := make(map[string]store.Person)
+	for _, p := range people {
+		peopleMap[p.JID] = p
+	}
+	if p, ok := peopleMap[alice.String()]; !ok || p.FullName != "Alice Wonderland" {
+		t.Errorf("alice not synced properly: %+v", p)
+	}
+	if p, ok := peopleMap[bob.String()]; !ok || p.FullName != "Bob Builder" {
+		t.Errorf("bob not synced properly: %+v", p)
+	}
+	if _, ok := peopleMap[masked.String()]; ok {
+		t.Errorf("masked contact should not be synced")
+	}
+	if len(peopleEvents) != 1 || peopleEvents[0].AccountID != acctA {
+		t.Errorf("PeopleEvent count = %d, want 1", len(peopleEvents))
 	}
 }
