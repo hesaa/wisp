@@ -16,6 +16,7 @@ import (
 type LockPage struct {
 	*walk.Composite
 	*kit
+	frame    *walk.Composite
 	pin      *walk.LineEdit
 	status   *label
 	unlock   *button
@@ -70,7 +71,18 @@ func NewLockPage(parent walk.Container, p theme.Palette) (*LockPage, error) {
 		return nil, err
 	}
 	title.mid, hint.mid = true, true
-	if g.pin, err = pinField(g.kit, col, "PIN", g.submit); err != nil {
+	if g.frame, err = walk.NewComposite(col); err != nil { // the field's border: grey, accent while it has focus
+		return nil, err
+	}
+	fl := walk.NewHBoxLayout()
+	if err := setBox(g.frame, fl, walk.Margins{HNear: 2, VNear: 2, HFar: 2, VFar: 2}); err != nil {
+		return nil, err
+	}
+	if g.pin, err = pinField(g.kit, g.frame, "PIN", g.submit); err != nil {
+		return nil, err
+	}
+	g.pin.FocusedChanged().Attach(func() { logErr("lock page border", g.border()) })
+	if err := g.border(); err != nil {
 		return nil, err
 	}
 	if g.status, err = g.newLabel(col, "", 10, 0, toneError, 28); err != nil {
@@ -121,6 +133,15 @@ func NewLockPage(parent walk.Container, p theme.Palette) (*LockPage, error) {
 	return g, nil
 }
 
+// border colours the PIN field's frame: the accent while the box has focus, else grey.
+func (g *LockPage) border() error {
+	hex := g.pal.TextSecondary
+	if g.pin.Focused() {
+		hex = g.pal.Accent
+	}
+	return setBg(g.frame, hex)
+}
+
 // submit hands the typed PIN to OnUnlock; an empty box does nothing.
 func (g *LockPage) submit() {
 	if pin := g.pin.Text(); pin != "" && g.onUnlock != nil && !g.waiting {
@@ -169,6 +190,7 @@ func (g *LockPage) Wait(d time.Duration) {
 		time.AfterFunc(min(left, time.Second), func() { g.Synchronize(tick) })
 	}
 	tick()
+	g.Focus() // the box just lost the focus: the link takes it
 }
 
 // Focus puts the keyboard in the PIN box (on the link while the box is disabled), when the window is
@@ -185,4 +207,4 @@ func (g *LockPage) Focus() {
 }
 
 // SetPalette recolours the page.
-func (g *LockPage) SetPalette(p theme.Palette) error { return g.setPalette(p) }
+func (g *LockPage) SetPalette(p theme.Palette) error { return errors.Join(g.setPalette(p), g.border()) }

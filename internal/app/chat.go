@@ -301,7 +301,7 @@ func (a *App) newChat() {
 		cancel()
 		a.mw.Synchronize(func() {
 			logErr("contacts", err) // the picker still lists the chats
-			if acct != a.v.active {
+			if acct != a.v.active || a.locked {
 				return
 			}
 			logErr("new chat", ui.RunNewChat(a.mw, a.pal, a.side.Model().Chats(), contacts, func(jid string) {
@@ -333,7 +333,7 @@ func (a *App) openStory(sender string) {
 		dropMissingMedia(msgs)
 		a.mw.Synchronize(func() {
 			logErr("status updates", err)
-			if acct != a.v.active || len(msgs) == 0 || a.statusSet != nil {
+			if acct != a.v.active || len(msgs) == 0 || a.statusSet != nil || a.locked {
 				return
 			}
 			a.statusAcct = acct

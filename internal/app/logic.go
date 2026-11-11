@@ -236,6 +236,12 @@ func (p *presenceCtl) sessionLocked(locked bool) {
 	p.update(locked)
 }
 
+// inFront reports whether the user is looking at the main window: on screen, not minimised, in the
+// foreground, and not behind the lock page.
+func inFront(visible, iconic, locked, foreground bool) bool {
+	return visible && !iconic && !locked && foreground
+}
+
 // appLock: the lock page covers the window, so the user is not using Wisp; same as a locked session.
 func (p *presenceCtl) appLock(locked bool) {
 	p.appLocked = locked

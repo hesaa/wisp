@@ -627,6 +627,17 @@ func TestLinkCancellable(t *testing.T) {
 	}
 }
 
+func TestInFront(t *testing.T) {
+	if !inFront(true, false, false, true) {
+		t.Error("visible, in front, unlocked: want in front")
+	}
+	for _, c := range [][4]bool{{false, false, false, true}, {true, true, false, true}, {true, false, true, true}, {true, false, false, false}} {
+		if inFront(c[0], c[1], c[2], c[3]) {
+			t.Errorf("inFront%v = true, want false", c)
+		}
+	}
+}
+
 func TestToastSettingsPrivateWhileLocked(t *testing.T) {
 	cfg := map[string]string{ui.KeyNotifyPrivate: "false", ui.KeyNotifySound: "true"}
 	if s := toastSettings(cfg, true, 2); !s.PrivateMode || !s.Sound || !s.MultiAccount || !s.Enabled {

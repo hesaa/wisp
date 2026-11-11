@@ -310,6 +310,9 @@ func (a *App) restore() {
 // activated: the user is back on the main window; read the open chat. (Presence follows
 // WM_ACTIVATEAPP: see watchActivation.)
 func (a *App) activated() {
+	if a.locked {
+		return // nothing is read behind the lock page
+	}
 	if c := a.v.open; c.jid != "" && a.v.loaded && a.chatUnread(c.jid) > 0 {
 		a.markChatRead(c)
 	}
@@ -318,7 +321,7 @@ func (a *App) activated() {
 // foreground reports whether the user is looking at the window.
 func (a *App) foreground() bool {
 	h := a.mw.Handle()
-	return a.mw.Visible() && !win.IsIconic(h) && win.GetForegroundWindow() == h
+	return inFront(a.mw.Visible(), win.IsIconic(h), a.locked, win.GetForegroundWindow() == h)
 }
 
 // sendPresence broadcasts the presence the window's state calls for (see presenceCtl.update).
@@ -333,6 +336,9 @@ func (a *App) sizeChanged() {
 	if m := win.IsIconic(a.mw.Handle()); m != a.minimized {
 		a.minimized = m
 		a.sendPresence(m)
+		if m {
+			a.lockNow() // locked while minimised: a restore never shows the chats
+		}
 		a.showPage() // pairing stops while minimised
 	}
 }
@@ -468,6 +474,7 @@ func (a *App) lockNow() {
 		return // off, or already locked (a countdown in progress stays)
 	}
 	a.locked = true
+	closeModals(a.mw.Handle()) // Settings, New chat, the status viewer, their dialogs
 	a.closeMedia()
 	a.lockPage.Clear()
 	a.showPage()
@@ -491,6 +498,7 @@ func (a *App) unlock(pin string) {
 		a.lockPage.Clear()
 		a.showPage() // focuses the search box
 		a.presence.appLock(false)
+		a.activated() // the chat in front is read now
 		return
 	}
 	now := time.Now()

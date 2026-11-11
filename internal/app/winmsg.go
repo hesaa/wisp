@@ -46,6 +46,37 @@ func mainWndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 	return win.CallWindowProc(hookedPrev, hwnd, msg, wParam, lParam)
 }
 
+var (
+	user32            = windows.NewLazySystemDLL("user32.dll")
+	enumThreadWindows = user32.NewProc("EnumThreadWindows")
+	modalPtr          = syscall.NewCallback(collectModal)
+	modalOwner        win.HWND // closeModals' arguments and result; UI thread only
+	modals            []win.HWND
+)
+
+func collectModal(h, _ uintptr) uintptr {
+	if w := win.HWND(h); win.IsWindowVisible(w) {
+		for o := win.GetWindow(w, win.GW_OWNER); o != 0; o = win.GetWindow(o, win.GW_OWNER) {
+			if o == modalOwner {
+				modals = append(modals, w)
+				break
+			}
+		}
+	}
+	return 1
+}
+
+// closeModals asks every window this thread shows that is owned (directly or through another
+// dialog) by owner to close: the Settings, New chat and status dialogs, their PIN, file and message
+// boxes. They close once control returns to their message loops.
+func closeModals(owner win.HWND) {
+	modalOwner, modals = owner, nil
+	enumThreadWindows.Call(uintptr(windows.GetCurrentThreadId()), modalPtr, 0)
+	for _, h := range modals {
+		win.PostMessage(h, win.WM_CLOSE, 0, 0)
+	}
+}
+
 // watchActivation subclasses the main window for WM_ACTIVATEAPP and registers it for session lock
 // notifications.
 func (a *App) watchActivation() error {
