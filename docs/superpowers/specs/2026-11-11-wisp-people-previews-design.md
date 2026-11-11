@@ -9,13 +9,16 @@ every control operable by keyboard, nothing shown or fetched behind the lock pag
 
 ## Goal
 
-Five gaps found in the first live test:
+Seven gaps found in the first live test:
 
 1. **Names** — unsaved contacts and group members show as bare internal IDs or numbers.
 2. **Mentions** — a mention shows as `@35893729566783` instead of `@Name`.
 3. **Pictures** — every avatar is initials; no profile or group pictures.
 4. **Details** — there is no way to see a contact's or a group's details.
 5. **Video and GIF previews** — a video or GIF message is a plain "Video" card.
+6. **Chat list preview line** — it is empty when the last message is a photo, sticker or other
+   non-text message.
+7. **Notification sound** — it can only be switched on or off, not chosen.
 
 ## Non-goals
 
@@ -72,6 +75,11 @@ details view, notifications and whole-message copy:
 4. else `Unknown`.
 
 An internal ID is never shown. Groups use their subject, else `Group`.
+
+A stored name that is only a masked number (`+62••••••32`: a `+`, digits and bullet or dot
+characters, as WhatsApp sends for a person whose number it hides) is not a name: it is skipped, so
+the rule falls through to the push name, the number, or `Unknown`. Such names are no longer written
+to `chats.name`.
 
 **Mentions.** `MentionedJID` from the message's context info is stored in `messages.mentions` for
 text and captions. When a bubble's text is built, each `@<user part>` of a mentioned JID becomes
@@ -140,6 +148,29 @@ embedded picture, under the existing 1 MP cap and thumbnail LRU.
 GIFs sent from Wisp carry a preview, width and height from the picked GIF's still image, so they
 show the same way on both sides.
 
+## 6. Chat list preview line
+
+The line under a chat's name is empty today when the last message has no text, because it shows
+the message body only. It shows instead, for the last message:
+
+- its text or caption, when there is one;
+- else a label for its kind: `Photo`, `Video`, `GIF`, `Sticker`, `Voice message`, `Audio`,
+  `Document: <name>`, `This message was deleted`, and `Unsupported message` for anything else;
+- prefixed with `You: ` when you sent it, and in a group with `<sender by the name rule>: ` when
+  someone else did.
+
+One pure function builds the line from the last message (`store.ListChats` returns the message's
+type, sender, own flag and metadata alongside the body); search in the chat list matches it.
+
+## 7. Notification sound choice
+
+Settings › Notifications keeps the `Notification sound` switch and gains, under it, a `Sound`
+choice that is enabled while the switch is on: `Default`, `Message`, `Mail`, `Reminder`, `SMS` —
+the notification sounds Windows offers for toasts (`ms-winsoundevent:Notification.Default`, `.IM`,
+`.Mail`, `.Reminder`, `.SMS`). Choosing one plays it once as a preview. The choice is the global
+setting `notify.sound.name` (default `default`); an unknown stored value falls back to `Default`.
+Windows plays the sound with the toast; Wisp loads no audio code.
+
 ---
 
 ## Components
@@ -154,6 +185,8 @@ show the same way on both sides.
 | `internal/ui/avatars.go` (new) | shared picture LRU; `drawAvatar` draws a picture when there is one |
 | `internal/ui/chatlayout.go`, `chatview.go` | group sender pictures, mention colour, video/GIF preview bubbles, header click and focus |
 | `internal/ui/infoview.go` (new) | details view |
+| `internal/ui/sidebar.go`, `internal/store/messages.go` | chat list preview line for non-text messages |
+| `internal/notify`, `internal/ui/settings*.go` | notification sound choice and its preview |
 | `internal/app` | people in memory, avatar fetch queue, open/close details, lock and page rules |
 
 ## Error handling
@@ -166,7 +199,8 @@ show the same way on both sides.
 
 - Unit tests: name rule (all four steps, LID + phone merge), mention rewriting (stored list, legacy
   digits, unknown ID left alone, surrogate pairs around it), `avatarDue`, migration v1 → v2 on a
-  copy of a v1 database in `t.TempDir()`, member sort, video preview layout choice.
+  copy of a v1 database in `t.TempDir()`, member sort, video preview layout choice, masked-number
+  names skipped, the chat list preview line for every message kind, the sound name mapping.
 - Views: a harness window on a scratch profile with seeded people and pictures, driven only by
   messages to its own window (the live-check rules of the previous plan apply unchanged).
 - With the user's linked account, by the user: pictures appear and refresh, about text, group
