@@ -432,3 +432,24 @@ func (v *view) takeOpenNext(acct string) (jid string, ok bool) {
 	v.openNext = chatRef{}
 	return jid, true
 }
+
+// page is what fills the main window.
+type page int
+
+const (
+	pageChats page = iota // rail, chat list and chat column
+	pageLink              // linking a phone
+	pageLock              // the lock screen
+)
+
+// pageFor picks the page: the lock covers everything, then linking (no account yet, or the user
+// is adding one), else the chats.
+func pageFor(accounts int, locked, adding bool) page {
+	switch {
+	case locked:
+		return pageLock
+	case accounts == 0 || adding:
+		return pageLink
+	}
+	return pageChats
+}

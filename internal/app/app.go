@@ -84,7 +84,10 @@ type App struct {
 	inflight   inflight
 	statusSet  func(id, path string) // the open status viewer's SetMediaPath; nil while none is open
 	statusAcct string
-	pairing    bool
+	right      *walk.Composite // the chat column
+	link       *ui.LinkPage
+	adding     bool // the user asked to link another account
+	locked     bool // the lock page covers the window (Task 5)
 	exiting    bool
 	minimized  bool // as sizeChanged last saw the window
 }
@@ -148,6 +151,7 @@ func (a *App) build() error {
 	if err != nil {
 		return err
 	}
+	a.right = right
 	rl := walk.NewVBoxLayout()
 	if err := errors.Join(rl.SetMargins(walk.Margins{}), rl.SetSpacing(0), right.SetLayout(rl), l.SetStretchFactor(right, 1000)); err != nil {
 		return err
@@ -164,6 +168,13 @@ func (a *App) build() error {
 	if err := errors.Join(rl.SetStretchFactor(a.empty, 1000), rl.SetStretchFactor(a.chat, 1000)); err != nil {
 		return err
 	}
+	if a.link, err = ui.NewLinkPage(mw, p, func(ctx context.Context) (<-chan whatsmeow.QRChannelItem, error) { return a.mgr.Pair(ctx) }); err != nil {
+		return err
+	}
+	if err := l.SetStretchFactor(a.link, 1000); err != nil {
+		return err
+	}
+	a.link.OnCancel(func() { a.adding = false; a.showPage() })
 	a.showChatPane(false)
 	a.chat.SetAutoDownload(a.cfg[ui.KeyAutoDownloadImages] == "true")
 
@@ -193,7 +204,7 @@ func (a *App) build() error {
 }
 
 // Attach connects mgr: the saved proxy first, then the event listener, then every saved account
-// (in the background). With no account at all the pairing dialog opens.
+// (in the background). With no account at all the link page shows.
 func (a *App) Attach(mgr Backend) {
 	a.mgr = mgr
 	logErr("proxy", mgr.SetProxy(a.cfg[ui.KeyProxy])) // ValidateProxy errors never repeat the address
@@ -209,9 +220,6 @@ func (a *App) Attach(mgr Backend) {
 		a.mw.Synchronize(func() {
 			logErr("sessions", err)
 			a.refreshAccounts()
-			if len(a.rail.Model().Accounts()) == 0 {
-				a.pair()
-			}
 		})
 	}()
 }
@@ -369,7 +377,7 @@ func (a *App) nav(n ui.Nav) {
 func (a *App) applyTheme(mode theme.ThemeMode) {
 	a.pal = theme.GetPalette(mode)
 	logErr("theme", errors.Join(a.rail.SetPalette(a.pal), a.side.SetPalette(a.pal), a.chat.SetPalette(a.pal),
-		a.bar.SetPalette(a.pal), a.empty.SetPalette(a.pal)))
+		a.bar.SetPalette(a.pal), a.empty.SetPalette(a.pal), a.link.SetPalette(a.pal)))
 	logErr("title bar", theme.ApplyTitleBar(uintptr(a.mw.Handle()), theme.Resolve(mode) == theme.ThemeDark))
 }
 
@@ -393,17 +401,25 @@ func (a *App) settingChanged(key string) {
 	}
 }
 
-// pair runs the QR pairing dialog; the paired account arrives as a ConnectionEvent.
+// pair shows the link page over the chats; the paired account arrives as a ConnectionEvent.
 func (a *App) pair() {
-	if a.pairing {
-		return
+	a.adding = true
+	a.showPage()
+}
+
+// showPage shows exactly one page: the chats, the link page or the lock page.
+func (a *App) showPage() {
+	pg := pageFor(len(a.rail.Model().Accounts()), a.locked, a.adding)
+	chats := pg == pageChats
+	a.rail.SetVisible(chats)
+	a.side.SetVisible(chats)
+	a.right.SetVisible(chats)
+	if pg == pageLink {
+		a.link.Show(a.adding)
+	} else {
+		a.link.Hide()
 	}
-	a.pairing = true
-	defer func() { a.pairing = false }()
-	if _, err := ui.RunQRDialog(a.mw, a.pal, a.mgr.Pair); err != nil {
-		logErr("pairing", err)
-		a.alert("The pairing window could not open: " + err.Error())
-	}
+	// pageLock: the lock page widget shows here (Task 5); until then the slot stays empty
 }
 
 // alert shows a problem the user should know about over the window in front.

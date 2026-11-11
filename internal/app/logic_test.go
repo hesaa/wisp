@@ -577,3 +577,30 @@ func TestDropMissingMedia(t *testing.T) {
 		t.Fatalf("after: %+v", msgs)
 	}
 }
+
+func TestPageFor(t *testing.T) {
+	cases := []struct {
+		accounts int
+		locked   bool
+		adding   bool
+		want     page
+	}{
+		{0, false, false, pageLink}, {1, false, false, pageChats}, {1, false, true, pageLink},
+		{0, true, false, pageLock}, {2, true, true, pageLock}, {2, false, false, pageChats},
+	}
+	for _, c := range cases {
+		if got := pageFor(c.accounts, c.locked, c.adding); got != c.want {
+			t.Errorf("pageFor(%d, %v, %v) = %v, want %v", c.accounts, c.locked, c.adding, got, c.want)
+		}
+	}
+}
+
+// Two accounts, one logs out: the chats stay; the last one logs out: the link page shows.
+func TestPageAfterLogouts(t *testing.T) {
+	if got := pageFor(1, false, false); got != pageChats {
+		t.Errorf("one account left: %v, want pageChats", got)
+	}
+	if got := pageFor(0, false, false); got != pageLink {
+		t.Errorf("none left: %v, want pageLink", got)
+	}
+}

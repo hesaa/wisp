@@ -111,6 +111,8 @@ func (a *App) onConnection(e whatsapp.ConnectionEvent) {
 	case whatsapp.StatePaired:
 		a.refreshAccounts()
 		a.rail.Model().SetActive(e.AccountID)
+		a.adding = false
+		a.showPage()
 	case whatsapp.StateLoggedOut:
 		log.Printf("app: +%s logged out (%s)", e.AccountID, e.Detail)
 		a.refreshAccounts() // the rail drops it and picks another active account
@@ -144,6 +146,7 @@ func (a *App) refreshAccounts() {
 		hint = "Link your phone with the + button on the left to start."
 	}
 	a.empty.SetHint(hint)
+	a.showPage()
 }
 
 // accountChanged switches the window to acct ("" when no account is left): the chat pane empties

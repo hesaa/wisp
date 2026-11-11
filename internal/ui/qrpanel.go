@@ -5,7 +5,6 @@ import (
 	"errors"
 
 	"github.com/lxn/walk"
-	"github.com/lxn/win"
 	"go.mau.fi/whatsmeow"
 	"rsc.io/qr"
 
@@ -14,32 +13,26 @@ import (
 )
 
 // PairFunc starts linking a phone, as whatsapp.Manager.Pair does: the channel carries the QR codes
-// and then the outcome. It blocks on the network, so the dialog calls it off the UI thread.
+// and then the outcome. It blocks on the network, so the panel calls it off the UI thread.
 type PairFunc func(ctx context.Context) (<-chan whatsmeow.QRChannelItem, error)
 
-// Sizes in 1/96 inch.
-const (
-	qrDlgW = 420
-	qrDlgH = 590
-	qrSide = 310 // the code's square: 5 px modules for a typical code at 96 DPI
-)
+// qrSide is the code's square in 1/96 inch: 5 px modules for a typical code at 96 DPI.
+const qrSide = 310
 
 const (
 	qrQuiet   = 4  // the white margin around a QR code, in modules, that scanners need
 	qrTypical = 53 // modules across a WhatsApp code (version 9); the placeholder takes its size
 )
 
-const qrSteps = "Open WhatsApp on your phone › Linked devices › Link a device, then point the phone at this code."
-
-// qrView is what the pairing dialog shows at one moment.
+// qrView is what the QR panel shows at one moment.
 type qrView struct {
 	code   string // QR payload to draw; "" for none
 	status string // the line under the steps
 	failed bool   // offer Try again
-	done   bool   // linked: the dialog closes
+	done   bool   // linked: the app swaps the page
 }
 
-// qrStep is the view for an item of the pairing channel; ok is false for items the dialog does not
+// qrStep is the view for an item of the pairing channel; ok is false for items the panel does not
 // handle (passkey prompts).
 func qrStep(it whatsmeow.QRChannelItem) (v qrView, ok bool) {
 	failed := func(status string) (qrView, bool) { return qrView{failed: true, status: status}, true }
@@ -124,160 +117,126 @@ func qrRects(n int, black func(x, y int) bool, box walk.Rectangle) (paper walk.R
 	return paper, dark
 }
 
-// qrDialog is the open pairing dialog. UI thread only.
-type qrDialog struct {
-	*walk.Dialog
+// QRPanel pairs a phone through a PairFunc: it shows each QR code as it comes (always dark on white,
+// for scanners), a status line, and on a timeout or error says why and offers Try again. It pairs
+// only between Start and Stop. UI thread only.
+type QRPanel struct {
+	*walk.Composite
 	*kit
-	pair      PairFunc
-	code      *qr.Code // nil: no code to show
-	canvas    *walk.CustomWidget
-	status    *label
-	retry     *button
-	cancelBtn *button
-	cancel    context.CancelFunc // ends the running attempt
-	gen       int                // per attempt: views of an earlier one are dropped
-	linked    bool
+	pair   PairFunc
+	code   *qr.Code // nil: no code to show
+	canvas *walk.CustomWidget
+	status *label
+	retry  *button
+	cancel context.CancelFunc // ends the running attempt
+	gen    int                // per attempt: views of an earlier one are dropped
 }
 
-// RunQRDialog shows the modal "Link a device" dialog over owner and pairs a phone through pair: it
-// shows each QR code as it comes (always dark on white, for scanners), closes once linked, and on a
-// timeout or error says why and offers Try again. Cancel, Esc or closing it stop the pairing. It
-// reports whether a phone was linked. UI thread only.
-func RunQRDialog(owner walk.Form, p theme.Palette, pair PairFunc) (linked bool, err error) {
-	dlg, err := walk.NewDialogWithFixedSize(owner)
+// NewQRPanel creates the panel in parent; nothing is paired until Start.
+func NewQRPanel(parent walk.Container, p theme.Palette, pair PairFunc) (*QRPanel, error) {
+	c, err := walk.NewComposite(parent)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	defer dlg.Dispose()
-	d := &qrDialog{Dialog: dlg, kit: &kit{pal: p}, pair: pair}
-	if err := d.build(); err != nil {
-		return false, err
-	}
-	d.start()
-	dlg.Run()
-	d.stop()
-	return d.linked, nil
-}
-
-func (d *qrDialog) build() error {
-	dlg := d.Dialog
+	q := &QRPanel{Composite: c, kit: &kit{pal: p}, pair: pair}
 	l := walk.NewVBoxLayout()
-	if err := errors.Join(dlg.SetTitle("Link a device"), setBox(dlg, l, walk.Margins{HNear: 28, VNear: 20, HFar: 28, VFar: 20}),
-		l.SetSpacing(10), d.themed(dlg, false),
-		dlg.SetMinMaxSize(walk.Size{Width: qrDlgW, Height: qrDlgH}, walk.Size{Width: qrDlgW, Height: qrDlgH})); err != nil {
-		return err
+	if err := errors.Join(setBox(c, l, walk.Margins{}), l.SetSpacing(10), q.themed(c, false)); err != nil {
+		return nil, err
 	}
-	if _, err := d.newLabel(dlg, "Use WhatsApp on this PC", 15, walk.FontBold, toneText, 32); err != nil {
-		return err
+	if _, err := walk.NewVSpacer(c); err != nil {
+		return nil, err
 	}
-	cw, err := newCanvas(dlg, d.paintCode)
+	cw, err := newCanvas(c, q.paintCode)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	d.canvas = cw
+	q.canvas = cw
 	if err := errors.Join(cw.SetMinMaxSize(walk.Size{Height: qrSide}, walk.Size{Height: qrSide}),
 		cw.Accessibility().SetRole(walk.AccRoleGraphic), cw.Accessibility().SetName("QR code to link your phone")); err != nil {
-		return err
+		return nil, err
 	}
-	if _, err := d.newLabel(dlg, qrSteps, 10, 0, toneText, 44); err != nil {
-		return err
+	if _, err = q.newLabel(c, "The code refreshes on its own", 10, 0, toneSecondary, 24); err != nil {
+		return nil, err
 	}
-	if d.status, err = d.newLabel(dlg, "", 9, 0, toneSecondary, 40); err != nil {
-		return err
+	if q.status, err = q.newLabel(c, "", 9, 0, toneSecondary, 40); err != nil {
+		return nil, err
 	}
-	if _, err := walk.NewVSpacer(dlg); err != nil {
-		return err
-	}
-	row, err := d.newRow(dlg, fieldH)
+	row, err := q.newRow(c, fieldH)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if _, err := walk.NewHSpacer(row); err != nil {
-		return err
+		return nil, err
 	}
-	if d.retry, err = d.newButton(row, "Try again", btnPrimary, 110, d.start); err != nil {
-		return err
+	if q.retry, err = q.newButton(row, "Try again", btnPrimary, 110, q.Start); err != nil {
+		return nil, err
 	}
-	if d.cancelBtn, err = d.newButton(row, "Cancel", btnPlain, 100, dlg.Cancel); err != nil {
-		return err
+	if _, err := walk.NewHSpacer(row); err != nil {
+		return nil, err
 	}
-	// walk routes Esc (IDCANCEL) only to a cancel button; this one stays hidden
-	esc, err := walk.NewPushButton(dlg)
-	if err != nil {
-		return err
+	q.retry.SetVisible(false)
+	if _, err := walk.NewVSpacer(c); err != nil {
+		return nil, err
 	}
-	esc.SetVisible(false)
-	esc.Clicked().Attach(dlg.Cancel)
-	if err := dlg.SetCancelButton(esc); err != nil {
-		return err
-	}
-	// the focus can only be set once the dialog shows
-	dlg.Starting().Attach(func() { dlg.Synchronize(func() { focusOn(d.cancelBtn) }) })
-	// focus cues follow the user's setting and last input (hidden after a click until a key is used)
-	dlg.SendMessage(win.WM_CHANGEUISTATE, win.UIS_INITIALIZE, 0)
-	// cosmetic: Windows builds without dark title bars keep a light one
-	logErr("pairing title bar", theme.ApplyTitleBar(uintptr(dlg.Handle()), isDark(d.pal)))
-	return nil
+	return q, nil
 }
 
-// start begins a pairing attempt, ending the one before.
-func (d *qrDialog) start() {
-	d.stop()
+// SetPalette recolours the panel; the code itself stays dark on white.
+func (q *QRPanel) SetPalette(p theme.Palette) error { return q.setPalette(p) }
+
+// Start begins a pairing attempt, ending the one before.
+func (q *QRPanel) Start() {
+	q.Stop()
 	ctx, cancel := context.WithCancel(context.Background())
-	d.cancel = cancel
-	gen := d.gen
-	d.show(qrView{status: "Connecting to WhatsApp…"})
-	go pairing(ctx, d.pair, d.Synchronize, func(v qrView) {
-		if gen == d.gen { // still this attempt, and the dialog is open
-			d.show(v)
+	q.cancel = cancel
+	gen := q.gen
+	q.show(qrView{status: "Connecting to WhatsApp…"})
+	go pairing(ctx, q.pair, q.Synchronize, func(v qrView) {
+		if gen == q.gen { // still this attempt
+			q.show(v)
 		}
 	})
 }
 
-// stop ends the running attempt; views it already queued are dropped.
-func (d *qrDialog) stop() {
-	if d.cancel != nil {
-		d.cancel()
+// Stop ends the running attempt; views it already queued are dropped.
+func (q *QRPanel) Stop() {
+	if q.cancel != nil {
+		q.cancel()
+		q.cancel = nil
 	}
-	d.gen++
+	q.gen++
 }
 
-func (d *qrDialog) show(v qrView) {
+func (q *QRPanel) show(v qrView) {
+	q.code = nil
 	if v.done {
-		d.linked = true
-		d.Accept()
-		return
+		v = qrView{status: "Linked."}
 	}
-	d.code = nil
 	if v.code != "" {
 		c, err := qr.Encode(v.code, qr.L)
 		if err != nil {
 			v = qrView{failed: true, status: "The code could not be drawn: " + err.Error()}
 		} else {
-			d.code = c
+			q.code = c
 		}
 	}
-	tone, closeText := toneSecondary, "Cancel"
+	tone := toneSecondary
 	if v.failed {
-		tone, closeText = toneError, "Close"
+		tone = toneError
 	}
-	d.status.set(v.status, tone)
-	if !v.failed && d.retry.Focused() { // it is about to hide
-		focusOn(d.cancelBtn)
-	}
-	d.retry.SetVisible(v.failed)
-	d.cancelBtn.text = closeText
-	logErr("pairing repaint", errors.Join(d.cancelBtn.Accessibility().SetName(closeText), d.cancelBtn.Invalidate(), d.canvas.Invalidate()))
+	q.status.set(v.status, tone)
+	q.retry.SetVisible(v.failed)
+	logErr("pairing repaint", q.canvas.Invalidate())
 	if v.failed {
-		focusOn(d.retry)
+		focusOn(q.retry)
 	}
 }
 
 // paintCode draws the code dark on white in both themes (scanners need the contrast), or a quiet
 // placeholder of the same size while there is none.
-func (d *qrDialog) paintCode(c *walk.Canvas, _ walk.Rectangle) error {
-	b := d.canvas.ClientBoundsPixels()
-	bg, err := brushFor(d.pal.Sidebar)
+func (q *QRPanel) paintCode(c *walk.Canvas, _ walk.Rectangle) error {
+	b := q.canvas.ClientBoundsPixels()
+	bg, err := brushFor(q.pal.Sidebar)
 	if err != nil {
 		return err
 	}
@@ -286,9 +245,9 @@ func (d *qrDialog) paintCode(c *walk.Canvas, _ walk.Rectangle) error {
 	}
 	side := min(b.Width, b.Height)
 	box := walk.Rectangle{X: (b.Width - side) / 2, Y: (b.Height - side) / 2, Width: side, Height: side}
-	if d.code == nil {
+	if q.code == nil {
 		paper, _ := qrRects(qrTypical, func(int, int) bool { return false }, box)
-		return icons.FillRounded(c, paper, d.canvas.IntFrom96DPI(12), theme.Color(d.pal.Header))
+		return icons.FillRounded(c, paper, q.canvas.IntFrom96DPI(12), theme.Color(q.pal.Header))
 	}
 	white, err := brushFor("#ffffff")
 	if err != nil {
@@ -298,7 +257,7 @@ func (d *qrDialog) paintCode(c *walk.Canvas, _ walk.Rectangle) error {
 	if err != nil {
 		return err
 	}
-	paper, dark := qrRects(d.code.Size, d.code.Black, box)
+	paper, dark := qrRects(q.code.Size, q.code.Black, box)
 	if err := c.FillRectanglePixels(white, paper); err != nil {
 		return err
 	}
