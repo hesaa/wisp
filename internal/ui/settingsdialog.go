@@ -787,14 +787,6 @@ func confirm(owner walk.Form, p theme.Palette, question, text, action string) (b
 	return dlg.Run() == walk.DlgCmdOK, nil
 }
 
-// focusOn gives w the keyboard focus. walk's SetFocus reports a failure whenever no window had the
-// focus before (so whenever a dialog opens), so the outcome is checked instead.
-func focusOn(w walk.Window) {
-	if win.SetFocus(w.Handle()); win.GetFocus() != w.Handle() {
-		logErr("focus", errors.New("ui: SetFocus failed"))
-	}
-}
-
 // escCloses makes Esc cancel dlg: walk routes Esc (IDCANCEL) only to a cancel button, so it gets a
 // hidden one.
 func escCloses(dlg *walk.Dialog) error {
@@ -895,7 +887,7 @@ func (k *kit) control(parent walk.Container, size walk.Size, role walk.AccRole, 
 			return
 		}
 		act := hit(x, y)
-		logErr("focus", cw.SetFocus())
+		focusOn(cw)
 		if act != nil {
 			act()
 		}

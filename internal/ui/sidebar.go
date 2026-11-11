@@ -239,7 +239,7 @@ func (s *Sidebar) SetStories(st []store.Story) {
 }
 
 // FocusSearch puts the keyboard focus in the search box.
-func (s *Sidebar) FocusSearch() error { return s.search.edit.SetFocus() }
+func (s *Sidebar) FocusSearch() { focusOn(s.search.edit) }
 
 // OnChatSelected sets the handler of a click on a chat row (the row is selected first).
 func (s *Sidebar) OnChatSelected(fn func(jid string)) { s.onChat = fn }
@@ -302,7 +302,7 @@ func (s *Sidebar) newHeader() (*walk.CustomWidget, error) {
 		if b != walk.LeftButton {
 			return
 		}
-		logErr("focus", h.SetFocus())
+		focusOn(h)
 		if onButton(x) {
 			newChat()
 		}
@@ -352,7 +352,7 @@ func newStoryStrip(parent walk.Container, pal *theme.Palette) (*storyStrip, erro
 		if i >= 0 {
 			st.setFocus(i)
 		}
-		logErr("focus", cw.SetFocus())
+		focusOn(cw)
 		if i >= 0 {
 			st.open(i)
 		}
@@ -640,7 +640,7 @@ func searchKeys(edit *walk.LineEdit, l *chatList) {
 	edit.KeyDown().Attach(func(k walk.Key) {
 		switch {
 		case k == walk.KeyDown && len(l.rows) > 0:
-			logErr("focus", l.SetFocus())
+			focusOn(l)
 			showFocusCues(l.Handle())
 		case k == walk.KeyReturn:
 			l.openFirstVisible()
@@ -670,7 +670,7 @@ func (l *chatList) mouseDown(x, y int, b walk.MouseButton) {
 	if i >= 0 {
 		l.setFocus(i)
 	}
-	logErr("focus", l.SetFocus())
+	focusOn(l)
 	if i >= 0 {
 		l.open(i)
 	}

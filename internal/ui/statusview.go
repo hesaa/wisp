@@ -587,7 +587,7 @@ func (d *statusDialog) build() error {
 	})
 	dlg.Starting().Attach(func() {
 		c.start()
-		cw.Synchronize(func() { logErr("status focus", cw.SetFocus()) }) // once the window is shown
+		cw.Synchronize(func() { focusOn(cw) }) // once the window is shown
 	})
 	// focus cues follow the user's setting and last input (hidden after a click until a key is used)
 	dlg.SendMessage(win.WM_CHANGEUISTATE, win.UIS_INITIALIZE, 0)
@@ -631,7 +631,7 @@ func (d *statusDialog) mouseDown(x, y int, b walk.MouseButton) {
 		return
 	}
 	hit := d.geom().hit(x, y)
-	logErr("status focus", d.canvas.SetFocus())
+	focusOn(d.canvas)
 	switch hit {
 	case hitClose:
 		d.Cancel()

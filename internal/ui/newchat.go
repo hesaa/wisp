@@ -64,7 +64,7 @@ func RunNewChat(owner walk.Form, p theme.Palette, chats []store.Chat, contacts [
 	}
 	list.onClick = pick
 	searchKeys(search.edit, list)
-	dlg.Starting().Attach(func() { logErr("new chat focus", search.edit.SetFocus()) })
+	dlg.Starting().Attach(func() { focusOn(search.edit) })
 	// focus cues follow the user's setting and last input (hidden after a click until a key is used)
 	dlg.SendMessage(win.WM_CHANGEUISTATE, win.UIS_INITIALIZE, 0)
 	// cosmetic: Windows builds without dark title bars keep a light one

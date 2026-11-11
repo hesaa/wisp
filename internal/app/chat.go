@@ -34,7 +34,7 @@ func (a *App) openChat(acct, jid, name string) {
 		if a.chatUnread(jid) > 0 {
 			a.markChatRead(c)
 		}
-		logErr("focus", a.bar.SetFocus())
+		a.bar.Focus()
 		return
 	}
 	if name == "" {
@@ -43,7 +43,7 @@ func (a *App) openChat(acct, jid, name string) {
 	a.bar.Reset() // before the switch: it may still tell the chat being left that typing stopped
 	a.loadChat(c, name)
 	a.showChatPane(true)
-	logErr("focus", a.bar.SetFocus())
+	a.bar.Focus()
 }
 
 // loadChat shows c in the chat view from its newest page, read off the UI thread once disappeared

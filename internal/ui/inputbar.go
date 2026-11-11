@@ -131,8 +131,8 @@ func (b *InputBar) Reset() {
 // fires.
 func (b *InputBar) Restore(text string) { b.composer.restore(text) }
 
-// SetFocus puts the keyboard focus in the message box.
-func (b *InputBar) SetFocus() error { return b.edit.SetFocus() }
+// Focus puts the keyboard focus in the message box.
+func (b *InputBar) Focus() { focusOn(b.edit) }
 
 // SetEnabled enables or disables the whole bar.
 func (b *InputBar) SetEnabled(enabled bool) {
@@ -167,7 +167,7 @@ func (b *InputBar) newButton(name string, icon icons.Icon, act func()) (*walk.Cu
 	}
 	cw.MouseDown().Attach(func(_, _ int, btn walk.MouseButton) {
 		if btn == walk.LeftButton { // the whole widget is the button: nothing to resolve first
-			logErr("focus", cw.SetFocus())
+			focusOn(cw)
 			act()
 		}
 	})
@@ -213,7 +213,7 @@ func (b *InputBar) edited() {
 // sendNow sends the box's text (Enter or the Send button) and leaves the focus in the box.
 func (b *InputBar) sendNow() {
 	b.send()
-	logErr("focus", b.edit.SetFocus())
+	focusOn(b.edit)
 }
 
 // fit sizes the bar for the box's display lines, one to inputMaxLines. While every line fits, the

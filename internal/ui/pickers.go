@@ -74,11 +74,11 @@ func (b *InputBar) pickEmoji() {
 		picked = i
 		p.Accept()
 	}
-	p.Starting().Attach(func() { logErr("emoji focus", grid.SetFocus()) })
+	p.Starting().Attach(func() { focusOn(grid) })
 	b.runPopup(p)
 	if picked >= 0 {
 		b.edit.ReplaceSelectedText(emojis[picked], true)
-		logErr("focus", b.edit.SetFocus())
+		focusOn(b.edit)
 	}
 }
 
@@ -156,15 +156,15 @@ func (b *InputBar) pickGIF() {
 		case k == walk.KeyReturn:
 			g.run()
 		case k == walk.KeyDown && g.grid.n > 0:
-			logErr("focus", g.grid.SetFocus())
+			focusOn(g.grid)
 			showFocusCues(g.grid.Handle())
 		}
 	})
-	p.Starting().Attach(func() { logErr("GIF focus", g.search.edit.SetFocus()) })
+	p.Starting().Attach(func() { focusOn(g.search.edit) })
 	b.runPopup(p)
 	if picked != "" && b.onSendGIF != nil {
 		b.onSendGIF(picked)
-		logErr("focus", b.edit.SetFocus())
+		focusOn(b.edit)
 	}
 }
 
@@ -497,7 +497,7 @@ func (g *cellGrid) mouseDown(x, y int, b walk.MouseButton) {
 	if i >= 0 {
 		g.setFocus(i)
 	}
-	logErr("focus", g.SetFocus())
+	focusOn(g)
 	if i >= 0 {
 		g.pick(i)
 	}

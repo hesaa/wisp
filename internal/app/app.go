@@ -184,7 +184,7 @@ func (a *App) build() error {
 	mw.Activating().Attach(a.activated)
 	mw.SizeChanged().Attach(a.sizeChanged)
 	// the focus can only be set once the window runs; the search box takes it, without a focus ring
-	mw.Starting().Attach(func() { mw.Synchronize(func() { logErr("focus", a.side.FocusSearch()) }) })
+	mw.Starting().Attach(func() { mw.Synchronize(func() { a.side.FocusSearch() }) })
 	mw.SendMessage(win.WM_CHANGEUISTATE, win.UIS_INITIALIZE, 0)
 	logErr("presence", a.watchActivation()) // without it presence stays unavailable
 	// cosmetic: Windows builds without dark title bars keep a light one
@@ -354,7 +354,7 @@ func (a *App) typingWorker() {
 func (a *App) nav(n ui.Nav) {
 	switch n {
 	case ui.NavChats:
-		logErr("focus", a.side.FocusSearch())
+		a.side.FocusSearch()
 	case ui.NavStatus:
 		if len(a.stories) > 0 {
 			a.openStory(a.stories[0].SenderJID)

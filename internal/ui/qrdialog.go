@@ -212,7 +212,7 @@ func (d *qrDialog) build() error {
 		return err
 	}
 	// the focus can only be set once the dialog shows
-	dlg.Starting().Attach(func() { dlg.Synchronize(func() { logErr("pairing focus", d.cancelBtn.SetFocus()) }) })
+	dlg.Starting().Attach(func() { dlg.Synchronize(func() { focusOn(d.cancelBtn) }) })
 	// focus cues follow the user's setting and last input (hidden after a click until a key is used)
 	dlg.SendMessage(win.WM_CHANGEUISTATE, win.UIS_INITIALIZE, 0)
 	// cosmetic: Windows builds without dark title bars keep a light one
@@ -263,13 +263,13 @@ func (d *qrDialog) show(v qrView) {
 	}
 	d.status.set(v.status, tone)
 	if !v.failed && d.retry.Focused() { // it is about to hide
-		logErr("pairing focus", d.cancelBtn.SetFocus())
+		focusOn(d.cancelBtn)
 	}
 	d.retry.SetVisible(v.failed)
 	d.cancelBtn.text = closeText
 	logErr("pairing repaint", errors.Join(d.cancelBtn.Accessibility().SetName(closeText), d.cancelBtn.Invalidate(), d.canvas.Invalidate()))
 	if v.failed {
-		logErr("pairing focus", d.retry.SetFocus())
+		focusOn(d.retry)
 	}
 }
 

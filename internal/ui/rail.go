@@ -299,7 +299,7 @@ func (r *Rail) click(x, y int, button walk.MouseButton) {
 	if ok {
 		r.focusOn(slices.IndexFunc(r.targets(), func(t railItem) bool { return t.r == it.r }))
 	}
-	logErr("focus", r.SetFocus())
+	focusOn(r)
 	if ok {
 		r.activate(it)
 	}

@@ -609,7 +609,7 @@ func (v *ChatView) mouseDown(x, y int, b walk.MouseButton) {
 	if i >= 0 {
 		v.setFocus(i)
 	}
-	logErr("focus", v.canvas.SetFocus())
+	focusOn(v.canvas)
 	if i < 0 {
 		return
 	}

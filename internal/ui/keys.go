@@ -11,6 +11,14 @@ import (
 	"wa-go/internal/ui/icons"
 )
 
+// focusOn gives w the keyboard focus. walk's SetFocus reports a failure whenever no window had the
+// focus before (so whenever a dialog opens), so the outcome is checked instead.
+func focusOn(w walk.Window) {
+	if win.SetFocus(w.Handle()); win.GetFocus() != w.Handle() {
+		logErr("focus", errors.New("ui: SetFocus failed"))
+	}
+}
+
 // navigate returns where keyboard focus moves from item cur (-1: none) among n items for key k:
 // Up/Left and Down/Right step, PgUp/PgDn move page items, Home/End jump to the ends. With wrap,
 // stepping past an end continues at the other one; paging and Home/End never wrap. It returns -1
