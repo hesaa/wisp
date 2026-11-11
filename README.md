@@ -25,10 +25,38 @@ key and you can enter one later in Settings › Media & Storage.
 
 ## Run and link a phone
 
-Start `wisp.exe`. On the first run the pairing window shows a QR code: on your phone open
-WhatsApp › Settings › Linked devices › Link a device and scan it; the phone then lists it as
-"Wisp". Add more accounts later with the **+** button on the rail. Only one Wisp runs at a time;
-starting it again brings the open one to the front.
+Start `wisp.exe`. With no account linked, the whole window is the link page: the steps on the left
+and a QR code on the right. On your phone open WhatsApp › Settings › Linked devices › Link a device
+and point it at the code; the phone then lists it as "Wisp". The code refreshes on its own, and
+**Try again** appears when it expires. Add more accounts later with the **+** button on the rail,
+which shows the same page with a **Cancel** button. Only one Wisp runs at a time; starting it again
+brings the open one to the front.
+
+## App lock
+
+Settings › Privacy & Security has an optional **App lock**, off by default. **Set PIN** asks for a
+4–8 digit PIN twice; **Change PIN** and **Turn off** ask for the current one first.
+
+With the lock on, Wisp shows a lock page instead of your chats at start-up, when you restore it
+from the tray or from minimised, and when Windows locks. Accounts stay connected while it is locked,
+but notifications show only "New message", and you count as not using Wisp, so you don't appear
+online. After 5 wrong PINs the box is disabled for 30 seconds, doubling after every further 5.
+
+**Forgot your PIN?** **Reset Wisp** on the lock page, after a confirmation, logs out every account,
+deletes the chats, sessions and downloaded media from this PC and starts Wisp afresh on the link
+page. It keeps `wisp.log`. If the logout can't reach WhatsApp, the phone may still list the device:
+remove it under Linked devices.
+
+The lock hides Wisp's window; it doesn't encrypt Wisp's files.
+
+## Media and copying
+
+Photos, stickers, videos and GIFs open inside Wisp: a single click (or Enter) on one opens it.
+Audio and documents open in their usual program, on double-click or Enter.
+
+Drag across message text to select it, then Ctrl+C to copy; Esc clears the selection. Ctrl+click,
+Shift+click or Shift+↑↓ pick whole messages, and Ctrl+C copies them. Right-click, the Menu key or
+Shift+F10 opens a menu with **Copy** and **Select**. Copying is text only.
 
 ## Your data
 
@@ -64,5 +92,7 @@ under Linked devices on your phone (or use Log out in Settings first).
 - No voice or video calls, and you cannot post a status (you can view them).
 - Avatars are initials, not profile photos.
 - Reactions are not shown.
+- In right-to-left and shaped scripts (Arabic, Hebrew, Indic) the selection highlight may sit
+  slightly off the text.
 - The GIPHY key built into `wisp.exe` can be extracted from the file: do not share builds made with
   your personal key.
