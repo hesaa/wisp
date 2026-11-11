@@ -91,6 +91,7 @@ func (s span) firstFull() int {
 type keyHook struct {
 	prev  uintptr // the window procedure walk installed
 	onKey func(walk.Key) bool
+	esc   func() bool // whether onKey takes Esc now (takeEscape); nil: never
 }
 
 var (
@@ -104,8 +105,8 @@ func keyHookProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 	case win.WM_GETDLGCODE:
 		// walk's message loop runs IsDialogMessage, which spends arrows and Enter on moving focus
 		// between controls, and typed characters on mnemonics, unless the focused window asks for
-		// them; Tab and Esc keep working.
-		if wParam == win.VK_RETURN {
+		// them; Tab keeps working, and so does Esc (Cancel) unless the widget takes it now.
+		if wParam == win.VK_RETURN || wParam == win.VK_ESCAPE && h.esc != nil && h.esc() {
 			return win.DLGC_WANTARROWS | win.DLGC_WANTCHARS | win.DLGC_WANTALLKEYS
 		}
 		return win.DLGC_WANTARROWS | win.DLGC_WANTCHARS
@@ -142,6 +143,9 @@ func focusable(cw *walk.CustomWidget, role walk.AccRole, name string, onKey func
 	acc := cw.Accessibility()
 	return errors.Join(acc.SetRole(role), acc.SetName(name))
 }
+
+// takeEscape has Esc go to cw's onKey while when() reports true, not to the dialog as Cancel.
+func takeEscape(cw *walk.CustomWidget, when func() bool) { keyHooks[cw.Handle()].esc = when }
 
 // focusCues reports whether w should paint its focus indicator: it has the focus and Windows shows
 // focus cues, which it hides until the keyboard is used (so clicks don't leave rings behind).

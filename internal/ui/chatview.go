@@ -35,10 +35,13 @@ const (
 	maxPreviewPixels = 1 << 20
 	// msgFormat is how gdiMeasurer.measure wraps text; message text is broken by wrapText instead.
 	msgFormat = walk.TextWordbreak | walk.TextNoPrefix
+	// autoScrollTick is how often a selection dragged past the top or bottom edge scrolls the view.
+	autoScrollTick = 30 * time.Millisecond
 )
 
 var (
 	getDoubleClickTime = windows.NewLazySystemDLL("user32.dll").NewProc("GetDoubleClickTime")
+	getCapture         = windows.NewLazySystemDLL("user32.dll").NewProc("GetCapture")
 	thumbSlot          = make(chan struct{}, 1) // one full-size image decoded at a time
 )
 
@@ -46,7 +49,8 @@ var (
 // scrolling canvas of message bubbles. Feed it with SetChat, PrependPage, Upsert and SetMediaPath;
 // it asks for older pages and media through its callbacks. The canvas is a tab stop:
 // Up/Down/PgUp/PgDn/Home/End move the focused message, Enter or Space download or open its media.
-// UI-thread only.
+// Dragging over message text selects it (a double-click selects a word, a triple-click the
+// message's text); Ctrl+C copies it, Esc or a click elsewhere clears it. UI-thread only.
 type ChatView struct {
 	*walk.Composite
 	header *walk.CustomWidget
@@ -70,6 +74,13 @@ type ChatView struct {
 	gen         int // bumped per chat: thumbnails finished for an older chat are dropped
 	lastClickID string
 	lastClickAt time.Time
+	clicks      int        // presses in a row on lastClickID, each within the double-click time
+	selA, selB  textMark   // anchor and caret of the text selection; selA.id is "" for none
+	dragging    bool       // the left button went down on text and is held: moves extend the selection
+	drag        walk.Point // where the pointer is while dragging
+	ticking     bool       // an auto-scroll tick is pending
+	notice      string     // shown in the header for a while instead of the number
+	noticeGen   int        // bumped per notice: only the latest one's timer clears it
 
 	onLoadPrevious func()
 	onNeedMedia    func(store.Message)
@@ -154,6 +165,13 @@ func (m *chatModel) upsert(msg store.Message) bool {
 	return true
 }
 
+// textMark is an end of the text selection: an offset into the text of the message with this ID,
+// so it stays put as messages are added around it.
+type textMark struct {
+	id  string
+	off int
+}
+
 // thumbBitmap is a thumbnail decoded and scaled for its box.
 type thumbBitmap struct {
 	bmp  *walk.Bitmap // nil: the source could not be decoded
@@ -201,6 +219,13 @@ func (v *ChatView) build() error {
 		return err
 	}
 	cw.MouseDown().Attach(v.mouseDown)
+	cw.MouseMove().Attach(v.mouseMove)
+	cw.MouseUp().Attach(func(_, _ int, b walk.MouseButton) {
+		if b == walk.LeftButton {
+			v.dragging = false
+		}
+	})
+	takeEscape(cw, func() bool { _, _, ok := v.selection(); return ok })
 	v.scroll.attach(cw, func() int { return v.lay.total }, func() int { return cw.IntFrom96DPI(100) })
 	v.scroll.moved = v.settle
 	cw.SizeChanged().Attach(func() {
@@ -245,6 +270,7 @@ func (v *ChatView) SetChat(accountID, chatJID, name string, isGroup bool, firstP
 	clear(v.thumbBusy)
 	v.gen++
 	v.focus, v.view, v.scroll.off, v.stale = "", 0, 0, true
+	v.selA, v.selB, v.dragging = textMark{}, textMark{}, false
 	logErr("chat layout", v.relayout(false))
 	logErr("chat repaint", errors.Join(v.header.Invalidate(), v.canvas.Invalidate()))
 	v.settle()
@@ -586,6 +612,13 @@ func (v *ChatView) describe(i int) string {
 }
 
 func (v *ChatView) key(k walk.Key) bool {
+	switch {
+	case k == walk.KeyC && walk.ModifiersDown() == walk.ModControl:
+		return v.copySelection()
+	case k == walk.KeyEscape: // only while there is a selection (takeEscape)
+		v.setSel(textMark{}, textMark{})
+		return true
+	}
 	i := v.focusIndex()
 	if k == walk.KeyReturn || k == walk.KeySpace {
 		if i >= 0 {
@@ -612,16 +645,183 @@ func (v *ChatView) mouseDown(x, y int, b walk.MouseButton) {
 	}
 	focusOn(v.canvas)
 	if i < 0 {
+		v.setSel(textMark{}, textMark{})
 		return
 	}
 	m, now := v.msgs[i], time.Now()
 	ms, _, _ := getDoubleClickTime.Call()
-	double := m.ID == v.lastClickID && now.Sub(v.lastClickAt) <= time.Duration(ms)*time.Millisecond
-	v.lastClickID, v.lastClickAt = m.ID, now
-	if double {
+	n := 1
+	if m.ID == v.lastClickID && now.Sub(v.lastClickAt) <= time.Duration(ms)*time.Millisecond {
+		n = v.clicks + 1
+	}
+	v.lastClickID, v.lastClickAt, v.clicks = m.ID, now, n
+	// a press on text selects, so a double-click on a caption picks a word and leaves the media be
+	if t := v.lay.cache[m.ID].text; x >= t.X && x < t.X+t.Width && y >= v.screenY(i)+t.Y && y < v.screenY(i)+t.Y+t.Height {
+		v.pressText(x, y, n)
+		return
+	}
+	v.setSel(textMark{}, textMark{})
+	if n == 2 {
 		v.lastClickID = "" // a third click starts over
 	}
-	v.activate(m, double)
+	v.activate(m, n == 2)
+}
+
+// pressText starts a selection for the nth press in a row on text at (x, y): the first sets the
+// anchor of a drag, the second selects the word under the pointer, the third the message's text.
+func (v *ChatView) pressText(x, y, n int) {
+	p := v.posAt(x, y, n == 2)
+	id := v.msgs[p.msg].ID
+	a, b := p.off, p.off
+	switch n {
+	case 1:
+		v.dragging, v.drag = true, walk.Point{X: x, Y: y}
+	case 2:
+		a, b = wordAt(v.lay.cache[id].units, p.off)
+	default:
+		a, b = 0, len(v.lay.cache[id].units)
+		v.lastClickID = "" // the next press starts over
+	}
+	v.setSel(textMark{id, a}, textMark{id, b})
+}
+
+func (v *ChatView) mouseMove(x, y int, b walk.MouseButton) {
+	if !v.dragging {
+		return
+	}
+	if b&walk.LeftButton == 0 { // released where the canvas didn't hear it
+		v.dragging = false
+		return
+	}
+	v.drag = walk.Point{X: x, Y: y}
+	v.extend()
+	if y < 0 || y >= v.view {
+		v.armScroll()
+	}
+}
+
+// extend moves the selection's caret to the text under the dragging pointer.
+func (v *ChatView) extend() { v.setSel(v.selA, v.mark(v.posAt(v.drag.X, v.drag.Y, false))) }
+
+// armScroll schedules an auto-scroll tick unless one is pending: the timer lives only while a drag
+// is past an edge.
+func (v *ChatView) armScroll() {
+	if !v.ticking {
+		v.ticking = true
+		time.AfterFunc(autoScrollTick, func() { v.canvas.Synchronize(v.autoScroll) })
+	}
+}
+
+// autoScroll scrolls towards a pointer dragged past the top or bottom edge, faster the further out
+// it is, extends the selection and goes on until the pointer is back or the button is released.
+func (v *ChatView) autoScroll() {
+	v.ticking = false
+	if v.canvas.IsDisposed() || !v.dragging {
+		return
+	}
+	if h, _, _ := getCapture.Call(); win.HWND(h) != v.canvas.Handle() { // the drag ended unheard (capture taken)
+		v.dragging = false
+		return
+	}
+	if d := min(v.drag.Y, 0) + max(v.drag.Y-v.view+1, 0); d != 0 {
+		v.scroll.scrollTo(v.scroll.off + d)
+		v.extend()
+		v.armScroll()
+	}
+}
+
+// posAt is the text position at canvas point (x, y), or the nearest one: in the last message whose
+// top is at or above y (the first above all), the start of its text above the text, the end below
+// it, else the boundary nearest to x on the line at y, or with under the character under x.
+func (v *ChatView) posAt(x, y int, under bool) textPos {
+	i := max(0, sort.Search(len(v.lay.tops), func(i int) bool { return v.screenY(i) > y })-1)
+	m := &v.msgs[i]
+	b := v.lay.cache[m.ID]
+	top := v.screenY(i) + b.text.Y
+	switch {
+	case len(b.lines) == 0 || y < top:
+		return textPos{i, 0}
+	case y >= top+len(b.lines)*v.lay.lineH:
+		return textPos{i, len(b.units)}
+	}
+	ln := b.lines[(y-top)/v.lay.lineH]
+	style := walk.FontStyle(0)
+	if _, muted := bubbleText(m, b.info); muted {
+		style = walk.FontItalic
+	}
+	ms := &gdiMeasurer{dpi: v.canvas.DPI(), cdpi: v.cdpi}
+	adv := lineAdv(ms, b.units[ln.start:ln.end], style)
+	logErr("chat hit test", ms.close())
+	x -= b.text.X
+	if under { // the unit whose right edge is past x; past the line's end, its last
+		return textPos{i, ln.start + min(sort.Search(len(adv), func(j int) bool { return adv[j] > x }), max(0, len(adv)-1))}
+	}
+	return textPos{i, ln.start + hitOffset(adv, x)}
+}
+
+func (v *ChatView) mark(p textPos) textMark { return textMark{v.msgs[p.msg].ID, p.off} }
+
+// setSel sets the selection's anchor and caret, repainting on a change.
+func (v *ChatView) setSel(a, b textMark) {
+	if a != v.selA || b != v.selB {
+		v.selA, v.selB = a, b
+		logErr("chat repaint", v.canvas.Invalidate())
+	}
+}
+
+// selection is the selected text's ends in text order; ok is false when nothing is selected (both
+// ends are then at message -1 or at one place).
+func (v *ChatView) selection() (from, to textPos, ok bool) {
+	from, to = orderPos(textPos{v.index(v.selA.id), v.selA.off}, textPos{v.index(v.selB.id), v.selB.off})
+	return from, to, from.msg >= 0 && from != to
+}
+
+// selectionText is the selected text as Ctrl+C copies it, "" when there is none.
+func (v *ChatView) selectionText() string {
+	from, to, ok := v.selection()
+	if !ok {
+		return ""
+	}
+	texts := make([][]uint16, to.msg+1)
+	for i := from.msg; i <= to.msg; i++ {
+		texts[i] = v.lay.cache[v.msgs[i].ID].units
+	}
+	return selectedText(texts, from, to)
+}
+
+// copySelection puts the selected text on the clipboard and reports whether there was any to copy.
+// Ctrl+C tries it first.
+func (v *ChatView) copySelection() bool {
+	text := v.selectionText()
+	if text == "" {
+		return false
+	}
+	cb := walk.Clipboard()
+	err := cb.Clear() // SetText alone leaves the last copy's other formats (HTML, ANSI text) behind
+	if err == nil {
+		err = cb.SetText(text)
+	}
+	if err != nil {
+		logErr("copy", err) // the error only, never the text
+		v.flash("Couldn't copy")
+	}
+	return true
+}
+
+// flash shows s in the header for two seconds.
+func (v *ChatView) flash(s string) {
+	v.notice = s
+	v.noticeGen++
+	gen := v.noticeGen
+	logErr("chat header repaint", v.header.Invalidate())
+	time.AfterFunc(2*time.Second, func() {
+		v.header.Synchronize(func() {
+			if gen == v.noticeGen && !v.header.IsDisposed() {
+				v.notice = ""
+				logErr("chat header repaint", v.header.Invalidate())
+			}
+		})
+	})
 }
 
 // activate acts on a media message: asks for its download when it has none (or its file is gone),
@@ -654,6 +854,11 @@ func (v *ChatView) paintHeader(c *walk.Canvas, _ walk.Rectangle) error {
 	var sub string
 	if user, server, _ := strings.Cut(v.chat, "@"); v.name != "" && server == "s.whatsapp.net" {
 		sub = "+" + user
+	}
+	if v.notice != "" {
+		sub = v.notice
+	}
+	if sub != "" {
 		name.Y, name.Height = b.Height/2-s(22), s(24)
 	}
 	return errors.Join(
@@ -677,13 +882,16 @@ func (v *ChatView) paint(c *walk.Canvas, ub walk.Rectangle) error {
 		return err
 	}
 	focused := focusCues(v.canvas)
+	from, to, _ := v.selection()
 	first, last := v.visible()
 	for i := first; i < last; i++ {
 		m, b, dy := &v.msgs[i], v.lay.cache[v.msgs[i].ID], v.screenY(i)
 		if dy+b.box.Height+s(3) <= ub.Y || dy-s(3) >= ub.Y+ub.Height {
 			continue
 		}
-		if err := v.paintBubble(c, m, b, dy); err != nil {
+		var sel textLine
+		sel.start, sel.end = selSpan(from, to, i, len(b.units))
+		if err := v.paintBubble(c, m, b, dy, sel); err != nil {
 			return err
 		}
 		if focused && m.ID == v.focus {
@@ -702,8 +910,9 @@ func (v *ChatView) paint(c *walk.Canvas, ub walk.Rectangle) error {
 
 var cardIcons = map[string]icons.Icon{"document": icons.IconDocument, "video": icons.IconVideo, "audio": icons.IconAudio, "sticker": icons.IconEmoji}
 
-// paintBubble paints message m's bubble b with its top at canvas y dy.
-func (v *ChatView) paintBubble(c *walk.Canvas, m *store.Message, b bubble, dy int) error {
+// paintBubble paints message m's bubble b with its top at canvas y dy, the units sel of its text
+// highlighted as selected.
+func (v *ChatView) paintBubble(c *walk.Canvas, m *store.Message, b bubble, dy int, sel textLine) error {
 	dpi, p := v.canvas.DPI(), v.pal
 	s := scaler(dpi)
 	at := func(r walk.Rectangle) walk.Rectangle { r.Y += dy; return r }
@@ -751,10 +960,20 @@ func (v *ChatView) paintBubble(c *walk.Canvas, m *store.Message, b bubble, dy in
 		}
 		r := at(b.text)
 		r.Height = v.lay.lineH
+		ms := &gdiMeasurer{dpi: dpi, cdpi: v.cdpi} // measures only lines with a selection
 		for _, ln := range b.lines {
+			if lo, hi := max(sel.start, ln.start)-ln.start, min(sel.end, ln.end)-ln.start; lo < hi {
+				x := lineAdv(ms, b.units[ln.start:ln.end], style)
+				hl, err := brushFor(p.Selection)
+				if err == nil {
+					err = c.FillRectanglePixels(hl, walk.Rectangle{X: r.X + widthOf(x, 0, lo), Y: r.Y, Width: widthOf(x, lo, hi), Height: r.Height})
+				}
+				errs = append(errs, err)
+			}
 			errs = append(errs, drawText(c, dpi, string(utf16.Decode(b.units[ln.start:ln.end])), bodyPt, style, color, r, walk.TextSingleLine|walk.TextNoPrefix))
 			r.Y += r.Height
 		}
+		errs = append(errs, ms.close())
 	}
 	errs = append(errs, drawText(c, dpi, clock(m.Timestamp), metaPt, 0, secondary, at(b.time), rightText))
 	if icon, color, ok := tickFor(p, m.Status); ok && b.ticks.Width > 0 {

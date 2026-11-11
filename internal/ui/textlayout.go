@@ -4,6 +4,8 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf16"
+
+	"github.com/lxn/walk"
 )
 
 // textLine is one line of laid-out text: UTF-16 offsets [start, end) into the text, without the
@@ -143,4 +145,100 @@ func widthOf(x []int, start, end int) int {
 		return x[end-1]
 	}
 	return x[end-1] - x[start-1]
+}
+
+// textPos is a position in the chat's text: a message index and a UTF-16 offset into its text.
+type textPos struct{ msg, off int }
+
+// orderPos returns a and b in text order.
+func orderPos(a, b textPos) (from, to textPos) {
+	if b.msg < a.msg || b.msg == a.msg && b.off < a.off {
+		return b, a
+	}
+	return a, b
+}
+
+// lineAdv is the x after each unit of a line of text in the body font, with the boundaries inside
+// a character (a surrogate pair, an emoji sequence) moved to its start, so hits and highlight edges
+// land on whole characters.
+func lineAdv(ms measurer, units []uint16, style walk.FontStyle) []int {
+	x := ms.advances(units, bodyPt, style)
+	for i := 0; i < len(units); {
+		_, n := cluster(units, i)
+		for j := i; j < i+n-1; j++ {
+			x[j] = widthOf(x, 0, i)
+		}
+		i += n
+	}
+	return x
+}
+
+// hitOffset is the boundary of a line nearest to x (the midpoint rule), given adv, the x after each
+// unit as lineAdv returns it; a tie keeps the earlier boundary, so a hit never lands inside a
+// character whose inner boundaries lineAdv moved to its start.
+func hitOffset(adv []int, x int) int {
+	best, bx := 0, 0
+	for i, a := range adv {
+		if abs(a-x) < abs(bx-x) {
+			best, bx = i+1, a
+		}
+	}
+	return best
+}
+
+func abs(n int) int { return max(n, -n) }
+
+// wordAt is the word around offset off of units: a run of letters and digits of any script with
+// their combining marks; any other character stands alone. An offset past the end means the last
+// character.
+func wordAt(units []uint16, off int) (start, end int) {
+	off = min(off, len(units)-1)
+	word := func(i int) (bool, int) {
+		r, n := cluster(units, i)
+		return unicode.IsLetter(r) || unicode.IsDigit(r), n
+	}
+	for i := 0; i < len(units); {
+		w, n := word(i)
+		j := i + n
+		for w && j < len(units) {
+			if w2, m := word(j); w2 {
+				j += m
+			} else {
+				break
+			}
+		}
+		if off < j {
+			return i, j
+		}
+		i = j
+	}
+	return len(units), len(units)
+}
+
+// selSpan is the part [s, e) of message i's text, n units long, that lies between from and to.
+func selSpan(from, to textPos, i, n int) (s, e int) {
+	if i < from.msg || i > to.msg {
+		return 0, 0
+	}
+	s, e = 0, n
+	if i == from.msg {
+		s = min(from.off, n)
+	}
+	if i == to.msg {
+		e = min(to.off, n)
+	}
+	return s, max(s, e)
+}
+
+// selectedText is the text between from and to, texts holding each message's text by index: the
+// selected part of each message, one per line, newlines as "\r\n" (the clipboard's, and what an
+// edit control shows as a line break).
+func selectedText(texts [][]uint16, from, to textPos) string {
+	var parts []string
+	for i := from.msg; i <= to.msg && i < len(texts); i++ {
+		if s, e := selSpan(from, to, i, len(texts[i])); s < e {
+			parts = append(parts, string(utf16.Decode(texts[i][s:e])))
+		}
+	}
+	return strings.ReplaceAll(strings.ReplaceAll(strings.Join(parts, "\n"), "\r\n", "\n"), "\n", "\r\n")
 }

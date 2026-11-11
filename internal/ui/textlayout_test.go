@@ -108,3 +108,100 @@ func TestWrapTextEmpty(t *testing.T) {
 		t.Errorf("empty text: lines %v", lines)
 	}
 }
+
+func TestHitOffsetMidpoints(t *testing.T) {
+	adv := []int{10, 20, 30}
+	for x, want := range map[int]int{4: 0, 6: 1, 31: 3, -5: 0, 5: 0} { // a tie keeps the earlier boundary
+		if got := hitOffset(adv, x); got != want {
+			t.Errorf("hitOffset(%v, %d) = %d, want %d", adv, x, got, want)
+		}
+	}
+	if got := hitOffset(nil, 7); got != 0 {
+		t.Errorf("hitOffset of an empty line = %d", got)
+	}
+}
+
+func TestHitOffsetLandsOnWholeCharacters(t *testing.T) {
+	// monoMeasurer gives a surrogate pair's width to its first half: lineAdv must still keep hits off it
+	u := utf16.Encode([]rune("a😀b👍🏽c" + "👨\u200d👩"))
+	starts := map[int]bool{len(u): true}
+	for i := 0; i < len(u); {
+		starts[i] = true
+		_, n := cluster(u, i)
+		i += n
+	}
+	adv := lineAdv(&monoMeasurer{}, u, 0)
+	for x := -5; x < 80; x++ {
+		if off := hitOffset(adv, x); !starts[off] {
+			t.Errorf("x=%d hits offset %d, inside a character", x, off)
+		}
+	}
+	if got := hitOffset(adv, 10); got != 1 { // the emoji spans 7 to 14: before its middle
+		t.Errorf("x=10 hits %d, want 1", got)
+	}
+	if got := hitOffset(adv, 11); got != 3 { // past its middle: after it
+		t.Errorf("x=11 hits %d, want 3", got)
+	}
+}
+
+func TestWordAt(t *testing.T) {
+	for _, c := range []struct {
+		text       string
+		off        int
+		start, end int
+	}{
+		{"halo dunia!", 6, 5, 10},
+		{"halo dunia!", 4, 4, 5},    // a space is its own character
+		{"halo dunia!", 10, 10, 11}, // so is punctuation
+		{"halo dunia!", 11, 10, 11}, // past the end: the last character
+		{"kopi☕susu", 4, 4, 5},      // the emoji alone
+		{"kopi☕susu", 3, 0, 4},
+		{"kopi☕susu", 5, 5, 9},
+		{"naïve", 2, 0, 5},
+		{"nai\u0308ve", 2, 0, 6}, // a combining mark stays with its letter
+		{"ab😀cd", 3, 2, 4},       // inside a surrogate pair: the pair
+		{"Rp 1500 ok", 5, 3, 7},  // digits form words too
+		{"東京タワー", 1, 0, 5},
+	} {
+		u := utf16.Encode([]rune(c.text))
+		if s, e := wordAt(u, c.off); s != c.start || e != c.end {
+			t.Errorf("wordAt(%q, %d) = (%d, %d), want (%d, %d)", c.text, c.off, s, e, c.start, c.end)
+		}
+	}
+	if s, e := wordAt(nil, 0); s != 0 || e != 0 {
+		t.Errorf("wordAt of no text = (%d, %d)", s, e)
+	}
+}
+
+func TestSelectedTextAcrossMessages(t *testing.T) {
+	enc := func(s string) []uint16 { return utf16.Encode([]rune(s)) }
+	texts := [][]uint16{enc("Hi 😀 there"), enc("line1\r\nline2")}
+	if got := selectedText(texts, textPos{0, 3}, textPos{1, 5}); got != "😀 there\r\nline1" {
+		t.Errorf("across two messages: %q", got)
+	}
+	if got := selectedText(texts, textPos{1, 0}, textPos{1, 12}); got != "line1\r\nline2" {
+		t.Errorf("a CRLF inside a message: %q", got)
+	}
+	texts = [][]uint16{enc("one\ntwo"), nil, enc("three")} // a photo without caption between
+	if got := selectedText(texts, textPos{0, 4}, textPos{2, 5}); got != "two\r\nthree" {
+		t.Errorf("skipping a message without text: %q", got)
+	}
+	if got := selectedText(texts, textPos{0, 0}, textPos{0, 7}); got != "one\r\ntwo" {
+		t.Errorf("a lone LF becomes CRLF: %q", got)
+	}
+	if got := selectedText(texts, textPos{0, 7}, textPos{2, 0}); got != "" {
+		t.Errorf("nothing between the end of one text and the start of another: %q", got)
+	}
+}
+
+func TestOrderPos(t *testing.T) {
+	for _, c := range [][4]textPos{
+		{{2, 1}, {0, 4}, {0, 4}, {2, 1}}, // dragged backwards
+		{{1, 5}, {1, 2}, {1, 2}, {1, 5}},
+		{{0, 4}, {2, 1}, {0, 4}, {2, 1}},
+	} {
+		if from, to := orderPos(c[0], c[1]); from != c[2] || to != c[3] {
+			t.Errorf("orderPos(%v, %v) = %v, %v", c[0], c[1], from, to)
+		}
+	}
+}
