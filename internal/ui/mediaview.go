@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"cmp"
 	"errors"
 	"image"
 	"io"
@@ -26,7 +27,29 @@ const (
 	mediaBarH = 56   // top bar, 1/96 inch
 	maxZoom   = 4    // times the fitted size
 	zoomStep  = 1.25 // per Ctrl +/- or wheel notch
+	videoBarH = 48   // a video's control bar, 1/96 inch
+	videoPoll = 250 * time.Millisecond
+	videoWait = 5 * time.Second // for playback to start before the video counts as unplayable
+	videoSkip = 5 * time.Second // per ← or →
 )
+
+// every runs tick every d on a goroutine until the returned channel is closed.
+func every(d time.Duration, tick func()) chan struct{} {
+	stop := make(chan struct{})
+	go func() {
+		t := time.NewTicker(d)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				tick()
+			}
+		}
+	}()
+	return stop
+}
 
 // mediaSteps are the nearest photos, stickers or videos before and after msgs[i]; -1 when none.
 func mediaSteps(msgs []store.Message, i int) (prev, next int) {
@@ -99,20 +122,34 @@ const (
 	mediaLoading                // decoding
 	mediaShown
 	mediaTooLarge
-	mediaBroken // could not be decoded
-	mediaVideo  // played with Open with… until the player comes
+	mediaBroken     // could not be decoded
+	mediaVideo      // the player runs
+	mediaUnplayable // the player failed: Open with…
 )
 
 // MediaView shows a chat's photos and stickers in the chat column: a top bar (back, sender and time,
 // zoom, Save as…, Open with…) over the picture, fitted, zoomed 1×–4× by the wheel around the
 // pointer, Ctrl + / −, or a double-click, and dragged when zoomed. ← and → step through the chat's
-// photos and videos, 0 fits, Esc closes. The picture is decoded only while shown. UI thread only.
+// photos and videos, 0 fits, Esc closes. The picture is decoded only while shown. Videos play in
+// video, over a control bar (Space plays or pauses, ← → seek 5 s, m mutes); GIFs play muted and
+// loop, without the bar. UI thread only.
 type MediaView struct {
 	*walk.Composite
 	*kit
 	canvas             *walk.CustomWidget
+	video, ctrl        *walk.CustomWidget // the player's window and a video's control bar
 	who, when, zoomLbl *label
 	save, with         *button
+
+	play     mediaPlayer // nil while no video is open
+	stop     chan struct{}
+	gif      bool
+	muted    bool
+	started  bool // the player has played or paused
+	opened   time.Time
+	st       playerState
+	pos, dur time.Duration
+	seeking  bool // the seek bar is dragged
 
 	list      []store.Message
 	i         int
@@ -225,6 +262,47 @@ func (v *MediaView) build() error {
 	})
 	cw.MouseWheel().Attach(v.wheel)
 	cw.SizeChanged().Attach(func() { v.reframe(v.zoom, v.pan) })
+	return v.buildVideo()
+}
+
+// buildVideo adds the player's window and the control bar, hidden.
+func (v *MediaView) buildVideo() error {
+	var err error
+	if v.video, err = walk.NewCustomWidgetPixels(v.Composite, 0, v.paintVideo); err != nil {
+		return err
+	}
+	vw := v.video
+	vw.SetPaintMode(walk.PaintNoErase) // the player draws the frames
+	if err := errors.Join(fillRest(v.Composite, vw), focusable(vw, walk.AccRoleAnimation, "Video", nil)); err != nil {
+		return err
+	}
+	v.keys(vw, v.videoKey)
+	vw.MouseDown().Attach(func(_, _ int, b walk.MouseButton) {
+		if b == walk.LeftButton {
+			focusOn(vw)
+			if !v.gif {
+				v.toggle()
+			}
+		}
+	})
+	vw.SizeChanged().Attach(func() { v.updateVideo() })
+	if v.ctrl, err = newCanvas(v.Composite, v.paintCtrl); err != nil {
+		return err
+	}
+	v.canvases = append(v.canvases, v.ctrl)
+	vw.FocusedChanged().Attach(func() { logErr("video bar repaint", v.ctrl.Invalidate()) }) // its focus shows there
+	if err := v.ctrl.SetMinMaxSize(walk.Size{Height: videoBarH}, walk.Size{Height: videoBarH}); err != nil {
+		return err
+	}
+	v.ctrl.MouseDown().Attach(v.ctrlDown)
+	v.ctrl.MouseMove().Attach(func(x, _ int, b walk.MouseButton) {
+		if v.seeking = v.seeking && b&walk.LeftButton != 0; v.seeking {
+			v.seekTo(x)
+		}
+	})
+	v.ctrl.MouseUp().Attach(func(_, _ int, _ walk.MouseButton) { v.seeking = false })
+	vw.SetVisible(false)
+	v.ctrl.SetVisible(false)
 	return nil
 }
 
@@ -253,10 +331,10 @@ func (v *MediaView) OnOpenWith(fn func(path string)) { v.onOpenWith = fn }
 func (v *MediaView) Open(list []store.Message, i int, sender func(store.Message) string) {
 	v.list, v.sender = slices.Clone(list), sender
 	v.show(i)
-	focusOn(v.canvas)
+	focusOn(v.area())
 }
 
-// Close drops the picture and the messages and gives the memory back.
+// Close drops the picture or shuts the player down, drops the messages and gives the memory back.
 func (v *MediaView) Close() {
 	v.gen++
 	v.drop()
@@ -270,6 +348,28 @@ func (v *MediaView) drop() {
 		v.bmp = nil
 	}
 	v.size, v.zoom, v.pan = walk.Size{}, 1, walk.Point{}
+	v.stopVideo()
+}
+
+// stopVideo stops the timer and shuts the player down, if one runs.
+func (v *MediaView) stopVideo() {
+	if v.stop != nil {
+		close(v.stop)
+		v.stop = nil
+	}
+	if v.play != nil {
+		v.play.Shutdown()
+		v.play = nil
+	}
+	v.seeking = false
+}
+
+// area is the window showing the current message: the player's while a video plays.
+func (v *MediaView) area() *walk.CustomWidget {
+	if v.play != nil {
+		return v.video
+	}
+	return v.canvas
 }
 
 // SetMediaPath records that message id was downloaded to path; the shown one is then decoded.
@@ -314,6 +414,8 @@ func (v *MediaView) show(i int) {
 	v.drop()
 	v.i, v.dragging = i, false
 	m, ok := v.current()
+	info, err := parseMedia(&m)
+	v.gif = ok && m.Type == "video" && err == nil && info.gif
 	switch {
 	case !ok:
 		return
@@ -323,7 +425,7 @@ func (v *MediaView) show(i int) {
 			v.onNeedMedia(m)
 		}
 	case m.Type == "video":
-		v.state = mediaVideo
+		v.startVideo(m)
 	default:
 		v.state = mediaLoading
 		gen, path, dpi := v.gen, m.MediaPath, v.canvas.DPI()
@@ -369,14 +471,174 @@ func (v *MediaView) update() {
 	v.save.SetVisible(has)
 	v.with.SetVisible(has)
 	kind := "Photo"
-	switch m.Type {
-	case "sticker":
+	switch {
+	case m.Type == "sticker":
 		kind = "Sticker"
-	case "video":
+	case m.Type == "video" && v.gif:
+		kind = "GIF"
+	case m.Type == "video":
 		kind = "Video"
 	}
-	announce(v.canvas, kind+" from "+v.sender(m)+", "+mediaWhen(m.Timestamp, time.Now()), v.stateText())
+	focused := v.canvas.Focused() || v.video.Focused()
+	playing := v.play != nil
+	v.canvas.SetVisible(!playing)
+	v.video.SetVisible(playing)
+	v.ctrl.SetVisible(playing && !v.gif)
+	if focused {
+		focusOn(v.area()) // the focused window may have gone
+	}
+	announce(v.area(), kind+" from "+v.sender(m)+", "+mediaWhen(m.Timestamp, time.Now()), v.stateText())
 	v.reframe(v.zoom, v.pan)
+}
+
+// startVideo creates the player for m (downloaded) and the timer that polls it.
+func (v *MediaView) startVideo(m store.Message) {
+	v.muted, v.started, v.opened, v.st, v.pos, v.dur = v.gif, false, time.Now(), playerEmpty, 0, 0
+	p, err := newPlayer(v.video.Handle(), m.MediaPath)
+	if err != nil {
+		logErr("video "+m.ID, err)
+		v.state = mediaUnplayable
+		return
+	}
+	v.play, v.state = p, mediaVideo
+	if v.gif {
+		logErr("mute", p.SetMute(true))
+	}
+	v.stop = every(videoPoll, func() { v.video.Synchronize(v.poll) })
+}
+
+// poll follows the player: whether it started in time, a GIF's loop, the control bar.
+func (v *MediaView) poll() {
+	if v.play == nil {
+		return // closed meanwhile
+	}
+	st, err := v.play.State()
+	if err == nil && !v.started && (st == playerPlaying || st == playerPaused) {
+		v.started = true
+		logErr("mute", v.play.SetMute(v.muted))
+		v.updateVideo()
+	}
+	if err != nil || !v.started && time.Since(v.opened) > videoWait {
+		if m, ok := v.current(); ok {
+			logErr("video "+m.ID, cmp.Or(err, errors.New("playback did not start")))
+		}
+		v.stopVideo()
+		v.state = mediaUnplayable
+		v.update()
+		return
+	}
+	pos, dur := v.pos, v.dur
+	if d, err := v.play.Position(); err == nil {
+		pos = d
+	}
+	if d, err := v.play.Duration(); err == nil {
+		dur = d
+	}
+	ended := pos
+	if st == playerStopped {
+		ended = v.pos + videoPoll // mfplay rewinds to 0 at the end: judge by the last position seen
+	}
+	if v.gif && gifRestart(st, ended, dur) {
+		logErr("gif loop", errors.Join(v.play.Seek(0), v.play.Play()))
+	}
+	if st != v.st || pos != v.pos || dur != v.dur {
+		v.st, v.pos, v.dur = st, pos, dur
+		logErr("video bar repaint", v.ctrl.Invalidate())
+	}
+}
+
+// toggle plays or pauses a video.
+func (v *MediaView) toggle() {
+	if v.play == nil {
+		return
+	}
+	if v.st == playerPlaying {
+		logErr("pause", v.play.Pause())
+		v.st = playerPaused
+	} else {
+		logErr("play", v.play.Play())
+		v.st = playerPlaying
+	}
+	logErr("video bar repaint", v.ctrl.Invalidate())
+}
+
+func (v *MediaView) toggleMute() {
+	if v.play != nil {
+		v.muted = !v.muted
+		logErr("mute", v.play.SetMute(v.muted))
+		logErr("video bar repaint", v.ctrl.Invalidate())
+	}
+}
+
+// seek moves a video to d, kept within it.
+func (v *MediaView) seek(d time.Duration) {
+	if v.play == nil || v.dur <= 0 {
+		return
+	}
+	v.pos = max(0, min(v.dur-100*time.Millisecond, d)) // seeking to the very end stalls mfplay
+	logErr("seek", v.play.Seek(v.pos))
+	logErr("video bar repaint", v.ctrl.Invalidate())
+}
+
+// updateVideo repaints the video; before playback starts there is none to paint.
+func (v *MediaView) updateVideo() {
+	if v.play != nil && v.started {
+		logErr("video repaint", v.play.UpdateVideo())
+	}
+}
+
+// videoKey handles a video's keys on the player's window; a GIF's go on to the view's.
+func (v *MediaView) videoKey(k walk.Key) bool {
+	if v.play == nil || v.gif {
+		return false
+	}
+	switch k {
+	case walk.KeySpace:
+		v.toggle()
+	case walk.KeyLeft:
+		v.seek(v.pos - videoSkip)
+	case walk.KeyRight:
+		v.seek(v.pos + videoSkip)
+	case walk.KeyM:
+		v.toggleMute()
+	default:
+		return false
+	}
+	return true
+}
+
+// ctrlParts lays the control bar out: play/pause, the seek bar, the clock and mute (pixels).
+func (v *MediaView) ctrlParts() (play, track, clock, mute walk.Rectangle) {
+	b, s := v.ctrl.ClientBoundsPixels(), scaler(v.ctrl.DPI())
+	play = walk.Rectangle{X: s(4), Width: s(44), Height: b.Height}
+	mute = walk.Rectangle{X: b.Width - s(48), Width: s(44), Height: b.Height}
+	clock = walk.Rectangle{X: mute.X - s(116), Width: s(112), Height: b.Height}
+	track = walk.Rectangle{X: play.X + play.Width + s(8), Y: b.Height/2 - s(2), Height: s(4)}
+	track.Width = max(0, clock.X-s(8)-track.X)
+	return play, track, clock, mute
+}
+
+func (v *MediaView) ctrlDown(x, y int, b walk.MouseButton) {
+	if b != walk.LeftButton || v.play == nil {
+		return
+	}
+	focusOn(v.video)
+	play, track, _, mute := v.ctrlParts()
+	slack := scaler(v.ctrl.DPI())(8)
+	switch {
+	case in(play, x, y):
+		v.toggle()
+	case in(mute, x, y):
+		v.toggleMute()
+	case x >= track.X-slack && x <= track.X+track.Width+slack:
+		v.seeking = true
+		v.seekTo(x)
+	}
+}
+
+func (v *MediaView) seekTo(x int) {
+	_, track, _, _ := v.ctrlParts()
+	v.seek(seekAt(x-track.X, track.Width, v.dur))
 }
 
 // stateText is what the view says instead of a picture; "" while one shows.
@@ -390,6 +652,8 @@ func (v *MediaView) stateText() string {
 		return "Too large to show here"
 	case mediaBroken:
 		return "Can't show this picture"
+	case mediaUnplayable:
+		return "Windows can't play this video"
 	}
 	return ""
 }
@@ -437,7 +701,7 @@ func (v *MediaView) key(k walk.Key) bool {
 		}
 		if prev >= 0 {
 			v.show(prev)
-			focusOn(v.canvas) // Save as… may have gone
+			focusOn(v.area()) // Save as… may have gone
 		}
 	case ctrl && (k == walk.KeyOEMPlus || k == walk.KeyAdd):
 		v.zoomBy(zoomStep, v.centre())
@@ -451,13 +715,10 @@ func (v *MediaView) key(k walk.Key) bool {
 	return true
 }
 
-// act is Enter on the picture: Retry after a failed download, play a video.
+// act is Enter on the picture: Retry after a failed download.
 func (v *MediaView) act() {
-	switch v.state {
-	case mediaFailed:
+	if v.state == mediaFailed {
 		v.show(v.i)
-	case mediaVideo:
-		v.openWith()
 	}
 }
 
@@ -476,9 +737,6 @@ func (v *MediaView) mouseDown(x, y int, b walk.MouseButton) {
 		if in(v.retryRect(), x, y) {
 			v.act()
 		}
-		return
-	case mediaVideo:
-		v.act()
 		return
 	case mediaShown:
 	default:
@@ -579,8 +837,6 @@ func (v *MediaView) paint(c *walk.Canvas, _ walk.Rectangle) error {
 	switch v.state {
 	case mediaShown:
 		errs = append(errs, c.DrawImageStretchedPixels(v.bmp, fitRect(v.size, b, v.zoom, v.pan)))
-	case mediaVideo:
-		errs = append(errs, icons.Draw(c, icons.IconPlay, square(b.Width/2, b.Height/2, s(64)), theme.Color(p.Text)))
 	case mediaLoading:
 	default:
 		msg := walk.Rectangle{X: s(16), Y: b.Height/2 - s(20), Width: b.Width - s(32), Height: s(28)}
@@ -592,6 +848,47 @@ func (v *MediaView) paint(c *walk.Canvas, _ walk.Rectangle) error {
 		}
 	}
 	if focusCues(cw) {
+		errs = append(errs, focusRect(c, b, s(2), p.Accent))
+	}
+	return errors.Join(errs...)
+}
+
+func (v *MediaView) paintVideo(c *walk.Canvas, _ walk.Rectangle) error {
+	if v.play != nil && v.started {
+		return v.play.UpdateVideo()
+	}
+	return fillBand(c, v.video.ClientBoundsPixels(), v.pal.ChatBg) // until the first frame
+}
+
+// paintCtrl paints the control bar; it also shows the player window's keyboard focus.
+func (v *MediaView) paintCtrl(c *walk.Canvas, _ walk.Rectangle) error {
+	p, b, dpi := v.pal, v.ctrl.ClientBoundsPixels(), v.ctrl.DPI()
+	s := scaler(dpi)
+	play, track, clock, mute := v.ctrlParts()
+	pp, snd := icons.IconPlay, icons.IconVolume
+	if v.st == playerPlaying {
+		pp = icons.IconPause
+	}
+	if v.muted {
+		snd = icons.IconMute
+	}
+	text := theme.Color(p.Text)
+	errs := []error{fillBand(c, b, p.Sidebar),
+		icons.Draw(c, pp, square(play.X+play.Width/2, b.Height/2, s(24)), text),
+		icons.Draw(c, snd, square(mute.X+mute.Width/2, b.Height/2, s(24)), text),
+		drawText(c, dpi, clockText(v.pos)+" / "+clockText(v.dur), 10, 0, v.color(toneSecondary), clock, centerText)}
+	if track.Width > 0 {
+		x := track.X
+		if v.dur > 0 {
+			x += int(float64(track.Width) * float64(min(v.pos, v.dur)) / float64(v.dur))
+		}
+		errs = append(errs, icons.Fill(c, track, theme.Color(p.TextSecondary)))
+		if x > track.X {
+			errs = append(errs, icons.Fill(c, walk.Rectangle{X: track.X, Y: track.Y, Width: x - track.X, Height: track.Height}, theme.Color(p.Accent)))
+		}
+		errs = append(errs, icons.Fill(c, square(x, b.Height/2, s(12)), theme.Color(p.Accent)))
+	}
+	if focusCues(v.video) {
 		errs = append(errs, focusRect(c, b, s(2), p.Accent))
 	}
 	return errors.Join(errs...)

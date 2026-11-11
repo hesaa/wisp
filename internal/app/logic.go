@@ -116,7 +116,7 @@ type mediaTarget int
 
 const (
 	targetViewer   mediaTarget = iota // the media view's photo viewer
-	targetPlayer                      // the media view's player (until it comes: the default program)
+	targetPlayer                      // the media view's player
 	targetExternal                    // the default program
 )
 

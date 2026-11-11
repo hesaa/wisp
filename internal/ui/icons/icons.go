@@ -39,7 +39,9 @@ const (
 	IconChevronLeft
 	IconChevronRight
 	IconClose
-	IconBack // left arrow: leave a view
+	IconBack   // left arrow: leave a view
+	IconVolume // speaker with sound waves: sound on
+	IconMute   // speaker with a cross: sound off
 )
 
 const (
@@ -142,7 +144,11 @@ var definitions = map[Icon][]op{
 	IconChevronRight: {poly(9, 5, 16, 12, 9, 19)},
 	IconClose:        {poly(6, 6, 18, 18), poly(18, 6, 6, 18)},
 	IconBack:         {poly(20, 12, 4, 12), poly(10, 6, 4, 12, 10, 18)},
+	IconVolume:       {speaker(), arc(7.5, 7.5, 9, 9, -45, 90), arc(4, 4, 16, 16, -45, 90)},
+	IconMute:         {speaker(), poly(15, 9.5, 20, 14.5), poly(20, 9.5, 15, 14.5)},
 }
+
+func speaker() op { return poly(3, 9.5, 7, 9.5, 12, 5, 12, 19, 7, 14.5, 3, 14.5, 3, 9.5) }
 
 func argb(c walk.Color) uint32 {
 	return 0xFF000000 | uint32(c.R())<<16 | uint32(c.G())<<8 | uint32(c.B())

@@ -228,15 +228,14 @@ func (a *App) needMedia(m store.Message) {
 	}()
 }
 
-// openMedia opens a chat's media message: photos and stickers in the media view, which asks for
-// their download itself; anything else (videos too, until the player comes) in its Windows program,
-// once downloaded.
+// openMedia opens a chat's media message: photos, stickers and videos in the media view, which asks
+// for their download itself; anything else in its Windows program, once downloaded.
 func (a *App) openMedia(m store.Message) {
 	if a.locked {
 		return // nothing is shown, opened or sent behind the lock page
 	}
 	switch {
-	case targetFor(m) == targetViewer:
+	case targetFor(m) != targetExternal:
 		msgs := a.chat.Messages()
 		i := slices.IndexFunc(msgs, func(x store.Message) bool { return x.ID == m.ID })
 		if i < 0 {

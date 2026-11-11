@@ -136,6 +136,48 @@ func TestDecodeFull(t *testing.T) {
 	}
 }
 
+type fakePlayer struct {
+	st        playerState
+	shutdowns int
+}
+
+func (f *fakePlayer) Play() error                      { f.st = playerPlaying; return nil }
+func (f *fakePlayer) Pause() error                     { f.st = playerPaused; return nil }
+func (f *fakePlayer) Seek(time.Duration) error         { return nil }
+func (f *fakePlayer) Position() (time.Duration, error) { return 0, nil }
+func (f *fakePlayer) Duration() (time.Duration, error) { return time.Minute, nil }
+func (f *fakePlayer) State() (playerState, error)      { return f.st, nil }
+func (f *fakePlayer) SetMute(bool) error               { return nil }
+func (f *fakePlayer) UpdateVideo() error               { return nil }
+func (f *fakePlayer) Shutdown()                        { f.shutdowns++; f.st = playerShutdown }
+
+// Review Focus 1: closing while a video plays shuts the player down and stops the timer.
+func TestMediaViewCloseShutsPlayerDown(t *testing.T) {
+	f := &fakePlayer{st: playerPlaying}
+	ticks := make(chan struct{}, 1)
+	v := &MediaView{zoom: 1, play: f, stop: every(time.Millisecond, func() {
+		select {
+		case ticks <- struct{}{}:
+		default:
+		}
+	})}
+	stop := v.stop
+	<-ticks // the timer runs
+	v.Close()
+	if f.shutdowns != 1 || v.play != nil {
+		t.Fatalf("after Close: %d shutdowns, player %v", f.shutdowns, v.play)
+	}
+	select {
+	case <-stop:
+	default:
+		t.Error("the timer still runs")
+	}
+	v.Close()
+	if f.shutdowns != 1 {
+		t.Errorf("a second Close: %d shutdowns", f.shutdowns)
+	}
+}
+
 func TestClickOpens(t *testing.T) {
 	photo := bubble{thumb: walk.Rectangle{X: 10, Y: 10, Width: 200, Height: 150}, text: walk.Rectangle{X: 10, Y: 165, Width: 200, Height: 20}}
 	card := bubble{card: walk.Rectangle{X: 10, Y: 10, Width: 240, Height: 60}}
