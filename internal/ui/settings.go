@@ -288,6 +288,9 @@ func pinUpdate(stored string, mode pinMode, values []string) (newStored, msg str
 	case pinOff:
 		current = values[0]
 	}
+	if mode != pinOff && next == "" { // an empty new PIN would turn the lock off while saying it is on
+		return "", "Use 4 to 8 digits.", false
+	}
 	newStored, err := lock.Update(stored, current, next)
 	switch {
 	case errors.Is(err, lock.ErrWrongPIN):

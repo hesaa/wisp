@@ -27,11 +27,18 @@ func askPIN(owner walk.Form, p theme.Palette, title string, labels ...string) ([
 		return nil, false, err
 	}
 	edits := make([]*walk.LineEdit, len(labels))
+	out := make([]string, len(labels))
+	accept := func() { // read the fields first: closing the dialog destroys them, and Text is "" after that
+		for i, e := range edits {
+			out[i] = e.Text()
+		}
+		dlg.Accept()
+	}
 	for i, name := range labels {
 		if _, err := k.newLabel(dlg, name, 10, 0, toneSecondary, 22); err != nil {
 			return nil, false, err
 		}
-		if edits[i], err = pinField(k, dlg, name, dlg.Accept); err != nil {
+		if edits[i], err = pinField(k, dlg, name, accept); err != nil {
 			return nil, false, err
 		}
 	}
@@ -50,7 +57,7 @@ func askPIN(owner walk.Form, p theme.Palette, title string, labels ...string) ([
 	if _, err := k.newButton(row, "Cancel", btnPlain, 100, dlg.Cancel); err != nil {
 		return nil, false, err
 	}
-	if _, err := k.newButton(row, "OK", btnPrimary, 100, dlg.Accept); err != nil {
+	if _, err := k.newButton(row, "OK", btnPrimary, 100, accept); err != nil {
 		return nil, false, err
 	}
 	if err := errors.Join(fillRest(dlg, spacer), fillRest(row, gap), escCloses(dlg)); err != nil {
@@ -61,10 +68,6 @@ func askPIN(owner walk.Form, p theme.Palette, title string, labels ...string) ([
 	logErr("PIN dialog title bar", theme.ApplyTitleBar(uintptr(dlg.Handle()), isDark(p)))
 	if dlg.Run() != walk.DlgCmdOK {
 		return nil, false, nil
-	}
-	out := make([]string, len(edits))
-	for i, e := range edits {
-		out[i] = e.Text()
 	}
 	return out, true, nil
 }

@@ -474,6 +474,9 @@ func TestPinUpdate(t *testing.T) {
 	if _, msg, ok := pinUpdate("", pinSet, []string{"1234", "1235"}); ok || msg != "The PINs don't match." {
 		t.Fatalf("mismatch: %v %q", ok, msg)
 	}
+	if _, msg, ok := pinUpdate("", pinSet, []string{"", ""}); ok || msg != "Use 4 to 8 digits." {
+		t.Errorf("empty PIN: ok=%v msg=%q", ok, msg)
+	}
 	if _, msg, ok := pinUpdate("", pinSet, []string{"12", "12"}); ok || msg != "Use 4 to 8 digits." {
 		t.Fatalf("format: %v %q", ok, msg)
 	}
