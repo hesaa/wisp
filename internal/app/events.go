@@ -152,6 +152,7 @@ func (a *App) refreshAccounts() {
 // accountChanged switches the window to acct ("" when no account is left): the chat pane empties
 // and acct's chats and stories load.
 func (a *App) accountChanged(acct string) {
+	a.closeMedia()
 	a.bar.Reset() // before the switch: it may still tell the chat being left that typing stopped
 	a.v.switchAccount(acct)
 	a.showChatPane(false)

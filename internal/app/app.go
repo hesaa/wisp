@@ -78,6 +78,7 @@ type App struct {
 	empty *ui.EmptyPane
 	chat  *ui.ChatView
 	bar   *ui.InputBar
+	media *ui.MediaView
 	tray  *notify.Tray
 
 	v          view
@@ -97,6 +98,7 @@ type App struct {
 	didReset   bool // the run ends through Reset Wisp
 	hiding     bool // closed to the tray and not restored since
 	minimized  bool // as sizeChanged last saw the window
+	viewing    bool // the media view replaces the chat and the input bar
 }
 
 // New builds the main window, themed by the settings in db; nothing connects until Attach.
@@ -154,7 +156,7 @@ func (a *App) build() error {
 	if a.side, err = ui.NewSidebar(mw, p); err != nil {
 		return err
 	}
-	right, err := walk.NewComposite(mw) // the chat column: the chat over the input bar, or the empty state
+	right, err := walk.NewComposite(mw) // the chat column: the chat over the input bar, the media view, or the empty state
 	if err != nil {
 		return err
 	}
@@ -172,7 +174,10 @@ func (a *App) build() error {
 	if a.bar, err = ui.NewInputBar(right, p, func() string { return gifKey(a.cfg[ui.KeyGiphyAPIKey], a.builtin) }); err != nil {
 		return err
 	}
-	if err := errors.Join(rl.SetStretchFactor(a.empty, 1000), rl.SetStretchFactor(a.chat, 1000)); err != nil {
+	if a.media, err = ui.NewMediaView(right, p); err != nil {
+		return err
+	}
+	if err := errors.Join(rl.SetStretchFactor(a.empty, 1000), rl.SetStretchFactor(a.chat, 1000), rl.SetStretchFactor(a.media, 1000)); err != nil {
 		return err
 	}
 	if a.link, err = ui.NewLinkPage(mw, p, func(ctx context.Context) (<-chan whatsmeow.QRChannelItem, error) { return a.mgr.Pair(ctx) }); err != nil {
@@ -202,6 +207,9 @@ func (a *App) build() error {
 	a.chat.OnLoadPrevious(a.loadPrevious)
 	a.chat.OnNeedMedia(a.needMedia)
 	a.chat.OnOpenMedia(a.openMedia)
+	a.media.OnClose(a.closeMedia)
+	a.media.OnNeedMedia(a.needMedia)
+	a.media.OnOpenWith(a.openFile)
 	a.bar.OnSend(a.send)
 	a.bar.OnTyping(a.typing)
 	a.bar.OnAttach(a.attach)
@@ -426,7 +434,7 @@ func (a *App) nav(n ui.Nav) {
 func (a *App) applyTheme(mode theme.ThemeMode) {
 	a.pal = theme.GetPalette(mode)
 	logErr("theme", errors.Join(a.rail.SetPalette(a.pal), a.side.SetPalette(a.pal), a.chat.SetPalette(a.pal),
-		a.bar.SetPalette(a.pal), a.empty.SetPalette(a.pal), a.link.SetPalette(a.pal), a.lockPage.SetPalette(a.pal)))
+		a.bar.SetPalette(a.pal), a.empty.SetPalette(a.pal), a.link.SetPalette(a.pal), a.media.SetPalette(a.pal), a.lockPage.SetPalette(a.pal)))
 	logErr("title bar", theme.ApplyTitleBar(uintptr(a.mw.Handle()), theme.Resolve(mode) == theme.ThemeDark))
 }
 
@@ -508,9 +516,6 @@ func (a *App) lockNow() {
 	a.showPage()
 	a.presence.appLock(true)
 }
-
-// closeMedia closes the open photo or video (Task 10 gives it its body).
-func (a *App) closeMedia() {}
 
 // unlock checks pin against the stored hash, with the back-off for wrong tries. pin is not kept.
 func (a *App) unlock(pin string) {

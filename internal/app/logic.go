@@ -111,6 +111,27 @@ func dropMissingMedia(msgs []store.Message) {
 	}
 }
 
+// mediaTarget is where an opened media message shows.
+type mediaTarget int
+
+const (
+	targetViewer   mediaTarget = iota // the media view's photo viewer
+	targetPlayer                      // the media view's player (until it comes: the default program)
+	targetExternal                    // the default program
+)
+
+// targetFor picks where m opens: photos and stickers in the viewer, videos (GIFs too) in the
+// player, everything else in its default program.
+func targetFor(m store.Message) mediaTarget {
+	switch m.Type {
+	case "image", "sticker":
+		return targetViewer
+	case "video":
+		return targetPlayer
+	}
+	return targetExternal
+}
+
 // unreadIncoming returns the messages of msgs a read receipt is due for.
 func unreadIncoming(msgs []store.Message) []store.Message {
 	var out []store.Message

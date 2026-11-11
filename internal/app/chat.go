@@ -4,8 +4,10 @@ import (
 	"context"
 	"log"
 	"os"
+	"slices"
 	"time"
 
+	"wa-go/internal/media"
 	"wa-go/internal/store"
 	"wa-go/internal/ui"
 	"wa-go/internal/whatsapp"
@@ -33,6 +35,7 @@ func (a *App) openChat(acct, jid, name string) {
 		return
 	}
 	a.side.Model().Select(jid)
+	a.closeMedia()
 	if c == a.v.open {
 		if a.chatUnread(jid) > 0 {
 			a.markChatRead(c)
@@ -204,12 +207,19 @@ func (a *App) needMedia(m store.Message) {
 		cancel()
 		a.mw.Synchronize(func() {
 			a.inflight.done(k)
+			shown := a.v.loaded && a.v.open == (chatRef{m.AccountID, m.ChatJID}) // IDs repeat across accounts
 			if err != nil {
 				logErr("download "+m.ID, err)
+				if shown && a.viewing {
+					a.media.SetDownloadError(m.ID, err)
+				}
 				return
 			}
-			if a.v.loaded && a.v.open == (chatRef{m.AccountID, m.ChatJID}) { // IDs repeat across accounts
+			if shown {
 				a.chat.SetMediaPath(m.ID, path)
+				if a.viewing {
+					a.media.SetMediaPath(m.ID, path)
+				}
 			}
 			if a.statusSet != nil && a.statusAcct == m.AccountID && m.ChatJID == statusBroadcast {
 				a.statusSet(m.ID, path)
@@ -218,9 +228,61 @@ func (a *App) needMedia(m store.Message) {
 	}()
 }
 
-// openMedia opens a downloaded file with its Windows program; a file the cache refuses to open is
+// openMedia opens a chat's media message: photos and stickers in the media view, which asks for
+// their download itself; anything else (videos too, until the player comes) in its Windows program,
+// once downloaded.
+func (a *App) openMedia(m store.Message) {
+	if a.locked {
+		return // nothing is shown, opened or sent behind the lock page
+	}
+	switch {
+	case targetFor(m) == targetViewer:
+		msgs := a.chat.Messages()
+		i := slices.IndexFunc(msgs, func(x store.Message) bool { return x.ID == m.ID })
+		if i < 0 {
+			return
+		}
+		a.viewing = true
+		a.chat.SetVisible(false)
+		a.bar.SetVisible(false)
+		a.media.SetVisible(true)
+		a.media.Open(msgs, i, a.mediaSender)
+	case m.MediaPath == "" || media.Missing(m.MediaPath):
+		a.needMedia(m)
+	default:
+		a.openFile(m.MediaPath)
+	}
+}
+
+// closeMedia closes the media view, dropping its picture, and shows the chat again where it was.
+func (a *App) closeMedia() {
+	if !a.viewing {
+		return
+	}
+	a.viewing = false
+	a.media.Close()
+	a.media.SetVisible(false)
+	a.chat.SetVisible(true)
+	a.bar.SetVisible(true)
+	if !a.locked {
+		a.chat.Focus()
+	}
+}
+
+// mediaSender names who sent m, for the media view.
+func (a *App) mediaSender(m store.Message) string {
+	switch {
+	case m.FromMe:
+		return "You"
+	case isGroup(m.ChatJID):
+		return a.label(m.AccountID, m.SenderJID)
+	}
+	return a.label(m.AccountID, m.ChatJID)
+}
+
+// openFile opens a downloaded file with its Windows program; a file the cache refuses to open is
 // reported.
-func (a *App) openMedia(path string) {
+func (a *App) openFile(path string) {
 	if a.locked {
 		return // nothing is shown, opened or sent behind the lock page
 	}
@@ -364,7 +426,7 @@ func (a *App) openStory(sender string) {
 			}
 			a.statusAcct = acct
 			logErr("status viewer", ui.RunStatusView(a.mw, a.pal, sender, name, msgs, ui.StatusCallbacks{
-				OnNeedMedia: a.needMedia, OnOpenMedia: a.openMedia, OnViewed: a.markMessageRead,
+				OnNeedMedia: a.needMedia, OnOpenMedia: a.openFile, OnViewed: a.markMessageRead,
 				Opened: func(set func(id, path string)) { a.statusSet = set },
 			}))
 			a.statusSet = nil

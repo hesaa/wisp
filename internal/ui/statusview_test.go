@@ -377,7 +377,7 @@ func TestFitImageKeepsAspectNeverUpscalesAndRefusesHugeImages(t *testing.T) {
 	}
 }
 
-func TestFitRect(t *testing.T) {
+func TestFitShape(t *testing.T) {
 	area := walk.Rectangle{X: 10, Y: 20, Width: 400, Height: 300}
 	for _, c := range []struct {
 		w, h int
@@ -387,7 +387,7 @@ func TestFitRect(t *testing.T) {
 		{300, 600, walk.Rectangle{X: 135, Y: 20, Width: 150, Height: 300}}, // tall: pillarboxed
 		{0, 0, area}, // unknown size fills
 	} {
-		if got := fitRect(c.w, c.h, area); got != c.want {
+		if got := fitShape(c.w, c.h, area); got != c.want {
 			t.Errorf("%dx%d: %v want %v", c.w, c.h, got, c.want)
 		}
 	}

@@ -18,6 +18,7 @@ import (
 	"github.com/lxn/walk"
 	"github.com/lxn/win"
 	"golang.org/x/image/draw"
+	_ "golang.org/x/image/webp" // sticker files, in the media view
 	"golang.org/x/sys/windows"
 
 	"wa-go/internal/media"
@@ -86,7 +87,7 @@ type ChatView struct {
 
 	onLoadPrevious func()
 	onNeedMedia    func(store.Message)
-	onOpenMedia    func(path string)
+	onOpenMedia    func(store.Message)
 }
 
 // chatModel is the open chat's messages and paging state, kept apart from the window so its rules
@@ -259,9 +260,15 @@ func (v *ChatView) OnLoadPrevious(fn func()) { v.onLoadPrevious = fn }
 // may come for a download already under way.
 func (v *ChatView) OnNeedMedia(fn func(store.Message)) { v.onNeedMedia = fn }
 
-// OnOpenMedia sets the handler of a double-click or Enter on downloaded media (path is
-// Message.MediaPath), typically media.Cache.OpenInDefaultApp.
-func (v *ChatView) OnOpenMedia(fn func(path string)) { v.onOpenMedia = fn }
+// OnOpenMedia sets the handler of a double-click or Enter on media, downloaded or not: it shows it
+// in the media view, or opens its file, or asks for the download first.
+func (v *ChatView) OnOpenMedia(fn func(store.Message)) { v.onOpenMedia = fn }
+
+// Messages are the loaded messages, oldest first; the caller must not change them.
+func (v *ChatView) Messages() []store.Message { return v.msgs }
+
+// Focus gives the messages the keyboard.
+func (v *ChatView) Focus() { focusOn(v.canvas) }
 
 // SetChat shows a chat from its newest page (store.GetChatMessages page 0, newest first), scrolled
 // to the end. name is the chat's own name ("" for none).
@@ -547,13 +554,33 @@ func decodeCapped(r io.ReadSeeker, limit int) (image.Image, error) {
 		return nil, err
 	}
 	if cfg.Width <= 0 || cfg.Height <= 0 || cfg.Width > limit/cfg.Height {
-		return nil, fmt.Errorf("ui: refusing to decode a %dx%d image", cfg.Width, cfg.Height)
+		return nil, fmt.Errorf("ui: refusing to decode a %dx%d image: %w", cfg.Width, cfg.Height, media.ErrImageTooLarge)
 	}
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
 	src, _, err := image.Decode(r)
 	return src, err
+}
+
+// decodeFull decodes a cached photo or sticker at full size, as decodeCapped does for thumbnails;
+// one of more than maxFullPixels is refused with media.ErrImageTooLarge.
+func decodeFull(path string) (*image.RGBA, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	src, err := decodeCapped(f, maxFullPixels)
+	if err != nil {
+		return nil, err
+	}
+	if rgba, ok := src.(*image.RGBA); ok {
+		return rgba, nil
+	}
+	dst := image.NewRGBA(src.Bounds())
+	draw.Draw(dst, dst.Bounds(), src, src.Bounds().Min, draw.Src)
+	return dst, nil
 }
 
 // coverImage decodes a small JPEG or PNG and scales it to cover w x h, centre-cropped, so only a
@@ -988,19 +1015,21 @@ func (v *ChatView) flash(s string) {
 	})
 }
 
-// activate acts on a media message: asks for its download when it has none (or its file is gone),
-// else opens it when open.
+// activate acts on a media message: opens it when open (OnOpenMedia decides about the download),
+// else asks for its download when it has none.
 func (v *ChatView) activate(m store.Message, open bool) {
 	switch {
 	case v.lay.cache[m.ID].kind == kindText:
-	case m.MediaPath == "" || media.Missing(m.MediaPath):
-		if v.onNeedMedia != nil {
-			v.onNeedMedia(m)
-		}
 	case open && v.onOpenMedia != nil:
-		v.onOpenMedia(m.MediaPath)
+		v.onOpenMedia(m)
+	case needsDownload(m) && v.onNeedMedia != nil:
+		v.onNeedMedia(m)
 	}
 }
+
+// needsDownload reports whether m's media must be downloaded before it can be shown or opened: it
+// never was, or its file is gone (Clear Cache, or deleted by hand).
+func needsDownload(m store.Message) bool { return m.MediaPath == "" || media.Missing(m.MediaPath) }
 
 func (v *ChatView) paintHeader(c *walk.Canvas, _ walk.Rectangle) error {
 	dpi, b, p := v.header.DPI(), v.header.ClientBoundsPixels(), v.pal

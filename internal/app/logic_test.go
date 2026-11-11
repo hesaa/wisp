@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
+	"google.golang.org/protobuf/proto"
 
 	"wa-go/internal/store"
 	"wa-go/internal/ui"
@@ -577,6 +579,23 @@ func TestDropMissingMedia(t *testing.T) {
 	dropMissingMedia(msgs)
 	if msgs[0].MediaPath != kept || msgs[1].MediaPath != "" || msgs[2].MediaPath != "" {
 		t.Fatalf("after: %+v", msgs)
+	}
+}
+
+func TestTargetFor(t *testing.T) {
+	cases := map[string]mediaTarget{"image": targetViewer, "sticker": targetViewer, "video": targetPlayer,
+		"audio": targetExternal, "document": targetExternal}
+	for typ, want := range cases {
+		if got := targetFor(store.Message{Type: typ}); got != want {
+			t.Errorf("%s: %v, want %v", typ, got, want)
+		}
+	}
+	meta, err := proto.Marshal(&waE2E.VideoMessage{GifPlayback: proto.Bool(true)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := targetFor(store.Message{Type: "video", MediaMeta: meta}); got != targetPlayer {
+		t.Errorf("gif: %v, want the player", got)
 	}
 }
 

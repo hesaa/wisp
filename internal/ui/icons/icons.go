@@ -39,6 +39,7 @@ const (
 	IconChevronLeft
 	IconChevronRight
 	IconClose
+	IconBack // left arrow: leave a view
 )
 
 const (
@@ -140,6 +141,7 @@ var definitions = map[Icon][]op{
 	IconChevronLeft:  {poly(15, 5, 8, 12, 15, 19)},
 	IconChevronRight: {poly(9, 5, 16, 12, 9, 19)},
 	IconClose:        {poly(6, 6, 18, 18), poly(18, 6, 6, 18)},
+	IconBack:         {poly(20, 12, 4, 12), poly(10, 6, 4, 12, 10, 18)},
 }
 
 func argb(c walk.Color) uint32 {

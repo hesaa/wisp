@@ -346,9 +346,9 @@ func (c *statusCtl) close() {
 	c.dispose()
 }
 
-// fitRect is the largest rectangle of a w x h picture's shape that fits area, centred in it; an
+// fitShape is the largest rectangle of a w x h picture's shape that fits area, centred in it; an
 // unknown size fills the area.
-func fitRect(w, h int, area walk.Rectangle) walk.Rectangle {
+func fitShape(w, h int, area walk.Rectangle) walk.Rectangle {
 	if w <= 0 || h <= 0 || area.Width <= 0 || area.Height <= 0 {
 		return area
 	}
@@ -369,7 +369,7 @@ func fitImage(r io.ReadSeeker, w, h, limit int) (*image.RGBA, error) {
 	sb := src.Bounds()
 	dw, dh := sb.Dx(), sb.Dy()
 	if dw > w || dh > h {
-		fit := fitRect(dw, dh, walk.Rectangle{Width: w, Height: h})
+		fit := fitShape(dw, dh, walk.Rectangle{Width: w, Height: h})
 		dw, dh = max(1, fit.Width), max(1, fit.Height)
 	}
 	dst := image.NewRGBA(image.Rect(0, 0, dw, dh))
@@ -655,7 +655,7 @@ func (d *statusDialog) makePictures(m *store.Message, gen int64) {
 	c.thumb = nil
 	if pv, w, h := slidePreview(m); pv != nil {
 		// the embedded preview is tiny: smoothed up to the slide, not left to blocky stretching
-		if fit := fitRect(w, h, area); fit.Width > 0 && fit.Height > 0 && area.Width > 0 {
+		if fit := fitShape(w, h, area); fit.Width > 0 && fit.Height > 0 && area.Width > 0 {
 			dst := image.NewRGBA(image.Rect(0, 0, fit.Width, fit.Height))
 			draw.BiLinear.Scale(dst, dst.Bounds(), pv, pv.Bounds(), draw.Src, nil)
 			pv, w, h = dst, fit.Width, fit.Height
@@ -802,9 +802,9 @@ func (d *statusDialog) paintPicture(c *walk.Canvas, g statusGeom, m *store.Messa
 	switch {
 	case ctl.pic != nil:
 		sz := ctl.pic.Size()
-		errs = append(errs, c.DrawImageStretchedPixels(ctl.pic, fitRect(sz.Width, sz.Height, g.body)))
+		errs = append(errs, c.DrawImageStretchedPixels(ctl.pic, fitShape(sz.Width, sz.Height, g.body)))
 	case ctl.thumb != nil:
-		errs = append(errs, c.DrawImageStretchedPixels(ctl.thumb, fitRect(ctl.aspect.Width, ctl.aspect.Height, g.body)))
+		errs = append(errs, c.DrawImageStretchedPixels(ctl.thumb, fitShape(ctl.aspect.Width, ctl.aspect.Height, g.body)))
 	case m.MediaPath == "":
 		errs = append(errs, icons.Draw(c, icons.IconDownload, square(g.body.X+g.body.Width/2, g.body.Y+g.body.Height/2, s(48)), theme.Color(p.TextSecondary)))
 	}
