@@ -462,7 +462,9 @@ func (d *settingsDialog) loadGlobals() {
 			w.setValue(vals[key])
 			w.setBusy(false)
 		}
-		d.showLock(vals[KeyLockPIN])
+		if err == nil { // else the PIN state is unknown: no button, so Set PIN can't replace a PIN unasked
+			d.showLock(vals[KeyLockPIN])
+		}
 		logErr("GIPHY key field", d.keyEdit.SetText(vals[KeyGiphyAPIKey]))
 		logErr("proxy field", d.proxyEdit.SetText(vals[KeyProxy]))
 	})

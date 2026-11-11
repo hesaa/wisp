@@ -54,6 +54,24 @@ func TestGifRestart(t *testing.T) {
 	}
 }
 
+// A poll late enough to judge the stopped GIF short of its end only delays the restart: the next
+// stopped poll restarts it.
+func TestGifRestartAfterLatePoll(t *testing.T) {
+	total := 3 * time.Second
+	at := gifReached(playerPlaying, total-400*time.Millisecond, 0) // the last poll while it played
+	at = gifReached(playerStopped, 0, at)                          // late: mfplay already rewound
+	if gifRestart(playerStopped, at, total) {
+		t.Fatalf("restarted at %v, before the end could be told", at)
+	}
+	at = gifReached(playerStopped, 0, at)
+	if !gifRestart(playerStopped, at, total) {
+		t.Errorf("not restarted at %v on the poll after the late one", at)
+	}
+	if got := gifReached(playerPlaying, time.Second, at); got != time.Second {
+		t.Errorf("playing again: %v, want 1s", got)
+	}
+}
+
 // Gated live check: plays a local H.264 MP4 through mfplay.dll in a hidden window.
 func TestPlayerPlaysMP4(t *testing.T) {
 	path := os.Getenv("WISP_TEST_MP4")

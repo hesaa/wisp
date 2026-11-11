@@ -3,6 +3,7 @@ package app
 import (
 	"fmt"
 	"syscall"
+	"unsafe"
 
 	"github.com/lxn/win"
 	"golang.org/x/sys/windows"
@@ -32,6 +33,12 @@ func mainWndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
 	case win.WM_ACTIVATEAPP:
 		hooked.presence.activated(wParam != 0)
+	case win.WM_SYSCOMMAND:
+		if wParam&0xFFF0 == win.SC_MINIMIZE {
+			hooked.lockNow() // while the window still paints: the taskbar preview and Alt+Tab keep the lock page
+			// UpdateWindow, children included: the lock page is a child window
+			win.RedrawWindow(hwnd, nil, 0, win.RDW_INVALIDATE|win.RDW_UPDATENOW|win.RDW_ALLCHILDREN)
+		}
 	case wmWTSSessionChange:
 		switch wParam {
 		case wtsSessionLock:
@@ -49,6 +56,7 @@ func mainWndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 var (
 	user32            = windows.NewLazySystemDLL("user32.dll")
 	enumThreadWindows = user32.NewProc("EnumThreadWindows")
+	endMenu           = user32.NewProc("EndMenu")
 	modalPtr          = syscall.NewCallback(collectModal)
 	modalOwner        win.HWND // closeModals' arguments and result; UI thread only
 	modals            []win.HWND
@@ -78,6 +86,27 @@ func closeModals(owner win.HWND) {
 	for _, h := range modals {
 		win.PostMessage(h, win.WM_CLOSE, 0, 0)
 	}
+}
+
+var dwmSetWindowAttribute = windows.NewLazySystemDLL("dwmapi.dll").NewProc("DwmSetWindowAttribute")
+
+const dwmwaForceIconicRepresentation = 7
+
+// forceIconic makes the taskbar preview and Alt+Tab show the icon instead of the window while on
+// (a PIN is set): a window minimised by Win+D never repaints the lock page first.
+func forceIconic(h win.HWND, on bool) error {
+	if err := dwmSetWindowAttribute.Find(); err != nil {
+		return err
+	}
+	v := int32(0) // BOOL
+	if on {
+		v = 1
+	}
+	r, _, _ := dwmSetWindowAttribute.Call(uintptr(h), dwmwaForceIconicRepresentation, uintptr(unsafe.Pointer(&v)), unsafe.Sizeof(v))
+	if int32(r) < 0 {
+		return fmt.Errorf("app: DwmSetWindowAttribute: HRESULT %#x", uint32(r))
+	}
+	return nil
 }
 
 // watchActivation subclasses the main window for WM_ACTIVATEAPP and registers it for session lock

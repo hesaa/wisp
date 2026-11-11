@@ -9,6 +9,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"time"
 
@@ -91,6 +92,7 @@ type App struct {
 	lockPage   *ui.LockPage
 	backoff    lock.Backoff // wrong PINs; not persisted
 	adding     bool         // the user asked to link another account
+	loaded     bool         // the saved accounts are on the rail: until then none is not "no account"
 	page       page         // as showPage last set it
 	locked     bool         // the lock page covers the window (Task 5)
 	exiting    bool
@@ -120,6 +122,9 @@ func New(db *store.DB, cache *media.Cache, builtinGIFKey string) (*App, error) {
 	}
 	for _, k := range globalKeys {
 		v, err := ui.Setting(db, "", k)
+		if err != nil && k == ui.KeyLockPIN {
+			return nil, fmt.Errorf("app: reading the app lock: %w", err) // fail safe: never start unlocked by mistake
+		}
 		logErr("read setting "+k, err) // the default stands in
 		a.cfg[k] = v
 	}
@@ -221,6 +226,9 @@ func (a *App) build() error {
 	mw.Starting().Attach(func() { mw.Synchronize(a.focusPage) })
 	mw.SendMessage(win.WM_CHANGEUISTATE, win.UIS_INITIALIZE, 0)
 	logErr("presence", a.watchActivation()) // without it presence stays unavailable
+	if a.cfg[ui.KeyLockPIN] != "" {
+		logErr("taskbar preview", forceIconic(mw.Handle(), true)) // not fatal: the lock page still covers a restore
+	}
 	// cosmetic: Windows builds without dark title bars keep a light one
 	logErr("title bar", theme.ApplyTitleBar(uintptr(mw.Handle()), theme.Resolve(mode) == theme.ThemeDark))
 	return nil
@@ -243,6 +251,7 @@ func (a *App) Attach(mgr Backend) {
 		err := mgr.Start(context.Background()) // returns before the accounts connect
 		a.mw.Synchronize(func() {
 			logErr("sessions", err)
+			a.loaded = true
 			a.refreshAccounts()
 		})
 	}()
@@ -455,6 +464,8 @@ func (a *App) settingChanged(key string) {
 		a.sendPresence(true)
 	case ui.KeyAutoDownloadImages:
 		a.chat.SetAutoDownload(v == "true")
+	case ui.KeyLockPIN:
+		logErr("taskbar preview", forceIconic(a.mw.Handle(), v != ""))
 	}
 }
 
@@ -467,11 +478,15 @@ func (a *App) pair() {
 	a.showPage()
 }
 
-// showPage shows exactly one page: the chats, the link page or the lock page. Pairing runs only
-// while the link page is in front of a window the user can see.
+// showPage shows at most one page: the chats, the link page or the lock page (none until the
+// accounts are loaded). Pairing runs only while the link page is in front of a window the user can
+// see; a video or GIF plays only while the chats are.
 func (a *App) showPage() {
 	n := len(a.rail.Model().Accounts())
-	pg := pageFor(n, a.locked, a.adding)
+	pg := pageFor(n, a.loaded, a.locked, a.adding)
+	if !mediaStays(pg, a.mw.Visible(), win.IsIconic(a.mw.Handle())) {
+		a.closeMedia() // to the tray, minimised, linking: nothing plays unseen
+	}
 	chats := pg == pageChats
 	a.rail.SetVisible(chats)
 	a.side.SetVisible(chats)
@@ -507,6 +522,7 @@ func (a *App) lockNow() {
 		return // off, or already locked (a countdown in progress stays)
 	}
 	a.locked = true
+	endMenu.Call() // an open context menu could still Copy behind the lock
 	if !a.resetting {
 		closeModals(a.mw.Handle()) // Settings, New chat, the status viewer, their dialogs
 	}

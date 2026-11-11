@@ -7,6 +7,8 @@ import (
 	"slices"
 	"time"
 
+	"github.com/lxn/win"
+
 	"wa-go/internal/media"
 	"wa-go/internal/store"
 	"wa-go/internal/ui"
@@ -263,7 +265,7 @@ func (a *App) closeMedia() {
 	a.media.SetVisible(false)
 	a.chat.SetVisible(true)
 	a.bar.SetVisible(true)
-	if !a.locked {
+	if !a.locked && a.mw.Visible() && !win.IsIconic(a.mw.Handle()) { // not into a window off screen
 		a.chat.Focus()
 	}
 }

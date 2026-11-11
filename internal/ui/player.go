@@ -52,6 +52,16 @@ func seekAt(x, width int, total time.Duration) time.Duration {
 	return max(0, min(total, time.Duration(float64(total)*float64(x)/float64(width))))
 }
 
+// gifReached is how far a GIF has got at a poll, given last, the value at the poll before: the
+// position while it plays; once stopped (mfplay rewinds to 0 at the end), last plus one poll, so a
+// late poll that judged it short of the end only delays the restart.
+func gifReached(st playerState, pos, last time.Duration) time.Duration {
+	if st == playerStopped {
+		return last + videoPoll
+	}
+	return pos
+}
+
 // gifRestart reports whether a GIF has played to its end and must start again.
 func gifRestart(st playerState, pos, total time.Duration) bool {
 	return st == playerStopped && total > 0 && pos >= total-100*time.Millisecond

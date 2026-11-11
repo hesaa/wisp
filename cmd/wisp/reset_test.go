@@ -29,6 +29,27 @@ func TestWipeDataKeepsOnlyTheLog(t *testing.T) {
 	}
 }
 
+// A session file that cannot be deleted (held open: Windows refuses) keeps wisp.db and its PIN.
+func TestWipeDataKeepsThePINWhenASessionStays(t *testing.T) {
+	dir := t.TempDir()
+	for _, n := range []string{"wisp.db", "session.db"} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f, err := os.Open(filepath.Join(dir, "session.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := wipeData(dir); err == nil {
+		t.Fatal("no error with session.db held open")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "wisp.db")); err != nil {
+		t.Errorf("wisp.db: %v; want it kept", err)
+	}
+}
+
 func TestWipeDataWithNothingThere(t *testing.T) {
 	if err := wipeData(t.TempDir()); err != nil {
 		t.Fatal(err)

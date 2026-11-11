@@ -30,7 +30,7 @@ const (
 	videoBarH = 48   // a video's control bar, 1/96 inch
 	videoPoll = 250 * time.Millisecond
 	videoWait = 5 * time.Second // for playback to start before the video counts as unplayable
-	videoSkip = 5 * time.Second // per ← or →
+	videoSkip = 5 * time.Second // per Shift+← or Shift+→
 )
 
 // every runs tick every d on a goroutine until the returned channel is closed.
@@ -149,7 +149,8 @@ type MediaView struct {
 	opened   time.Time
 	st       playerState
 	pos, dur time.Duration
-	seeking  bool // the seek bar is dragged
+	gifAt    time.Duration // how far a GIF has got (see gifReached); not rewound when mfplay stops it
+	seeking  bool          // the seek bar is dragged
 
 	list      []store.Message
 	i         int
@@ -493,7 +494,7 @@ func (v *MediaView) update() {
 
 // startVideo creates the player for m (downloaded) and the timer that polls it.
 func (v *MediaView) startVideo(m store.Message) {
-	v.muted, v.started, v.opened, v.st, v.pos, v.dur = v.gif, false, time.Now(), playerEmpty, 0, 0
+	v.muted, v.started, v.opened, v.st, v.pos, v.dur, v.gifAt = v.gif, false, time.Now(), playerEmpty, 0, 0, 0
 	p, err := newPlayer(v.video.Handle(), m.MediaPath)
 	if err != nil {
 		logErr("video "+m.ID, err)
@@ -534,12 +535,10 @@ func (v *MediaView) poll() {
 	if d, err := v.play.Duration(); err == nil {
 		dur = d
 	}
-	ended := pos
-	if st == playerStopped {
-		ended = v.pos + videoPoll // mfplay rewinds to 0 at the end: judge by the last position seen
-	}
-	if v.gif && gifRestart(st, ended, dur) {
+	v.gifAt = gifReached(st, pos, v.gifAt)
+	if v.gif && v.started && gifRestart(st, v.gifAt, dur) {
 		logErr("gif loop", errors.Join(v.play.Seek(0), v.play.Play()))
+		v.gifAt = 0 // until it plays again: no second restart before a whole loop
 	}
 	if st != v.st || pos != v.pos || dur != v.dur {
 		v.st, v.pos, v.dur = st, pos, dur
@@ -587,19 +586,21 @@ func (v *MediaView) updateVideo() {
 	}
 }
 
-// videoKey handles a video's keys on the player's window; a GIF's go on to the view's.
+// videoKey handles a video's keys on the player's window: Space, Shift+← and Shift+→ (seek), m; the
+// rest, and all of a GIF's, go on to the view's (← and → step to the previous or next media).
 func (v *MediaView) videoKey(k walk.Key) bool {
 	if v.play == nil || v.gif {
 		return false
 	}
-	switch k {
-	case walk.KeySpace:
+	shift := walk.ShiftDown()
+	switch {
+	case k == walk.KeySpace:
 		v.toggle()
-	case walk.KeyLeft:
+	case k == walk.KeyLeft && shift:
 		v.seek(v.pos - videoSkip)
-	case walk.KeyRight:
+	case k == walk.KeyRight && shift:
 		v.seek(v.pos + videoSkip)
-	case walk.KeyM:
+	case k == walk.KeyM:
 		v.toggleMute()
 	default:
 		return false

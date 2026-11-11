@@ -492,14 +492,18 @@ const (
 	pageChats page = iota // rail, chat list and chat column
 	pageLink              // linking a phone
 	pageLock              // the lock screen
+	pageNone              // nothing yet: the saved accounts are still loading
 )
 
-// pageFor picks the page: the lock covers everything, then linking (no account yet, or the user
-// is adding one), else the chats.
-func pageFor(accounts int, locked, adding bool) page {
+// pageFor picks the page: the lock covers everything; then nothing until the saved accounts are
+// loaded (none yet is not "no account"), then linking (no account, or the user is adding one), else
+// the chats.
+func pageFor(accounts int, loaded, locked, adding bool) page {
 	switch {
 	case locked:
 		return pageLock
+	case !loaded:
+		return pageNone
 	case accounts == 0 || adding:
 		return pageLink
 	}
@@ -509,6 +513,10 @@ func pageFor(accounts int, locked, adding bool) page {
 // pairingRuns reports whether the link page should be pairing: it is the page, and the window is
 // on screen (not hidden to the tray, not minimised).
 func pairingRuns(pg page, visible, iconic bool) bool { return pg == pageLink && visible && !iconic }
+
+// mediaStays reports whether an open media view may stay open (and a video or GIF keep playing):
+// the chats are the page, and the window is on screen.
+func mediaStays(pg page, visible, iconic bool) bool { return pg == pageChats && visible && !iconic }
 
 // linkCancellable: Cancel returns to the chats, so it needs an account and an add in progress.
 func linkCancellable(adding bool, accounts int) bool { return adding && accounts > 0 }

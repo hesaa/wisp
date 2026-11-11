@@ -602,27 +602,50 @@ func TestTargetFor(t *testing.T) {
 func TestPageFor(t *testing.T) {
 	cases := []struct {
 		accounts int
+		loaded   bool
 		locked   bool
 		adding   bool
 		want     page
 	}{
-		{0, false, false, pageLink}, {1, false, false, pageChats}, {1, false, true, pageLink},
-		{0, true, false, pageLock}, {2, true, true, pageLock}, {2, false, false, pageChats},
+		{0, true, false, false, pageLink}, {1, true, false, false, pageChats}, {1, true, false, true, pageLink},
+		{0, true, true, false, pageLock}, {2, true, true, true, pageLock}, {2, true, false, false, pageChats},
+		// start-up: the accounts are not loaded yet, so none is not "no account" (no link page, no pairing)
+		{0, false, false, false, pageNone}, {0, false, false, true, pageNone}, {0, false, true, false, pageLock},
 	}
 	for _, c := range cases {
-		if got := pageFor(c.accounts, c.locked, c.adding); got != c.want {
-			t.Errorf("pageFor(%d, %v, %v) = %v, want %v", c.accounts, c.locked, c.adding, got, c.want)
+		if got := pageFor(c.accounts, c.loaded, c.locked, c.adding); got != c.want {
+			t.Errorf("pageFor(%d, %v, %v, %v) = %v, want %v", c.accounts, c.loaded, c.locked, c.adding, got, c.want)
+		}
+		if c.want == pageNone && pairingRuns(c.want, true, false) {
+			t.Errorf("pairing runs before the accounts are loaded")
 		}
 	}
 }
 
 // Two accounts, one logs out: the chats stay; the last one logs out: the link page shows.
 func TestPageAfterLogouts(t *testing.T) {
-	if got := pageFor(1, false, false); got != pageChats {
+	if got := pageFor(1, true, false, false); got != pageChats {
 		t.Errorf("one account left: %v, want pageChats", got)
 	}
-	if got := pageFor(0, false, false); got != pageLink {
+	if got := pageFor(0, true, false, false); got != pageLink {
 		t.Errorf("none left: %v, want pageLink", got)
+	}
+}
+
+// The media view closes (nothing plays) unless the chats are in front of a window on screen.
+func TestMediaStays(t *testing.T) {
+	cases := []struct {
+		pg              page
+		visible, iconic bool
+		want            bool
+	}{
+		{pageChats, true, false, true}, {pageChats, false, false, false}, {pageChats, true, true, false},
+		{pageLink, true, false, false}, {pageLock, true, false, false}, {pageNone, true, false, false},
+	}
+	for _, c := range cases {
+		if got := mediaStays(c.pg, c.visible, c.iconic); got != c.want {
+			t.Errorf("mediaStays(%v, %v, %v) = %v, want %v", c.pg, c.visible, c.iconic, got, c.want)
+		}
 	}
 }
 

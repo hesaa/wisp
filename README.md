@@ -52,7 +52,11 @@ The lock hides Wisp's window; it doesn't encrypt Wisp's files.
 ## Media and copying
 
 Photos, stickers, videos and GIFs open inside Wisp: a single click (or Enter) on one opens it.
-Audio and documents open in their usual program, on double-click or Enter.
+← and → step through the chat's photos and videos; Esc goes back to the chat. Zoom a photo with the
+mouse wheel, Ctrl + and Ctrl −, or a double-click; 0 fits it again. On a video, Space plays and
+pauses, Shift+← and Shift+→ skip 5 seconds, and m mutes. **Save as…** keeps a copy, and **Open
+with…** opens it in its usual program. Audio and documents open in their usual program, on
+double-click or Enter.
 
 Drag across message text to select it, then Ctrl+C to copy; Esc clears the selection. Ctrl+click,
 Shift+click or Shift+↑↓ pick whole messages, and Ctrl+C copies them. Right-click, the Menu key or
