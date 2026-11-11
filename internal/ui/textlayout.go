@@ -215,19 +215,36 @@ func wordAt(units []uint16, off int) (start, end int) {
 	return len(units), len(units)
 }
 
-// selSpan is the part [s, e) of message i's text, n units long, that lies between from and to.
-func selSpan(from, to textPos, i, n int) (s, e int) {
+// selSpan is the part [s, e) of message i's text units that lies between from and to. An end past
+// the text or inside a character (left there by an edit of the message) moves to the start of the
+// character, so a selection never splits one.
+func selSpan(from, to textPos, i int, units []uint16) (s, e int) {
 	if i < from.msg || i > to.msg {
 		return 0, 0
 	}
-	s, e = 0, n
+	s, e = 0, len(units)
 	if i == from.msg {
-		s = min(from.off, n)
+		s = charStart(units, from.off)
 	}
 	if i == to.msg {
-		e = min(to.off, n)
+		e = charStart(units, to.off)
 	}
 	return s, max(s, e)
+}
+
+// charStart is the start of the character (cluster) holding offset off of units; the end of units
+// for an offset at or past it.
+func charStart(units []uint16, off int) int {
+	if off >= len(units) {
+		return len(units)
+	}
+	for i := 0; ; {
+		_, n := cluster(units, i)
+		if i+n > off {
+			return i
+		}
+		i += n
+	}
 }
 
 // selectedText is the text between from and to, texts holding each message's text by index: the
@@ -236,7 +253,7 @@ func selSpan(from, to textPos, i, n int) (s, e int) {
 func selectedText(texts [][]uint16, from, to textPos) string {
 	var parts []string
 	for i := from.msg; i <= to.msg && i < len(texts); i++ {
-		if s, e := selSpan(from, to, i, len(texts[i])); s < e {
+		if s, e := selSpan(from, to, i, texts[i]); s < e {
 			parts = append(parts, string(utf16.Decode(texts[i][s:e])))
 		}
 	}

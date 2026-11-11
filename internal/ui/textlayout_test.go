@@ -205,3 +205,29 @@ func TestOrderPos(t *testing.T) {
 		}
 	}
 }
+
+func TestSelectionOffsetsStayOnCharacters(t *testing.T) {
+	// offsets left inside a character by an edit of the message snap to its start
+	u := utf16.Encode([]rune("a😀b")) // a, the pair at 1-2, b at 3
+	for _, c := range []struct {
+		from, to   int
+		start, end int
+	}{
+		{0, 2, 0, 1},  // the end inside the pair: the emoji is left out
+		{2, 4, 1, 4},  // the start inside it: the emoji is taken whole
+		{0, 99, 0, 4}, // past the end of a shortened text
+		{2, 2, 1, 1},
+	} {
+		if s, e := selSpan(textPos{0, c.from}, textPos{0, c.to}, 0, u); s != c.start || e != c.end {
+			t.Errorf("selSpan %d..%d = %d..%d, want %d..%d", c.from, c.to, s, e, c.start, c.end)
+		}
+	}
+	family := utf16.Encode([]rune("x👨\u200d👩y")) // the family sequence is units 1-5
+	if s, e := selSpan(textPos{0, 0}, textPos{0, 4}, 0, family); s != 0 || e != 1 {
+		t.Errorf("an end inside an emoji sequence: %d..%d, want 0..1", s, e)
+	}
+	texts := [][]uint16{utf16.Encode([]rune("Hi 😀")), u}
+	if got := selectedText(texts, textPos{0, 4}, textPos{1, 2}); got != "😀\r\na" {
+		t.Errorf("copied across stale offsets: %q", got)
+	}
+}

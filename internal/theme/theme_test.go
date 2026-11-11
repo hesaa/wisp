@@ -39,7 +39,7 @@ func TestDarkAndLightValues(t *testing.T) {
 	if d.TickRead != "#53bdeb" || l.TickRead != "#53bdeb" {
 		t.Errorf("read tick colour: dark %q light %q, want #53bdeb", d.TickRead, l.TickRead)
 	}
-	if d.Selection != "#2b5f56" || l.Selection != "#b9e3d8" {
+	if d.Selection != "#27649b" || l.Selection != "#b3d4f5" {
 		t.Errorf("selection colour: dark %q light %q", d.Selection, l.Selection)
 	}
 }

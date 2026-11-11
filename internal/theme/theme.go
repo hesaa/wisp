@@ -39,14 +39,14 @@ var dark = Palette{
 	ChatBg: "#0b141a", Rail: "#111b21", Sidebar: "#111b21", Header: "#202c33",
 	OutgoingBubble: "#005c4b", IncomingBubble: "#202c33",
 	Text: "#e9edef", TextSecondary: "#8696a0", Accent: "#00a884", TickRead: "#53bdeb",
-	Selection: "#2b5f56",
+	Selection: "#27649b",
 }
 
 var light = Palette{
 	ChatBg: "#efeae2", Rail: "#111b21", Sidebar: "#ffffff", Header: "#f0f2f5",
 	OutgoingBubble: "#d9fdd3", IncomingBubble: "#ffffff",
 	Text: "#111b21", TextSecondary: "#667781", Accent: "#00a884", TickRead: "#53bdeb",
-	Selection: "#b9e3d8",
+	Selection: "#b3d4f5",
 }
 
 // Resolve turns ThemeSystem into ThemeDark or ThemeLight; other modes pass through.

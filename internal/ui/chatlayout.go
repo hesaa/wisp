@@ -126,6 +126,15 @@ func bubbleText(m *store.Message, info mediaInfo) (string, bool) {
 	return strings.TrimRight(m.Body, " \t\r\n"), false
 }
 
+// selectableUnits is the text of message m's bubble b a selection may take: its text or caption,
+// none for a notice ("This message was deleted").
+func selectableUnits(m *store.Message, b bubble) []uint16 {
+	if _, muted := bubbleText(m, b.info); muted {
+		return nil
+	}
+	return b.units
+}
+
 // cardLabels are a media card's title and its size line.
 func cardLabels(m *store.Message, info mediaInfo) (title, sub string) {
 	size := humanSize(info.size)

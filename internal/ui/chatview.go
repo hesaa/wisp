@@ -656,7 +656,7 @@ func (v *ChatView) mouseDown(x, y int, b walk.MouseButton) {
 	}
 	v.lastClickID, v.lastClickAt, v.clicks = m.ID, now, n
 	// a press on text selects, so a double-click on a caption picks a word and leaves the media be
-	if t := v.lay.cache[m.ID].text; x >= t.X && x < t.X+t.Width && y >= v.screenY(i)+t.Y && y < v.screenY(i)+t.Y+t.Height {
+	if t := v.lay.cache[m.ID].text; len(v.selText(i)) > 0 && x >= t.X && x < t.X+t.Width && y >= v.screenY(i)+t.Y && y < v.screenY(i)+t.Y+t.Height {
 		v.pressText(x, y, n)
 		return
 	}
@@ -671,15 +671,15 @@ func (v *ChatView) mouseDown(x, y int, b walk.MouseButton) {
 // anchor of a drag, the second selects the word under the pointer, the third the message's text.
 func (v *ChatView) pressText(x, y, n int) {
 	p := v.posAt(x, y, n == 2)
-	id := v.msgs[p.msg].ID
+	id, units := v.msgs[p.msg].ID, v.selText(p.msg)
 	a, b := p.off, p.off
 	switch n {
 	case 1:
 		v.dragging, v.drag = true, walk.Point{X: x, Y: y}
 	case 2:
-		a, b = wordAt(v.lay.cache[id].units, p.off)
+		a, b = wordAt(units, p.off)
 	default:
-		a, b = 0, len(v.lay.cache[id].units)
+		a, b = 0, len(units)
 		v.lastClickID = "" // the next press starts over
 	}
 	v.setSel(textMark{id, a}, textMark{id, b})
@@ -731,26 +731,23 @@ func (v *ChatView) autoScroll() {
 }
 
 // posAt is the text position at canvas point (x, y), or the nearest one: in the last message whose
-// top is at or above y (the first above all), the start of its text above the text, the end below
-// it, else the boundary nearest to x on the line at y, or with under the character under x.
+// top is at or above y (the first above all), the start of its text above the text or when it has
+// none to select, the end below it, else the boundary nearest to x on the line at y, or with under
+// the character under x.
 func (v *ChatView) posAt(x, y int, under bool) textPos {
 	i := max(0, sort.Search(len(v.lay.tops), func(i int) bool { return v.screenY(i) > y })-1)
 	m := &v.msgs[i]
 	b := v.lay.cache[m.ID]
 	top := v.screenY(i) + b.text.Y
 	switch {
-	case len(b.lines) == 0 || y < top:
+	case len(selectableUnits(m, b)) == 0 || y < top:
 		return textPos{i, 0}
 	case y >= top+len(b.lines)*v.lay.lineH:
 		return textPos{i, len(b.units)}
 	}
 	ln := b.lines[(y-top)/v.lay.lineH]
-	style := walk.FontStyle(0)
-	if _, muted := bubbleText(m, b.info); muted {
-		style = walk.FontItalic
-	}
 	ms := &gdiMeasurer{dpi: v.canvas.DPI(), cdpi: v.cdpi}
-	adv := lineAdv(ms, b.units[ln.start:ln.end], style)
+	adv := lineAdv(ms, b.units[ln.start:ln.end], 0) // notices, in italics, are not selectable
 	logErr("chat hit test", ms.close())
 	x -= b.text.X
 	if under { // the unit whose right edge is past x; past the line's end, its last
@@ -760,6 +757,11 @@ func (v *ChatView) posAt(x, y int, under bool) textPos {
 }
 
 func (v *ChatView) mark(p textPos) textMark { return textMark{v.msgs[p.msg].ID, p.off} }
+
+// selText is the selectable text of message i (selectableUnits).
+func (v *ChatView) selText(i int) []uint16 {
+	return selectableUnits(&v.msgs[i], v.lay.cache[v.msgs[i].ID])
+}
 
 // setSel sets the selection's anchor and caret, repainting on a change.
 func (v *ChatView) setSel(a, b textMark) {
@@ -784,7 +786,7 @@ func (v *ChatView) selectionText() string {
 	}
 	texts := make([][]uint16, to.msg+1)
 	for i := from.msg; i <= to.msg; i++ {
-		texts[i] = v.lay.cache[v.msgs[i].ID].units
+		texts[i] = v.selText(i)
 	}
 	return selectedText(texts, from, to)
 }
@@ -890,7 +892,7 @@ func (v *ChatView) paint(c *walk.Canvas, ub walk.Rectangle) error {
 			continue
 		}
 		var sel textLine
-		sel.start, sel.end = selSpan(from, to, i, len(b.units))
+		sel.start, sel.end = selSpan(from, to, i, selectableUnits(m, b))
 		if err := v.paintBubble(c, m, b, dy, sel); err != nil {
 			return err
 		}

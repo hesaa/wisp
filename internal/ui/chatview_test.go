@@ -615,3 +615,25 @@ func TestImagesAreFetchedOnSightOnlyWithAutoDownload(t *testing.T) {
 		t.Fatal("the same image was requested twice on sight")
 	}
 }
+
+func TestNoticesAreNotSelectable(t *testing.T) {
+	msgs := []store.Message{
+		{ID: "t", Type: "text", Body: "hello", SenderJID: alice},
+		{ID: "r", Type: "revoked", Body: "This message was deleted", SenderJID: alice},
+		{ID: "u", Type: "unsupported", SenderJID: alice},
+		{ID: "c", Type: "image", Body: "a caption", SenderJID: alice},
+	}
+	l := layOut(t, false, msgs...)
+	texts := make([][]uint16, len(msgs))
+	for i := range msgs {
+		texts[i] = selectableUnits(&msgs[i], l.cache[msgs[i].ID])
+	}
+	for i, want := range []string{"hello", "", "", "a caption"} {
+		if got := string(utf16.Decode(texts[i])); got != want {
+			t.Errorf("%s: selectable text %q, want %q", msgs[i].ID, got, want)
+		}
+	}
+	if got := selectedText(texts, textPos{0, 0}, textPos{3, 9}); got != "hello\r\na caption" {
+		t.Errorf("a selection across notices copies %q", got)
+	}
+}
