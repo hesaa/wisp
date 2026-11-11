@@ -54,3 +54,32 @@ func TestCaptionWinsOverLabel(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 }
+
+func TestRangeBetween(t *testing.T) {
+	var msgs []store.Message
+	for _, id := range []string{"a", "b", "c", "d", "e", "f"} {
+		msgs = append(msgs, store.Message{ID: id})
+	}
+	ids := func(m []store.Message) string {
+		s := ""
+		for _, x := range m {
+			s += x.ID
+		}
+		return s
+	}
+	// Shift+Down three times from c (anchor 2): the range grows
+	for i, want := range []string{"cd", "cde", "cdef"} {
+		if got := ids(rangeBetween(msgs, 2, 3+i)); got != want {
+			t.Errorf("step %d: %q, want %q", i, got, want)
+		}
+	}
+	if got := ids(rangeBetween(msgs, 2, 4)); got != "cde" { // reversing shrinks
+		t.Errorf("shrink: %q", got)
+	}
+	if got := ids(rangeBetween(msgs, 4, 1)); got != "bcde" { // anchor after the end
+		t.Errorf("reverse: %q", got)
+	}
+	if got := ids(rangeBetween(msgs, 3, 3)); got != "d" {
+		t.Errorf("single: %q", got)
+	}
+}

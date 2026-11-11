@@ -79,6 +79,7 @@ type ChatView struct {
 	dragging    bool            // the left button went down on text and is held: moves extend the selection
 	drag        walk.Point      // where the pointer is while dragging
 	ticking     bool            // an auto-scroll tick is pending
+	pickAnchor  string          // where a range of picks starts (Shift+click, Shift+Up/Down); "" for none
 	picked      map[string]bool // messages picked for copying (Ctrl+click, Shift+click, Shift+Up/Down)
 	notice      string          // shown in the header for a while instead of the number
 	noticeGen   int             // bumped per notice: only the latest one's timer clears it
@@ -277,6 +278,7 @@ func (v *ChatView) SetChat(accountID, chatJID, name string, isGroup bool, firstP
 	v.focus, v.view, v.scroll.off, v.stale = "", 0, 0, true
 	v.selA, v.selB, v.dragging = textMark{}, textMark{}, false
 	clear(v.picked)
+	v.pickAnchor = ""
 	logErr("chat layout", v.relayout(false))
 	logErr("chat repaint", errors.Join(v.header.Invalidate(), v.canvas.Invalidate()))
 	v.settle()
@@ -630,6 +632,7 @@ func (v *ChatView) key(k walk.Key) bool {
 	case k == walk.KeyEscape: // only while there is a selection or picks (takeEscape)
 		v.setSel(textMark{}, textMark{})
 		v.setPicks(nil)
+		v.pickAnchor = ""
 		return true
 	}
 	i := v.focusIndex()
@@ -638,7 +641,7 @@ func (v *ChatView) key(k walk.Key) bool {
 		if k == walk.KeyUp {
 			next = max(0, i-1)
 		}
-		v.setPicks(v.msgs[min(i, next) : max(i, next)+1])
+		v.pickRange(i, next)
 		v.focusOn(next)
 		return true
 	}
@@ -670,13 +673,14 @@ func (v *ChatView) mouseDown(x, y int, b walk.MouseButton) {
 	case i >= 0 && mods == walk.ModControl:
 		v.setSel(textMark{}, textMark{})
 		v.togglePick(v.msgs[i].ID)
+		v.pickAnchor = v.msgs[i].ID
 		return
 	case i >= 0 && mods == walk.ModShift:
-		v.setSel(textMark{}, textMark{})
-		v.setPicks(v.msgs[min(i, max(prev, 0)) : max(i, prev)+1])
+		v.pickRange(max(prev, 0), i)
 		return
 	}
 	v.setPicks(nil)
+	v.pickAnchor = ""
 	if i < 0 {
 		v.setSel(textMark{}, textMark{})
 		return
@@ -824,8 +828,26 @@ func (v *ChatView) selectionText() string {
 	return selectedText(texts, from, to)
 }
 
-// setPicks makes msgs the picked messages (none for nil) and repaints on a change.
+// rangeBetween is msgs[a..b] in chat order, whichever of a and b comes first.
+func rangeBetween(msgs []store.Message, a, b int) []store.Message {
+	return msgs[max(0, min(a, b)) : min(len(msgs)-1, max(a, b))+1]
+}
+
+// pickRange picks the messages from the pick anchor (set to message from when there is none) to
+// message to, so a run of Shift+arrows grows the range and reversing shrinks it.
+func (v *ChatView) pickRange(from, to int) {
+	if v.index(v.pickAnchor) < 0 {
+		v.pickAnchor = v.msgs[from].ID
+	}
+	v.setPicks(rangeBetween(v.msgs, v.index(v.pickAnchor), to))
+}
+
+// setPicks makes msgs the picked messages (none for nil) and repaints on a change. Picking drops
+// the text selection, which Ctrl+C would otherwise copy first.
 func (v *ChatView) setPicks(msgs []store.Message) {
+	if len(msgs) > 0 {
+		v.setSel(textMark{}, textMark{})
+	}
 	if len(msgs) == len(v.picked) && !slices.ContainsFunc(msgs, func(m store.Message) bool { return !v.picked[m.ID] }) {
 		return
 	}
@@ -879,6 +901,7 @@ func (v *ChatView) buildMenu() error {
 		{"Select", func() {
 			if i := v.focusIndex(); i >= 0 && !v.picked[v.msgs[i].ID] {
 				v.togglePick(v.msgs[i].ID)
+				v.pickAnchor = v.msgs[i].ID
 			}
 		}},
 	} {
