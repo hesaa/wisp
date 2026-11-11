@@ -453,3 +453,10 @@ func pageFor(accounts int, locked, adding bool) page {
 	}
 	return pageChats
 }
+
+// pairingRuns reports whether the link page should be pairing: it is the page, and the window is
+// on screen (not hidden to the tray, not minimised).
+func pairingRuns(pg page, visible, iconic bool) bool { return pg == pageLink && visible && !iconic }
+
+// linkCancellable: Cancel returns to the chats, so it needs an account and an add in progress.
+func linkCancellable(adding bool, accounts int) bool { return adding && accounts > 0 }

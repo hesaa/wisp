@@ -130,8 +130,11 @@ func (g *LinkPage) Show(cancellable bool) {
 	g.shown = true
 	g.SetVisible(true)
 	g.qr.Start()
-	if cancellable {
+	switch {
+	case cancellable:
 		focusOn(g.cancel)
+	case g.qr.retry.Visible():
+		focusOn(g.qr.retry)
 	}
 }
 

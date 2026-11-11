@@ -87,6 +87,7 @@ type App struct {
 	right      *walk.Composite // the chat column
 	link       *ui.LinkPage
 	adding     bool // the user asked to link another account
+	page       page // as showPage last set it
 	locked     bool // the lock page covers the window (Task 5)
 	exiting    bool
 	minimized  bool // as sizeChanged last saw the window
@@ -234,6 +235,7 @@ func (a *App) Run() error {
 	a.tray = tray
 	a.tray.OnToastClick(a.toastClicked)
 	a.mw.Show()
+	a.showPage() // the first page may have been picked before the window was visible
 	a.mw.Run()
 	// the window is gone: blocking here is fine
 	if a.tray != nil { // the loop ended some other way than Exit
@@ -256,6 +258,7 @@ func (a *App) closing(canceled *bool, _ walk.CloseReason) {
 	}
 	*canceled = true
 	a.mw.Hide()
+	a.showPage() // stops pairing while hidden
 	a.sendPresence(true)
 }
 
@@ -285,6 +288,7 @@ func (a *App) restore() {
 		win.ShowWindow(h, win.SW_RESTORE)
 	}
 	win.SetForegroundWindow(h)
+	a.showPage() // pairing resumes
 }
 
 // activated: the user is back on the main window; read the open chat. (Presence follows
@@ -313,6 +317,7 @@ func (a *App) sizeChanged() {
 	if m := win.IsIconic(a.mw.Handle()); m != a.minimized {
 		a.minimized = m
 		a.sendPresence(m)
+		a.showPage() // pairing stops while minimised
 	}
 }
 
@@ -407,19 +412,27 @@ func (a *App) pair() {
 	a.showPage()
 }
 
-// showPage shows exactly one page: the chats, the link page or the lock page.
+// showPage shows exactly one page: the chats, the link page or the lock page. Pairing runs only
+// while the link page is in front of a window the user can see.
 func (a *App) showPage() {
-	pg := pageFor(len(a.rail.Model().Accounts()), a.locked, a.adding)
+	n := len(a.rail.Model().Accounts())
+	pg := pageFor(n, a.locked, a.adding)
 	chats := pg == pageChats
 	a.rail.SetVisible(chats)
 	a.side.SetVisible(chats)
 	a.right.SetVisible(chats)
-	if pg == pageLink {
-		a.link.Show(a.adding)
+	if pairingRuns(pg, a.mw.Visible(), win.IsIconic(a.mw.Handle())) {
+		a.link.Show(linkCancellable(a.adding, n))
 	} else {
 		a.link.Hide()
 	}
 	// pageLock: the lock page widget shows here (Task 5); until then the slot stays empty
+	if pg != a.page {
+		a.page = pg
+		if chats {
+			a.side.FocusSearch() // the focused Cancel / Try again is gone
+		}
+	}
 }
 
 // alert shows a problem the user should know about over the window in front.

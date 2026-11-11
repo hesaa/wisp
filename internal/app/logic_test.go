@@ -604,3 +604,25 @@ func TestPageAfterLogouts(t *testing.T) {
 		t.Errorf("none left: %v, want pageLink", got)
 	}
 }
+
+func TestPairingRuns(t *testing.T) {
+	cases := []struct {
+		pg              page
+		visible, iconic bool
+		want            bool
+	}{
+		{pageLink, true, false, true}, {pageLink, false, false, false}, {pageLink, true, true, false},
+		{pageChats, true, false, false}, {pageLock, true, false, false},
+	}
+	for _, c := range cases {
+		if got := pairingRuns(c.pg, c.visible, c.iconic); got != c.want {
+			t.Errorf("pairingRuns(%v, %v, %v) = %v, want %v", c.pg, c.visible, c.iconic, got, c.want)
+		}
+	}
+}
+
+func TestLinkCancellable(t *testing.T) {
+	if !linkCancellable(true, 1) || linkCancellable(true, 0) || linkCancellable(false, 2) {
+		t.Error("Cancel needs adding and at least one account")
+	}
+}
