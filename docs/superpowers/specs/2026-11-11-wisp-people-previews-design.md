@@ -59,9 +59,9 @@ message's sender and push name, in direct chats and groups; the address book (`A
 member lists when a group's details are loaded; LID-to-phone mappings whenever whatsmeow learns one;
 history sync. Updates are batched with the message batch that carried them; no extra goroutine.
 
-**Lookup.** `store.Person(accountID, jid)` returns the row for `jid`, or the row whose `pn_jid` is
-`jid`, merged: a LID row and its phone-number row count as one person, and the address-book name of
-either wins. Old messages are never rewritten; names are resolved when drawn. The app keeps the
+**Lookup.** A pure index built from the account's rows (`store.People`) answers for a `jid` with
+its row, or the row whose `pn_jid` is `jid`, merged: a LID row and its phone-number row count as
+one person, and the address-book name of either wins. Old messages are never rewritten; names are resolved when drawn. The app keeps the
 people of the open account in memory as it does chat names today and refreshes them on change.
 
 ## 2. Names and mentions
@@ -165,11 +165,18 @@ type, sender, own flag and metadata alongside the body); search in the chat list
 ## 7. Notification sound choice
 
 Settings › Notifications keeps the `Notification sound` switch and gains, under it, a `Sound`
-choice that is enabled while the switch is on: `Default`, `Message`, `Mail`, `Reminder`, `SMS` —
-the notification sounds Windows offers for toasts (`ms-winsoundevent:Notification.Default`, `.IM`,
-`.Mail`, `.Reminder`, `.SMS`). Choosing one plays it once as a preview. The choice is the global
-setting `notify.sound.name` (default `default`); an unknown stored value falls back to `Default`.
-Windows plays the sound with the toast; Wisp loads no audio code.
+choice that is enabled while the switch is on: `Default`, `Message`, `Mail`, `Reminder`, `SMS`.
+Choosing one plays it once as a preview. The choice is the global setting `notify.sound.name`
+(values `default`, `message`, `mail`, `reminder`, `sms`; default `default`); an unknown stored
+value counts as `default`.
+
+Wisp's notifications are tray balloons, whose only sound is the Windows default. So `Default`
+keeps today's behaviour (Windows plays its own sound with the balloon). For the other four the
+balloon is shown silent and Wisp plays the matching Windows sound file itself with `PlaySound`
+(`winmm.dll`, asynchronous, loaded on the first sound): `%WINDIR%\Media\Windows Notify
+Messaging.wav`, `Windows Notify Email.wav`, `Windows Notify Calendar.wav`, `Windows Message
+Nudge.wav`. When the file is missing the balloon keeps the Windows default sound. No sound plays
+while the switch is off.
 
 ---
 
