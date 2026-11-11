@@ -17,6 +17,7 @@ import (
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
 
+	"wa-go/internal/lock"
 	"wa-go/internal/media"
 	"wa-go/internal/notify"
 	"wa-go/internal/store"
@@ -86,9 +87,11 @@ type App struct {
 	statusAcct string
 	right      *walk.Composite // the chat column
 	link       *ui.LinkPage
-	adding     bool // the user asked to link another account
-	page       page // as showPage last set it
-	locked     bool // the lock page covers the window (Task 5)
+	lockPage   *ui.LockPage
+	backoff    lock.Backoff // wrong PINs; not persisted
+	adding     bool         // the user asked to link another account
+	page       page         // as showPage last set it
+	locked     bool         // the lock page covers the window (Task 5)
 	exiting    bool
 	minimized  bool // as sizeChanged last saw the window
 }
@@ -175,6 +178,14 @@ func (a *App) build() error {
 	if err := l.SetStretchFactor(a.link, 1000); err != nil {
 		return err
 	}
+	if a.lockPage, err = ui.NewLockPage(mw, p); err != nil {
+		return err
+	}
+	if err := l.SetStretchFactor(a.lockPage, 1000); err != nil {
+		return err
+	}
+	a.lockPage.OnUnlock(a.unlock)
+	// a.lockPage.OnReset: Reset Wisp is wired in Task 6
 	a.link.OnCancel(func() { a.adding = false; a.showPage() })
 	a.showChatPane(false)
 	a.chat.SetAutoDownload(a.cfg[ui.KeyAutoDownloadImages] == "true")
@@ -196,7 +207,7 @@ func (a *App) build() error {
 	mw.Activating().Attach(a.activated)
 	mw.SizeChanged().Attach(a.sizeChanged)
 	// the focus can only be set once the window runs; the search box takes it, without a focus ring
-	mw.Starting().Attach(func() { mw.Synchronize(func() { a.side.FocusSearch() }) })
+	mw.Starting().Attach(func() { mw.Synchronize(a.focusPage) })
 	mw.SendMessage(win.WM_CHANGEUISTATE, win.UIS_INITIALIZE, 0)
 	logErr("presence", a.watchActivation()) // without it presence stays unavailable
 	// cosmetic: Windows builds without dark title bars keep a light one
@@ -215,6 +226,7 @@ func (a *App) Attach(mgr Backend) {
 	a.outbox, a.typingQ = newPresenceBox(), make(chan func(context.Context) error, 64)
 	go a.presenceWorker()
 	go a.typingWorker()
+	a.lockNow() // before the window is first shown: the chats never appear
 	go func() {
 		a.purgeExpired()                       // before any chat list is read
 		err := mgr.Start(context.Background()) // returns before the accounts connect
@@ -258,6 +270,7 @@ func (a *App) closing(canceled *bool, _ walk.CloseReason) {
 	}
 	*canceled = true
 	a.mw.Hide()
+	a.lockNow()  // locked while hidden: a restore never flashes the chats
 	a.showPage() // stops pairing while hidden
 	a.sendPresence(true)
 }
@@ -289,6 +302,9 @@ func (a *App) restore() {
 	}
 	win.SetForegroundWindow(h)
 	a.showPage() // pairing resumes
+	if a.page == pageLock {
+		a.lockPage.Focus()
+	}
 }
 
 // activated: the user is back on the main window; read the open chat. (Presence follows
@@ -382,7 +398,7 @@ func (a *App) nav(n ui.Nav) {
 func (a *App) applyTheme(mode theme.ThemeMode) {
 	a.pal = theme.GetPalette(mode)
 	logErr("theme", errors.Join(a.rail.SetPalette(a.pal), a.side.SetPalette(a.pal), a.chat.SetPalette(a.pal),
-		a.bar.SetPalette(a.pal), a.empty.SetPalette(a.pal), a.link.SetPalette(a.pal)))
+		a.bar.SetPalette(a.pal), a.empty.SetPalette(a.pal), a.link.SetPalette(a.pal), a.lockPage.SetPalette(a.pal)))
 	logErr("title bar", theme.ApplyTitleBar(uintptr(a.mw.Handle()), theme.Resolve(mode) == theme.ThemeDark))
 }
 
@@ -426,12 +442,63 @@ func (a *App) showPage() {
 	} else {
 		a.link.Hide()
 	}
-	// pageLock: the lock page widget shows here (Task 5); until then the slot stays empty
+	a.lockPage.SetVisible(pg == pageLock)
 	if pg != a.page {
 		a.page = pg
-		if chats {
-			a.side.FocusSearch() // the focused Cancel / Try again is gone
-		}
+		a.focusPage() // the focused Cancel / Try again / PIN box is gone
+	}
+}
+
+// focusPage puts the keyboard where the page in front wants it, once the window is on screen.
+func (a *App) focusPage() {
+	if !a.mw.Visible() || win.IsIconic(a.mw.Handle()) {
+		return
+	}
+	switch a.page {
+	case pageChats:
+		a.side.FocusSearch()
+	case pageLock:
+		a.lockPage.Focus()
+	}
+}
+
+// lockNow covers the window with the lock page; it does nothing while no PIN is set.
+func (a *App) lockNow() {
+	if a.cfg[ui.KeyLockPIN] == "" || a.locked {
+		return // off, or already locked (a countdown in progress stays)
+	}
+	a.locked = true
+	a.closeMedia()
+	a.lockPage.Clear()
+	a.showPage()
+	a.presence.appLock(true)
+}
+
+// closeMedia closes the open photo or video (Task 10 gives it its body).
+func (a *App) closeMedia() {}
+
+// unlock checks pin against the stored hash, with the back-off for wrong tries. pin is not kept.
+func (a *App) unlock(pin string) {
+	if d := a.backoff.Wait(time.Now()); d > 0 {
+		a.lockPage.Wait(d) // a refused attempt does not count
+		return
+	}
+	ok, err := lock.Verify(a.cfg[ui.KeyLockPIN], pin)
+	logErr("PIN check", err) // a malformed stored value; the text holds no PIN
+	if ok {
+		a.backoff.Succeeded()
+		a.locked = false
+		a.lockPage.Clear()
+		a.showPage() // focuses the search box
+		a.presence.appLock(false)
+		return
+	}
+	now := time.Now()
+	a.backoff.Failed(now)
+	a.lockPage.Clear()
+	a.lockPage.Say("That PIN isn't right.")
+	if d := a.backoff.Wait(now); d > 0 {
+		a.lockPage.Wait(d)
 	}
 }
 

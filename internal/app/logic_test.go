@@ -626,3 +626,30 @@ func TestLinkCancellable(t *testing.T) {
 		t.Error("Cancel needs adding and at least one account")
 	}
 }
+
+func TestToastSettingsPrivateWhileLocked(t *testing.T) {
+	cfg := map[string]string{ui.KeyNotifyPrivate: "false", ui.KeyNotifySound: "true"}
+	if s := toastSettings(cfg, true, 2); !s.PrivateMode || !s.Sound || !s.MultiAccount || !s.Enabled {
+		t.Errorf("locked: %+v, want private, sound, multi-account", s)
+	}
+	if s := toastSettings(cfg, false, 1); s.PrivateMode || !s.Sound || s.MultiAccount {
+		t.Errorf("unlocked: %+v, want not private, sound, single account", s)
+	}
+	if s := toastSettings(map[string]string{ui.KeyNotifyPrivate: "true"}, false, 1); !s.PrivateMode {
+		t.Errorf("unlocked, private setting: %+v, want private", s)
+	}
+}
+
+func TestPresenceUnavailableWhileAppLocked(t *testing.T) {
+	on, off := types.PresenceAvailable, types.PresenceUnavailable
+	r := newPresenceRig()
+	r.activated(true)
+	r.expect(t, "startup", on)
+	r.appLock(true)
+	r.expect(t, "app locked: at once", off)
+	r.sessionLocked(true)
+	r.sessionLocked(false)
+	r.expect(t, "session lock forces a send; its unlock keeps the app lock", off)
+	r.appLock(false)
+	r.expect(t, "app unlocked", on)
+}

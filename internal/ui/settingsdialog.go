@@ -1044,6 +1044,7 @@ type label struct {
 	pt    int
 	style walk.FontStyle
 	tone  int
+	mid   bool // centred in its width, one line
 }
 
 // newLabel adds a label h (1/96 inch) high.
@@ -1074,6 +1075,9 @@ func (l *label) paint(c *walk.Canvas, _ walk.Rectangle) error {
 	format := wrapText
 	if r.Height <= l.IntFrom96DPI(fieldH) { // one line, centred: level with a button beside it
 		format = leftText
+		if l.mid {
+			format = centerText
+		}
 	}
 	return errors.Join(c.FillRectanglePixels(bg, r), drawText(c, l.DPI(), l.text, l.pt, l.style, l.k.color(l.tone), r, format))
 }
@@ -1322,6 +1326,7 @@ const (
 	btnPlain = iota
 	btnPrimary
 	btnDanger
+	btnLink // accent text, underlined, no pill
 )
 
 // button is a pill with a text; a click, Enter or Space runs act.
@@ -1359,12 +1364,14 @@ func (b *button) paint(c *walk.Canvas, _ walk.Rectangle) error {
 	if err := c.FillRectanglePixels(bg, r); err != nil {
 		return err
 	}
-	fill, fg := theme.Color(p.Header), theme.Color(p.Text)
+	fill, fg, style := theme.Color(p.Header), theme.Color(p.Text), walk.FontBold
 	switch b.kind {
 	case btnPrimary:
 		fill, fg = theme.Color(p.Accent), walk.RGB(255, 255, 255)
 	case btnDanger:
 		fg = b.k.color(toneError)
+	case btnLink:
+		fill, fg, style = theme.Color(p.Sidebar), theme.Color(p.Accent), walk.FontUnderline
 	}
 	pill := r
 	if focusCues(b) {
@@ -1373,7 +1380,7 @@ func (b *button) paint(c *walk.Canvas, _ walk.Rectangle) error {
 		}
 		pill = inset(pill, s(2))
 	}
-	return errors.Join(icons.Fill(c, pill, fill), drawText(c, dpi, b.text, 10, walk.FontBold, fg, pill, centerText))
+	return errors.Join(icons.Fill(c, pill, fill), drawText(c, dpi, b.text, 10, style, fg, pill, centerText))
 }
 
 func inset(r walk.Rectangle, d int) walk.Rectangle {

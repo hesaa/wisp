@@ -53,7 +53,7 @@ func NewLinkPage(parent walk.Container, p theme.Palette, pair PairFunc) (*LinkPa
 	}
 	g.logo, err = walk.NewIconFromResourceWithSize("APP", walk.Size{Width: 128, Height: 128})
 	logErr("link page logo", err) // the glyph stands in
-	if err := g.newLogo(left); err != nil {
+	if err := g.newLogo(left, g.logo, false); err != nil {
 		return nil, err
 	}
 	if _, err := g.newLabel(left, "Link your phone to Wisp", 20, walk.FontBold, toneText, 56); err != nil {
@@ -95,24 +95,28 @@ func NewLinkPage(parent walk.Container, p theme.Palette, pair PairFunc) (*LinkPa
 	return g, nil
 }
 
-func (g *LinkPage) newLogo(parent walk.Container) error {
+// newLogo adds the 64-high logo canvas, centred in its width when center; a nil logo draws a glyph.
+func (k *kit) newLogo(parent walk.Container, logo *walk.Icon, center bool) error {
 	var cw *walk.CustomWidget
 	cw, err := newCanvas(parent, func(c *walk.Canvas, _ walk.Rectangle) error {
 		b := cw.ClientBoundsPixels()
-		bg, err := brushFor(g.pal.Sidebar)
+		bg, err := brushFor(k.pal.Sidebar)
 		if err != nil {
 			return err
 		}
 		box := walk.Rectangle{X: 0, Y: 0, Width: b.Height, Height: b.Height}
-		if g.logo == nil {
-			return errors.Join(c.FillRectanglePixels(bg, b), icons.Draw(c, icons.IconChat, box, theme.Color(g.pal.Accent)))
+		if center {
+			box.X = (b.Width - b.Height) / 2
 		}
-		return errors.Join(c.FillRectanglePixels(bg, b), c.DrawImageStretchedPixels(g.logo, box))
+		if logo == nil {
+			return errors.Join(c.FillRectanglePixels(bg, b), icons.Draw(c, icons.IconChat, box, theme.Color(k.pal.Accent)))
+		}
+		return errors.Join(c.FillRectanglePixels(bg, b), c.DrawImageStretchedPixels(logo, box))
 	})
 	if err != nil {
 		return err
 	}
-	g.canvases = append(g.canvases, cw)
+	k.canvases = append(k.canvases, cw)
 	return errors.Join(cw.SetMinMaxSize(walk.Size{Height: 64}, walk.Size{Height: 64}), cw.Accessibility().SetRole(walk.AccRoleGraphic),
 		cw.Accessibility().SetName("Wisp logo"))
 }

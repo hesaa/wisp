@@ -36,6 +36,7 @@ func mainWndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 		switch wParam {
 		case wtsSessionLock:
 			hooked.presence.sessionLocked(true)
+			hooked.lockNow()
 		case wtsSessionUnlock:
 			hooked.presence.sessionLocked(false)
 		}

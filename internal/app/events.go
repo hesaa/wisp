@@ -243,8 +243,7 @@ func (a *App) toast(m store.Message) {
 	if m.Type == whatsapp.TypeDocument {
 		in.FileName = m.Body // a document's body is its caption, else its file name
 	}
-	s := notify.Settings{Enabled: true, PrivateMode: a.cfg[ui.KeyNotifyPrivate] == "true", Sound: a.cfg[ui.KeyNotifySound] == "true",
-		MultiAccount: len(a.rail.Model().Accounts()) > 1}
+	s := toastSettings(a.cfg, a.locked, len(a.rail.Model().Accounts()))
 	if a.tray != nil {
 		logErr("toast", a.tray.Notify(in, s))
 	}
@@ -253,6 +252,9 @@ func (a *App) toast(m store.Message) {
 // toastClicked brings the window back on the toast's chat, switching account first if needed.
 func (a *App) toastClicked(acct, jid string) {
 	a.restore()
+	if a.locked {
+		return // the chat opens after unlocking, by hand
+	}
 	if acct == a.v.active {
 		a.openChat(acct, jid, "")
 		return

@@ -8,7 +8,9 @@ import (
 	"go.mau.fi/whatsmeow/types"
 
 	"wa-go/internal/media"
+	"wa-go/internal/notify"
 	"wa-go/internal/store"
+	"wa-go/internal/ui"
 	"wa-go/internal/whatsapp"
 )
 
@@ -200,6 +202,7 @@ type presenceCtl struct {
 	send          func(types.Presence)
 	active        bool // Wisp has the foreground (WM_ACTIVATEAPP)
 	locked        bool // the session is locked
+	appLocked     bool // the app lock page covers the window
 	grace         grace
 	last          presenceState
 }
@@ -208,7 +211,7 @@ type presenceCtl struct {
 // tray, locked, a setting change, a reconnect), otherwise only when it changed.
 func (p *presenceCtl) update(force bool) {
 	visible, iconic := p.window()
-	w := stateOf(visible, iconic, p.locked, p.active, p.grace.pending())
+	w := stateOf(visible, iconic, p.locked || p.appLocked, p.active, p.grace.pending())
 	if pr, send := p.last.next(w, p.appearOffline(), force); send {
 		p.send(pr)
 	}
@@ -231,6 +234,19 @@ func (p *presenceCtl) activated(active bool) {
 func (p *presenceCtl) sessionLocked(locked bool) {
 	p.locked = locked
 	p.update(locked)
+}
+
+// appLock: the lock page covers the window, so the user is not using Wisp; same as a locked session.
+func (p *presenceCtl) appLock(locked bool) {
+	p.appLocked = locked
+	p.update(locked)
+}
+
+// toastSettings are the notification settings for a toast: private whatever the setting while the
+// app is locked.
+func toastSettings(cfg map[string]string, locked bool, accounts int) notify.Settings {
+	return notify.Settings{Enabled: true, PrivateMode: locked || cfg[ui.KeyNotifyPrivate] == "true",
+		Sound: cfg[ui.KeyNotifySound] == "true", MultiAccount: accounts > 1}
 }
 
 // presenceState remembers the last broadcast presence, so window activations do not repeat it.
