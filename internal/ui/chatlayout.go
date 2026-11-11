@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf16"
 
 	"github.com/lxn/walk"
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -43,6 +44,8 @@ const (
 type measurer interface {
 	// measure is the size, in pixels, of text in Segoe UI at pt points word-wrapped at maxW pixels.
 	measure(text string, pt int, style walk.FontStyle, maxW int) (w, h int)
+	// advances is the width, in pixels, of units in Segoe UI at pt points after each unit.
+	advances(units []uint16, pt int, style walk.FontStyle) []int
 }
 
 type bubbleKind int
@@ -205,7 +208,9 @@ type bubble struct {
 	info    mediaInfo // without preview bytes
 	box     walk.Rectangle
 	name    walk.Rectangle // sender name, incoming group messages starting a run
-	text    walk.Rectangle // body, caption or notice
+	text    walk.Rectangle // body, caption or notice: widest line by lines × line height
+	units   []uint16       // the text, UTF-16
+	lines   []textLine     // the text's lines, top to bottom
 	thumb   walk.Rectangle // image box
 	card    walk.Rectangle // media card
 	time    walk.Rectangle
@@ -332,9 +337,12 @@ func (l *chatLayout) layout(m *store.Message, named bool, ms measurer) bubble {
 	}
 	metaY := y + s(2) // own row under media without a caption
 	if text != "" {
-		tw, th := ms.measure(text, bodyPt, style, maxW-2*padX)
+		var x []int
+		b.units = utf16.Encode([]rune(text))
+		b.lines = wrapText(b.units, maxW-2*padX, func(u []uint16) []int { x = ms.advances(u, bodyPt, style); return x })
+		tw, th := textWidth(b.units, x, b.lines, maxW-2*padX), len(b.lines)*l.lineH
 		b.text = walk.Rectangle{X: padX, Y: y, Width: tw, Height: th}
-		inline := th <= l.lineH && tw+s(metaGap)+metaW <= maxW-2*padX
+		inline := len(b.lines) == 1 && tw+s(metaGap)+metaW <= maxW-2*padX
 		if inline {
 			metaY = y + th - s(metaH)
 			tw += s(metaGap) + metaW

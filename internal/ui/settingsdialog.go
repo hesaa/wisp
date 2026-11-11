@@ -890,8 +890,8 @@ const (
 
 const navName = "Settings sections"
 
-// wrapText draws a block of text from the top left, broken into lines.
-const wrapText = walk.TextLeft | walk.TextTop | walk.TextWordbreak | walk.TextEndEllipsis | walk.TextNoPrefix
+// blockText draws a block of text from the top left, broken into lines.
+const blockText = walk.TextLeft | walk.TextTop | walk.TextWordbreak | walk.TextEndEllipsis | walk.TextNoPrefix
 
 // kit makes themed controls and keeps what a palette change must recolour.
 type kit struct {
@@ -1072,7 +1072,7 @@ func (l *label) paint(c *walk.Canvas, _ walk.Rectangle) error {
 	if err != nil {
 		return err
 	}
-	format := wrapText
+	format := blockText
 	if r.Height <= l.IntFrom96DPI(fieldH) { // one line, centred: level with a button beside it
 		format = leftText
 		if l.mid {

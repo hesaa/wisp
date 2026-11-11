@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf16"
 
 	"github.com/lxn/walk"
 	"github.com/lxn/win"
@@ -32,7 +33,7 @@ const (
 	// maxPreviewPixels bounds what is decoded for painting: embedded previews and cached thumbnails
 	// are at most a few hundred pixels square; anything bigger is refused, not decoded.
 	maxPreviewPixels = 1 << 20
-	// msgFormat wraps message text; measuring uses the same flags so lines break identically.
+	// msgFormat is how gdiMeasurer.measure wraps text; message text is broken by wrapText instead.
 	msgFormat = walk.TextWordbreak | walk.TextNoPrefix
 )
 
@@ -743,12 +744,17 @@ func (v *ChatView) paintBubble(c *walk.Canvas, m *store.Message, b bubble, dy in
 		}
 	}
 	if b.text.Width > 0 {
-		text, muted := bubbleText(m, b.info)
+		_, muted := bubbleText(m, b.info)
 		color, style := theme.Color(p.Text), walk.FontStyle(0)
 		if muted {
 			color, style = secondary, walk.FontItalic
 		}
-		errs = append(errs, drawText(c, dpi, text, bodyPt, style, color, at(b.text), msgFormat))
+		r := at(b.text)
+		r.Height = v.lay.lineH
+		for _, ln := range b.lines {
+			errs = append(errs, drawText(c, dpi, string(utf16.Decode(b.units[ln.start:ln.end])), bodyPt, style, color, r, walk.TextSingleLine|walk.TextNoPrefix))
+			r.Y += r.Height
+		}
 	}
 	errs = append(errs, drawText(c, dpi, clock(m.Timestamp), metaPt, 0, secondary, at(b.time), rightText))
 	if icon, color, ok := tickFor(p, m.Status); ok && b.ticks.Width > 0 {
@@ -767,17 +773,19 @@ type gdiMeasurer struct {
 	err       error
 }
 
-func (g *gdiMeasurer) measure(text string, pt int, style walk.FontStyle, maxW int) (int, int) {
-	if g.err != nil || text == "" {
-		return 0, 0
+// ready makes the canvas on first use and reports whether measuring can go on.
+func (g *gdiMeasurer) ready() bool {
+	if g.err == nil && g.c == nil {
+		if g.bmp, g.err = walk.NewBitmapForDPI(walk.Size{Width: 1, Height: 1}, g.cdpi); g.err == nil {
+			g.c, g.err = walk.NewCanvasFromImage(g.bmp)
+		}
 	}
-	if g.c == nil {
-		if g.bmp, g.err = walk.NewBitmapForDPI(walk.Size{Width: 1, Height: 1}, g.cdpi); g.err != nil {
-			return 0, 0
-		}
-		if g.c, g.err = walk.NewCanvasFromImage(g.bmp); g.err != nil {
-			return 0, 0
-		}
+	return g.err == nil
+}
+
+func (g *gdiMeasurer) measure(text string, pt int, style walk.FontStyle, maxW int) (int, int) {
+	if text == "" || !g.ready() {
+		return 0, 0
 	}
 	r, _, err := g.c.MeasureTextPixels(text, textFont(pt, style, g.dpi, g.cdpi), walk.Rectangle{Width: maxW, Height: 1 << 20}, msgFormat|walk.TextCalcRect)
 	if err != nil {
@@ -785,6 +793,64 @@ func (g *gdiMeasurer) measure(text string, pt int, style walk.FontStyle, maxW in
 		return 0, 0
 	}
 	return r.Width, r.Height
+}
+
+// advances is the cumulative width of units after each unit (GetTextExtentExPointW), all zero on
+// failure.
+func (g *gdiMeasurer) advances(units []uint16, pt int, style walk.FontStyle) []int {
+	x := make([]int, len(units))
+	if len(units) == 0 || !g.ready() {
+		return x
+	}
+	f := hfont(textFont(pt, style, g.dpi, g.cdpi), g.cdpi)
+	if f == 0 {
+		g.err = errors.New("ui: CreateFontIndirect failed")
+		return x
+	}
+	defer win.DeleteObject(win.HGDIOBJ(f))
+	hdc := g.c.HDC()
+	defer win.SelectObject(hdc, win.SelectObject(hdc, win.HGDIOBJ(f)))
+	dx := make([]int32, min(len(units), advChunk))
+	var size win.SIZE
+	for i := 0; i < len(units); {
+		n := min(len(units)-i, advChunk)
+		if i+n < len(units) && units[i+n-1] >= 0xd800 && units[i+n-1] < 0xdc00 {
+			n-- // a surrogate pair stays in one call
+		}
+		if !win.GetTextExtentExPoint(hdc, &units[i], int32(n), 0, nil, &dx[0], &size) {
+			g.err = errors.New("ui: GetTextExtentExPoint failed")
+			return x
+		}
+		base := 0
+		if i > 0 {
+			base = x[i-1]
+		}
+		for j, d := range dx[:n] {
+			x[i+j] = base + int(d)
+		}
+		i += n
+	}
+	return x
+}
+
+// advChunk is the most units advances measures in one call: GDI fails on text with emoji longer
+// than about 43,000 units.
+const advChunk = 1 << 14
+
+// hfont makes the GDI font walk draws f with on a canvas at dpi, as walk's Font.createForDPI does
+// (walk keeps its handles private); the caller deletes it.
+func hfont(f *walk.Font, dpi int) win.HFONT {
+	lf := win.LOGFONT{LfHeight: -win.MulDiv(int32(f.PointSize()), int32(dpi), 72), LfWeight: win.FW_NORMAL,
+		LfCharSet: win.DEFAULT_CHARSET, LfOutPrecision: win.OUT_TT_PRECIS, LfClipPrecision: win.CLIP_DEFAULT_PRECIS,
+		LfQuality: win.CLEARTYPE_QUALITY, LfPitchAndFamily: win.VARIABLE_PITCH | win.FF_SWISS}
+	if f.Bold() {
+		lf.LfWeight = win.FW_BOLD
+	}
+	if f.Italic() {
+		lf.LfItalic = 1
+	}
+	copy(lf.LfFaceName[:len(lf.LfFaceName)-1], utf16.Encode([]rune(f.Family())))
+	return win.CreateFontIndirect(&lf)
 }
 
 func (g *gdiMeasurer) close() error {

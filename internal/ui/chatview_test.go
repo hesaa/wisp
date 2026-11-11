@@ -4,6 +4,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf16"
 	"unicode/utf8"
 
 	"github.com/lxn/walk"
@@ -30,6 +31,19 @@ func (m *monoMeasurer) measure(text string, pt int, _ walk.FontStyle, maxW int) 
 		widest = max(widest, min(n, per))
 	}
 	return widest * cw, lines * lh
+}
+
+// advances gives every rune the fixed width (the low half of a surrogate pair adds none).
+func (m *monoMeasurer) advances(units []uint16, pt int, _ walk.FontStyle) []int {
+	m.calls++
+	x, w := make([]int, len(units)), 0
+	for i, u := range units {
+		if u < 0xdc00 || u > 0xdfff {
+			w += pt * 7 / 10
+		}
+		x[i] = w
+	}
+	return x
 }
 
 const viewW = 800 // at 96 DPI: bubbles are at most 520 wide, 18 from the sides
@@ -124,6 +138,22 @@ func TestLongTextWrapsAtMaxWidth(t *testing.T) {
 	}
 	if sb.box.Height >= lb.box.Height || sb.box.Width > 120 {
 		t.Errorf("short bubble %+v too big", sb.box)
+	}
+}
+
+func TestLayoutTextSizeFromLines(t *testing.T) {
+	body := "short\n" + strings.Repeat("word ", 30) + "end"
+	l := layOut(t, false, store.Message{ID: "m", Type: "text", Body: body, SenderJID: alice})
+	b := l.cache["m"]
+	if string(utf16.Decode(b.units)) != body || len(b.lines) < 3 {
+		t.Fatalf("units %q in %d lines: want the body over at least 3 lines", string(utf16.Decode(b.units)), len(b.lines))
+	}
+	widest := 0 // in runes of 7px: a line's trailing space counts when it fits the 502px (71 runes)
+	for _, ln := range b.lines {
+		widest = max(widest, min(utf8.RuneCountInString(string(utf16.Decode(b.units[ln.start:ln.end]))), 71)*7)
+	}
+	if b.text.Height != len(b.lines)*l.lineH || b.text.Width != widest {
+		t.Errorf("text %+v: want %d lines of %dpx high, widest line %dpx", b.text, len(b.lines), l.lineH, widest)
 	}
 }
 
@@ -460,11 +490,21 @@ func TestGDIMeasurerMatchesDrawnText(t *testing.T) {
 	w, h := g.measure("Yesterday", 9, 0, 1000)
 	_, h2 := g.measure("Yesterday\nToday", 9, 0, 1000)
 	long, longH := g.measure(strings.Repeat("x", 300), 10, 0, 200) // one word: broken, not overflowing
+	// advances use the same font: no kerning pairs here (DrawText kerns, GetTextExtentExPoint doesn't)
+	plain, _ := g.measure("second line", 10, 0, 1000)
+	adv := g.advances(utf16.Encode([]rune("second line")), 10, 0)
+	huge := g.advances(utf16.Encode([]rune(strings.Repeat("😀", 30000))), 10, 0) // past GDI's limit for one call
 	if err := g.close(); err != nil {
 		t.Fatal(err)
 	}
 	if ink := inkWidth(t, 96, 144); w < ink || w > ink+4 {
 		t.Errorf("measured %dpx, drawn ink %dpx", w, ink)
+	}
+	if len(adv) != 11 || adv[10] != plain || adv[0] <= 0 {
+		t.Errorf("advances %v, want 11 rising to the measured width %d", adv, plain)
+	}
+	if huge[1] <= 0 || huge[len(huge)-1] != 30000*huge[1] {
+		t.Errorf("30000 emoji: %d wide, want 30000 x %d", huge[len(huge)-1], huge[1])
 	}
 	if h2 != 2*h {
 		t.Errorf("two lines %dpx high, one line %dpx", h2, h)
