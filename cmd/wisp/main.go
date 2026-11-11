@@ -31,21 +31,46 @@ var giphyKey string
 const logLimit = 1 << 20
 
 func main() {
-	if err := run(); err != nil {
+	reset, err := run()
+	if err != nil {
 		walk.MsgBox(nil, "Wisp", "Wisp could not start: "+err.Error(), walk.MsgBoxIconError|walk.MsgBoxOK)
+		os.Exit(1)
+	}
+	if !reset {
+		return
+	}
+	// every defer of run is done: databases closed, instance handle released, log closed
+	dir, err := dataDir()
+	if err == nil {
+		err = wipeData(dir)
+	}
+	if err == nil {
+		err = relaunch()
+	}
+	if err != nil {
+		walk.MsgBox(nil, "Wisp", "Wisp could not reset: "+err.Error(), walk.MsgBoxIconError|walk.MsgBoxOK)
 		os.Exit(1)
 	}
 }
 
-// run starts Wisp and returns once it exits; an error is logged before the log closes.
-func run() (err error) {
+// dataDir is Wisp's data folder, %LOCALAPPDATA%\Wisp.
+func dataDir() (string, error) {
 	base, err := os.UserCacheDir() // %LOCALAPPDATA%
 	if err != nil {
-		return err
+		return "", err
 	}
-	dir := filepath.Join(base, "Wisp")
+	return filepath.Join(base, "Wisp"), nil
+}
+
+// run starts Wisp and returns once it exits; reset says it ended through Reset Wisp. An error is
+// logged before the log closes.
+func run() (reset bool, err error) {
+	dir, err := dataDir()
+	if err != nil {
+		return false, err
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
+		return false, err
 	}
 	if f, ferr := openLog(filepath.Join(dir, "wisp.log"), logLimit); ferr == nil {
 		log.SetOutput(f)
@@ -59,31 +84,31 @@ func run() (err error) {
 
 	show, first, err := claimInstance(dir)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !first {
 		log.Printf("wisp: already running; brought it to the front")
-		return nil
+		return false, nil
 	}
 	defer windows.CloseHandle(show)
 
 	db, err := store.Open(filepath.Join(dir, "wisp.db"))
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer db.Close()
 	root, err := media.DefaultRoot()
 	if err != nil {
-		return err
+		return false, err
 	}
 	cache := media.New(root)
 	a, err := app.New(db, cache, giphyKey)
 	if err != nil {
-		return err
+		return false, err
 	}
 	mgr, err := whatsapp.New(context.Background(), filepath.Join(dir, "session.db"), db, cache)
 	if err != nil {
-		return err
+		return false, err
 	}
 	a.Attach(mgr)
 	go func() { // another Wisp asked for the window

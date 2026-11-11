@@ -1,9 +1,11 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -672,4 +674,18 @@ func TestPresenceUnavailableWhileAppLocked(t *testing.T) {
 	r.expect(t, "session lock forces a send; its unlock keeps the app lock", off)
 	r.appLock(false)
 	r.expect(t, "app unlocked", on)
+}
+
+func TestLogoutAllReportsFailuresAndTriesEvery(t *testing.T) {
+	var called []string
+	failed := logoutAll(context.Background(), []string{"a", "b", "c"}, func(_ context.Context, id string) error {
+		called = append(called, id)
+		if id != "b" {
+			return errors.New("offline")
+		}
+		return nil
+	})
+	if !slices.Equal(failed, []string{"a", "c"}) || !slices.Equal(called, []string{"a", "b", "c"}) {
+		t.Errorf("failed %v, called %v", failed, called)
+	}
 }

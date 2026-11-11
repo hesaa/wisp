@@ -93,6 +93,8 @@ type App struct {
 	page       page         // as showPage last set it
 	locked     bool         // the lock page covers the window (Task 5)
 	exiting    bool
+	resetting  bool // Reset Wisp's confirmation, logout and exit are under way: the lock leaves its dialog be
+	didReset   bool // the run ends through Reset Wisp
 	hiding     bool // closed to the tray and not restored since
 	minimized  bool // as sizeChanged last saw the window
 }
@@ -186,7 +188,7 @@ func (a *App) build() error {
 		return err
 	}
 	a.lockPage.OnUnlock(a.unlock)
-	// a.lockPage.OnReset: Reset Wisp is wired in Task 6
+	a.lockPage.OnReset(a.reset)
 	a.link.OnCancel(func() { a.adding = false; a.showPage() })
 	a.showChatPane(false)
 	a.chat.SetAutoDownload(a.cfg[ui.KeyAutoDownloadImages] == "true")
@@ -240,10 +242,10 @@ func (a *App) Attach(mgr Backend) {
 
 // Run shows the window and the tray icon and returns after Exit, once every account has been set
 // unavailable and disconnected. Call Attach first.
-func (a *App) Run() error {
+func (a *App) Run() (reset bool, err error) {
 	tray, err := notify.NewTray(a.mw, a.icon, "Wisp", a.restore, a.exit)
 	if err != nil {
-		return err
+		return false, err
 	}
 	a.tray = tray
 	a.tray.OnToastClick(a.toastClicked)
@@ -260,7 +262,7 @@ func (a *App) Run() error {
 	cancel()
 	logErr("disconnect", a.mgr.Close())
 	a.icon.Dispose()
-	return nil
+	return a.didReset, nil
 }
 
 // closing hides the window to the tray instead of closing it, and every account goes unavailable at
@@ -321,8 +323,10 @@ func (a *App) restore() {
 // WM_ACTIVATEAPP: see watchActivation.)
 func (a *App) activated() {
 	if a.locked {
-		closeModals(a.mw.Handle()) // none survives a lock, whatever brought it back
-		a.focusPage()              // walk put the focus back into the hidden chats
+		if !a.resetting {
+			closeModals(a.mw.Handle()) // none survives a lock, whatever brought it back
+		}
+		a.focusPage() // walk put the focus back into the hidden chats
 		return
 	}
 	if a.page != pageChats {
@@ -495,7 +499,9 @@ func (a *App) lockNow() {
 		return // off, or already locked (a countdown in progress stays)
 	}
 	a.locked = true
-	closeModals(a.mw.Handle())    // Settings, New chat, the status viewer, their dialogs
+	if !a.resetting {
+		closeModals(a.mw.Handle()) // Settings, New chat, the status viewer, their dialogs
+	}
 	a.mw.Synchronize(a.focusPage) // once they are gone
 	a.closeMedia()
 	a.lockPage.Clear()
@@ -530,6 +536,33 @@ func (a *App) unlock(pin string) {
 	if d := a.backoff.Wait(now); d > 0 {
 		a.lockPage.Wait(d)
 	}
+}
+
+// reset is the lock page's Reset Wisp: after a confirmation it logs every account out and exits;
+// main then deletes the data and starts a new Wisp. The confirmation is the one dialog the lock
+// leaves open.
+func (a *App) reset() {
+	if a.resetting {
+		return
+	}
+	a.resetting = true
+	ok, err := ui.Confirm(a.mw, a.pal, "Reset Wisp?",
+		"This logs out every account on this PC and deletes your chats, media and settings here. Your phone keeps its chats.", "Reset")
+	if err != nil || !ok {
+		logErr("reset confirm", err)
+		a.resetting = false
+		return
+	}
+	failed := logoutAll(a.bg, a.rail.Model().Accounts(), func(ctx context.Context, id string) error {
+		ctx, cancel := context.WithTimeout(ctx, netTimeout)
+		defer cancel()
+		return a.mgr.Logout(ctx, id)
+	})
+	if len(failed) > 0 {
+		a.alert(`Some accounts couldn't be logged out. Remove "Wisp" under Linked devices on your phone.`)
+	}
+	a.didReset = true
+	a.exit()
 }
 
 // alert shows a problem the user should know about over the window in front.

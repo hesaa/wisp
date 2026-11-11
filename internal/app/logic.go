@@ -1,6 +1,8 @@
 package app
 
 import (
+	"context"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -489,3 +491,15 @@ func pairingRuns(pg page, visible, iconic bool) bool { return pg == pageLink && 
 
 // linkCancellable: Cancel returns to the chats, so it needs an account and an add in progress.
 func linkCancellable(adding bool, accounts int) bool { return adding && accounts > 0 }
+
+// logoutAll logs every account out, trying all of them even when one fails (offline), and returns
+// the ones that failed.
+func logoutAll(ctx context.Context, accounts []string, logout func(context.Context, string) error) (failed []string) {
+	for _, id := range accounts {
+		if err := logout(ctx, id); err != nil {
+			log.Printf("app: logout %s: %v", id, err)
+			failed = append(failed, id)
+		}
+	}
+	return failed
+}

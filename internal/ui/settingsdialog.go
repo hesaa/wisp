@@ -671,7 +671,7 @@ func (d *settingsDialog) measureCache() {
 
 // clearCache deletes the downloaded media once the user confirms, then measures again.
 func (d *settingsDialog) clearCache() {
-	ok, err := confirm(d.Dialog, d.pal, "Clear the media cache?",
+	ok, err := Confirm(d.Dialog, d.pal, "Clear the media cache?",
 		"Photos, videos and documents downloaded to this PC are deleted. Your messages stay, and media can be downloaded again while WhatsApp still has it.",
 		"Clear cache")
 	if err != nil {
@@ -755,7 +755,7 @@ func (d *settingsDialog) listAccounts() error {
 
 // logout logs id out once the user confirms, then lists the accounts again.
 func (d *settingsDialog) logout(id string) {
-	ok, err := confirm(d.Dialog, d.pal, "Log out +"+id+"?",
+	ok, err := Confirm(d.Dialog, d.pal, "Log out +"+id+"?",
 		"This PC stops receiving this account's messages. Chats already here are kept. To use it here again, link it with a new QR code.",
 		"Log out")
 	if err != nil {
@@ -818,10 +818,10 @@ func (s *serial) drain() {
 	}
 }
 
-// confirm asks a yes/no question in a small modal dialog over owner, themed in p: the question,
+// Confirm asks a yes/no question in a small modal dialog over owner, themed in p: the question,
 // text, Cancel and the action button. The focus starts on Cancel; Esc cancels. It reports whether
 // the action was chosen.
-func confirm(owner walk.Form, p theme.Palette, question, text, action string) (bool, error) {
+func Confirm(owner walk.Form, p theme.Palette, question, text, action string) (bool, error) {
 	dlg, err := walk.NewDialogWithFixedSize(owner)
 	if err != nil {
 		return false, err
