@@ -260,8 +260,9 @@ func (v *ChatView) OnLoadPrevious(fn func()) { v.onLoadPrevious = fn }
 // may come for a download already under way.
 func (v *ChatView) OnNeedMedia(fn func(store.Message)) { v.onNeedMedia = fn }
 
-// OnOpenMedia sets the handler of a double-click or Enter on media, downloaded or not: it shows it
-// in the media view, or opens its file, or asks for the download first.
+// OnOpenMedia sets the handler that opens media, downloaded or not (Enter; a click on a photo,
+// sticker or video's picture; a double-click elsewhere and on documents and audio): it shows it in
+// the media view, or opens its file, or asks for the download first.
 func (v *ChatView) OnOpenMedia(fn func(store.Message)) { v.onOpenMedia = fn }
 
 // Messages are the loaded messages, oldest first; the caller must not change them.
@@ -729,17 +730,18 @@ func (v *ChatView) mouseDown(x, y int, b walk.MouseButton) {
 	if n == 2 {
 		v.lastClickID = "" // a third click starts over
 	}
-	v.activate(m, n == 2 || clickOpens(m.Type, v.lay.cache[m.ID], x, y-v.screenY(i), mods, v.dragging))
+	v.activate(m, clickOpens(m.Type, v.lay.cache[m.ID], x, y-v.screenY(i), n, mods, v.dragging))
 }
 
-// clickOpens reports whether a press at (x, y) (y from the bubble's top) opens a message at once,
-// as Enter does: a plain click, not ending a drag, on the picture or card of a photo, sticker or
-// video. Documents and audio wait for a double-click; picks and text keep their own gestures.
-func clickOpens(typ string, b bubble, x, y int, mods walk.Modifiers, dragged bool) bool {
-	if mods != 0 || dragged || typ != "image" && typ != "sticker" && typ != "video" {
-		return false
+// clickOpens reports whether the nth press in a row at (x, y) (y from the bubble's top) opens a
+// message, as Enter does. On the picture or card of a photo, sticker or video the first plain press
+// does (not one ending a drag), and the second of a double-click must not open it again; elsewhere,
+// and for documents and audio, the double-click does. Picks and text keep their own gestures.
+func clickOpens(typ string, b bubble, x, y, n int, mods walk.Modifiers, dragged bool) bool {
+	if (typ == "image" || typ == "sticker" || typ == "video") && (in(b.thumb, x, y) || in(b.card, x, y)) {
+		return n == 1 && mods == 0 && !dragged
 	}
-	return in(b.thumb, x, y) || in(b.card, x, y)
+	return n == 2
 }
 
 // pressText starts a selection for the nth press in a row on text at (x, y): the first sets the

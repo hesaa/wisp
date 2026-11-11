@@ -144,23 +144,29 @@ func TestClickOpens(t *testing.T) {
 		typ     string
 		b       bubble
 		x, y    int
+		n       int
 		mods    walk.Modifiers
 		dragged bool
 		want    bool
 	}{
-		{"plain click on the photo", "image", photo, 50, 50, 0, false, true},
-		{"plain click on a sticker", "sticker", photo, 50, 50, 0, false, true},
-		{"plain click on a video card", "video", card, 50, 30, 0, false, true},
-		{"ctrl picks", "image", photo, 50, 50, walk.ModControl, false, false},
-		{"shift picks", "image", photo, 50, 50, walk.ModShift, false, false},
-		{"caption text", "image", photo, 50, 170, 0, false, false},
-		{"outside the media", "image", photo, 230, 50, 0, false, false},
-		{"end of a drag", "image", photo, 50, 50, 0, true, false},
-		{"document waits for a double-click", "document", card, 50, 30, 0, false, false},
-		{"audio waits for a double-click", "audio", card, 50, 30, 0, false, false},
+		{"plain click on the photo", "image", photo, 50, 50, 1, 0, false, true},
+		{"plain click on a sticker", "sticker", photo, 50, 50, 1, 0, false, true},
+		{"plain click on a video card", "video", card, 50, 30, 1, 0, false, true},
+		{"ctrl picks", "image", photo, 50, 50, 1, walk.ModControl, false, false},
+		{"shift picks", "image", photo, 50, 50, 1, walk.ModShift, false, false},
+		{"caption text", "image", photo, 50, 170, 1, 0, false, false},
+		{"outside the media", "image", photo, 230, 50, 1, 0, false, false},
+		{"end of a drag", "image", photo, 50, 50, 1, 0, true, false},
+		{"document waits for a double-click", "document", card, 50, 30, 1, 0, false, false},
+		{"audio waits for a double-click", "audio", card, 50, 30, 1, 0, false, false},
+		{"double-click on the photo opens once", "image", photo, 50, 50, 2, 0, false, false},
+		{"double-click on a video card opens once", "video", card, 50, 30, 2, 0, false, false},
+		{"double-click on a document", "document", card, 50, 30, 2, 0, false, true},
+		{"double-click on audio", "audio", card, 50, 30, 2, 0, false, true},
+		{"double-click beside a photo", "image", photo, 230, 50, 2, 0, false, true},
 	}
 	for _, c := range cases {
-		if got := clickOpens(c.typ, c.b, c.x, c.y, c.mods, c.dragged); got != c.want {
+		if got := clickOpens(c.typ, c.b, c.x, c.y, c.n, c.mods, c.dragged); got != c.want {
 			t.Errorf("%s: %v, want %v", c.name, got, c.want)
 		}
 	}
