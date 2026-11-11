@@ -119,6 +119,9 @@ type settingsDialog struct {
 	proxyEdit  *walk.LineEdit
 	accounts   *walk.Composite
 	addBtn     *button
+	lockStored string // the app-lock PIN's hash ("" is off); loaded with the app-global settings
+	lockState  *label
+	lockBtns   [3]*button // Set PIN, Change PIN, Turn off
 }
 
 func (d *settingsDialog) build() error {
@@ -218,7 +221,83 @@ func (d *settingsDialog) buildPrivacy(pg *walk.Composite) error {
 	d.bind(secPrivacy, KeyProfilePhoto, photo)
 	d.bind(secPrivacy, KeyReadReceipts, receipts)
 	d.bind(secPrivacy, KeyDisappearing, timer)
-	return nil
+	return d.buildLock(pg)
+}
+
+// buildLock adds the App lock row: its state and the buttons that set, change or turn off the PIN.
+// The buttons stay hidden until the saved hash is loaded.
+func (d *settingsDialog) buildLock(pg *walk.Composite) error {
+	row, err := d.newRow(pg, fieldH)
+	if err != nil {
+		return err
+	}
+	if d.lockState, err = d.newLabel(row, "App lock", 10, 0, toneText, fieldH); err != nil {
+		return err
+	}
+	if err := fillRest(row, d.lockState); err != nil {
+		return err
+	}
+	for i, b := range []struct {
+		text string
+		kind int
+		w    int
+		mode pinMode
+	}{{"Set PIN", btnPlain, 110, pinSet}, {"Change PIN", btnPlain, 130, pinChange}, {"Turn off", btnDanger, 110, pinOff}} {
+		if d.lockBtns[i], err = d.newButton(row, b.text, b.kind, b.w, func() { d.editLock(b.mode) }); err != nil {
+			return err
+		}
+		d.lockBtns[i].SetVisible(false)
+	}
+	_, err = d.newLabel(pg, "The lock hides Wisp's window; it doesn't encrypt Wisp's files.", 9, 0, toneSecondary, 20)
+	return err
+}
+
+// showLock shows the lock state for hash and the buttons that fit it.
+func (d *settingsDialog) showLock(hash string) {
+	d.lockStored = hash
+	state := "App lock: Off"
+	if hash != "" {
+		state = "App lock: On"
+	}
+	d.lockState.set(state, toneText)
+	d.lockBtns[0].SetVisible(hash == "")
+	d.lockBtns[1].SetVisible(hash != "")
+	d.lockBtns[2].SetVisible(hash != "")
+}
+
+// editLock asks for the PINs mode needs and saves the result.
+func (d *settingsDialog) editLock(mode pinMode) {
+	title, labels := "Set PIN", []string{"New PIN", "Confirm new PIN"}
+	switch mode {
+	case pinChange:
+		title, labels = "Change PIN", []string{"Current PIN", "New PIN", "Confirm new PIN"}
+	case pinOff:
+		title, labels = "Turn off app lock", []string{"Current PIN"}
+	}
+	values, ok, err := askPIN(d.Dialog, d.pal, title, labels...)
+	if err != nil {
+		d.say(secPrivacy, "Couldn't open the PIN dialog: "+err.Error(), toneError)
+		return
+	}
+	if !ok {
+		return
+	}
+	hash, msg, ok := pinUpdate(d.lockStored, mode, values)
+	if !ok {
+		d.say(secPrivacy, msg, toneError)
+		return
+	}
+	d.ctl.setGlobal(KeyLockPIN, hash, func(err error) {
+		if d.closed {
+			return
+		}
+		if err != nil {
+			d.say(secPrivacy, "App lock was not saved: "+err.Error(), toneError)
+			return
+		}
+		d.showLock(hash)
+		d.say(secPrivacy, msg, toneSecondary)
+	})
 }
 
 func (d *settingsDialog) buildChats(pg *walk.Composite) error {
@@ -383,6 +462,7 @@ func (d *settingsDialog) loadGlobals() {
 			w.setValue(vals[key])
 			w.setBusy(false)
 		}
+		d.showLock(vals[KeyLockPIN])
 		logErr("GIPHY key field", d.keyEdit.SetText(vals[KeyGiphyAPIKey]))
 		logErr("proxy field", d.proxyEdit.SetText(vals[KeyProxy]))
 	})

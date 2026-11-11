@@ -13,6 +13,7 @@ import (
 
 	"go.mau.fi/whatsmeow/types"
 
+	"wa-go/internal/lock"
 	"wa-go/internal/store"
 	"wa-go/internal/theme"
 	"wa-go/internal/whatsapp"
@@ -462,5 +463,31 @@ func TestASaveThatFailsAfterItsDialogClosedIsKeptForTheNextOne(t *testing.T) {
 	closed.setGlobal(KeyNotify, "false", func(error) {})
 	if m := next.takeMissed(); !strings.Contains(m, "Notifications") {
 		t.Fatalf("kept failure %q", m)
+	}
+}
+
+func TestPinUpdate(t *testing.T) {
+	stored, msg, ok := pinUpdate("", pinSet, []string{"1234", "1234"})
+	if v, _ := lock.Verify(stored, "1234"); !ok || !v || msg != "App lock is on." {
+		t.Fatalf("set: %q %v %q", stored, ok, msg)
+	}
+	if _, msg, ok := pinUpdate("", pinSet, []string{"1234", "1235"}); ok || msg != "The PINs don't match." {
+		t.Fatalf("mismatch: %v %q", ok, msg)
+	}
+	if _, msg, ok := pinUpdate("", pinSet, []string{"12", "12"}); ok || msg != "Use 4 to 8 digits." {
+		t.Fatalf("format: %v %q", ok, msg)
+	}
+	if _, msg, ok := pinUpdate(stored, pinChange, []string{"0000", "5678", "5678"}); ok || msg != "That PIN isn't right." {
+		t.Fatalf("wrong current: %v %q", ok, msg)
+	}
+	changed, msg, ok := pinUpdate(stored, pinChange, []string{"1234", "5678", "5678"})
+	if v, _ := lock.Verify(changed, "5678"); !ok || !v || msg != "PIN changed." {
+		t.Fatalf("change: %v %q", ok, msg)
+	}
+	if _, msg, ok := pinUpdate(stored, pinOff, []string{"9999"}); ok || msg != "That PIN isn't right." {
+		t.Fatalf("off wrong: %v %q", ok, msg)
+	}
+	if off, msg, ok := pinUpdate(stored, pinOff, []string{"1234"}); !ok || off != "" || msg != "App lock is off." {
+		t.Fatalf("off: %q %v %q", off, ok, msg)
 	}
 }

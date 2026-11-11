@@ -11,6 +11,7 @@ import (
 
 	"go.mau.fi/whatsmeow/types"
 
+	"wa-go/internal/lock"
 	"wa-go/internal/theme"
 	"wa-go/internal/whatsapp"
 )
@@ -32,6 +33,7 @@ const (
 	KeyNotifyPrivate      = "notify.private"            // toasts without sender or text
 	KeyNotifySound        = "notify.sound"              // toasts with the notification sound
 	KeyTheme              = "ui.theme"                  // system, dark or light
+	KeyLockPIN            = "lock.pin"                  // the app-lock PIN's hash (see package lock); "" is lock off
 )
 
 // option is one value of a multiple-choice setting with its label.
@@ -61,14 +63,14 @@ var settingNames = map[string]string{
 	KeyDisappearing: "Default message timer", KeyGhostTyping: "Ghost typing", KeyAppearOffline: "Appear offline",
 	KeyAutoDownloadImages: "Auto-download images", KeyGiphyAPIKey: "GIPHY API key", KeyProxy: "Proxy",
 	KeyNotify: "Notifications", KeyNotifyPrivate: "Private notifications", KeyNotifySound: "Notification sound",
-	KeyTheme: "Theme",
+	KeyTheme: "Theme", KeyLockPIN: "App lock",
 }
 
 // defaults are the values of settings never saved. Privacy ones stand in until WhatsApp's answer.
 var defaults = map[string]string{
 	KeyLastSeen: "all", KeyReadReceipts: "all", KeyProfilePhoto: "all", KeyDisappearing: "0",
 	KeyGhostTyping: "false", KeyAppearOffline: "false", KeyAutoDownloadImages: "true", KeyGiphyAPIKey: "",
-	KeyProxy: "", KeyNotify: "true", KeyNotifyPrivate: "false", KeyNotifySound: "true", KeyTheme: "system",
+	KeyProxy: "", KeyNotify: "true", KeyNotifyPrivate: "false", KeyNotifySound: "true", KeyTheme: "system", KeyLockPIN: "",
 }
 
 // SettingsStore is the part of *store.DB the settings use.
@@ -257,4 +259,45 @@ func (c *settingsCtl) setGlobal(key, value string, done func(error)) {
 		}
 		done(err)
 	}))
+}
+
+// pinMode is what the PIN dialog is for.
+type pinMode int
+
+const (
+	pinSet    pinMode = iota // values: new, confirm
+	pinChange                // values: current, new, confirm
+	pinOff                   // values: current
+)
+
+// pinUpdate applies the PIN dialog's values to the stored hash. It returns the hash to store ("" is
+// lock off) and the message to show; ok is false when nothing should be stored.
+func pinUpdate(stored string, mode pinMode, values []string) (newStored, msg string, ok bool) {
+	current, next := "", ""
+	switch mode {
+	case pinSet:
+		next = values[0]
+		if values[1] != next {
+			return "", "The PINs don't match.", false
+		}
+	case pinChange:
+		current, next = values[0], values[1]
+		if values[2] != next {
+			return "", "The PINs don't match.", false
+		}
+	case pinOff:
+		current = values[0]
+	}
+	newStored, err := lock.Update(stored, current, next)
+	switch {
+	case errors.Is(err, lock.ErrWrongPIN):
+		return "", "That PIN isn't right.", false
+	case errors.Is(err, lock.ErrPINFormat):
+		return "", "Use 4 to 8 digits.", false
+	case errors.Is(err, lock.ErrStored):
+		return "", "The saved PIN is damaged. Use Reset Wisp on the lock page.", false
+	case err != nil:
+		return "", "Couldn't set the PIN.", false
+	}
+	return newStored, map[pinMode]string{pinSet: "App lock is on.", pinChange: "PIN changed.", pinOff: "App lock is off."}[mode], true
 }
