@@ -92,6 +92,9 @@ type keyHook struct {
 	prev  uintptr // the window procedure walk installed
 	onKey func(walk.Key) bool
 	esc   func() bool // whether onKey takes Esc now (takeEscape); nil: never
+	// menu is asked before a context menu opens, with the screen point it was asked for ((-1, -1) from the
+	// keyboard); it gives where to open it, or false for none (takeContextMenu); nil: as asked.
+	menu func(x, y int32) (int32, int32, bool)
 }
 
 var (
@@ -110,6 +113,14 @@ func keyHookProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 			return win.DLGC_WANTARROWS | win.DLGC_WANTCHARS | win.DLGC_WANTALLKEYS
 		}
 		return win.DLGC_WANTARROWS | win.DLGC_WANTCHARS
+	case win.WM_CONTEXTMENU:
+		if h.menu != nil {
+			x, y, ok := h.menu(win.GET_X_LPARAM(lParam), win.GET_Y_LPARAM(lParam))
+			if !ok {
+				return 0
+			}
+			lParam = uintptr(uint32(uint16(x)) | uint32(uint16(y))<<16)
+		}
 	case win.WM_KEYDOWN: // handled here, not via walk's KeyDown, which drops auto-repeat
 		if h.onKey(walk.Key(wParam)) {
 			showFocusCues(hwnd)
@@ -146,6 +157,11 @@ func focusable(cw *walk.CustomWidget, role walk.AccRole, name string, onKey func
 
 // takeEscape has Esc go to cw's onKey while when() reports true, not to the dialog as Cancel.
 func takeEscape(cw *walk.CustomWidget, when func() bool) { keyHooks[cw.Handle()].esc = when }
+
+// takeContextMenu lets where decide where cw's context menu opens, or whether it does (keyHook.menu).
+func takeContextMenu(cw *walk.CustomWidget, where func(x, y int32) (int32, int32, bool)) {
+	keyHooks[cw.Handle()].menu = where
+}
 
 // focusCues reports whether w should paint its focus indicator: it has the focus and Windows shows
 // focus cues, which it hides until the keyboard is used (so clicks don't leave rings behind).

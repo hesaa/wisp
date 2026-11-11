@@ -74,13 +74,14 @@ type ChatView struct {
 	gen         int // bumped per chat: thumbnails finished for an older chat are dropped
 	lastClickID string
 	lastClickAt time.Time
-	clicks      int        // presses in a row on lastClickID, each within the double-click time
-	selA, selB  textMark   // anchor and caret of the text selection; selA.id is "" for none
-	dragging    bool       // the left button went down on text and is held: moves extend the selection
-	drag        walk.Point // where the pointer is while dragging
-	ticking     bool       // an auto-scroll tick is pending
-	notice      string     // shown in the header for a while instead of the number
-	noticeGen   int        // bumped per notice: only the latest one's timer clears it
+	clicks      int             // presses in a row on lastClickID, each within the double-click time
+	selA, selB  textMark        // anchor and caret of the text selection; selA.id is "" for none
+	dragging    bool            // the left button went down on text and is held: moves extend the selection
+	drag        walk.Point      // where the pointer is while dragging
+	ticking     bool            // an auto-scroll tick is pending
+	picked      map[string]bool // messages picked for copying (Ctrl+click, Shift+click, Shift+Up/Down)
+	notice      string          // shown in the header for a while instead of the number
+	noticeGen   int             // bumped per notice: only the latest one's timer clears it
 
 	onLoadPrevious func()
 	onNeedMedia    func(store.Message)
@@ -187,7 +188,7 @@ func NewChatView(parent walk.Container, p theme.Palette, cache *media.Cache, sen
 		return nil, err
 	}
 	v := &ChatView{Composite: comp, pal: p, cache: cache, cdpi: canvasDPI(), autoFetch: true,
-		requested: map[string]bool{}, thumbFiles: map[string]string{}, thumbBusy: map[string]bool{},
+		picked: map[string]bool{}, requested: map[string]bool{}, thumbFiles: map[string]string{}, thumbBusy: map[string]bool{},
 		bitmaps: newLRU(thumbCacheSize, func(t thumbBitmap) {
 			if t.bmp != nil {
 				t.bmp.Dispose()
@@ -225,7 +226,8 @@ func (v *ChatView) build() error {
 			v.dragging = false
 		}
 	})
-	takeEscape(cw, func() bool { _, _, ok := v.selection(); return ok })
+	takeEscape(cw, func() bool { _, _, ok := v.selection(); return ok || len(v.picked) > 0 })
+	takeContextMenu(cw, v.menuAt)
 	v.scroll.attach(cw, func() int { return v.lay.total }, func() int { return cw.IntFrom96DPI(100) })
 	v.scroll.moved = v.settle
 	cw.SizeChanged().Attach(func() {
@@ -240,6 +242,9 @@ func (v *ChatView) build() error {
 		}
 	})
 	cw.Disposing().Attach(v.bitmaps.clear)
+	if err := v.buildMenu(); err != nil {
+		return err
+	}
 	return v.SetPalette(v.pal)
 }
 
@@ -271,6 +276,7 @@ func (v *ChatView) SetChat(accountID, chatJID, name string, isGroup bool, firstP
 	v.gen++
 	v.focus, v.view, v.scroll.off, v.stale = "", 0, 0, true
 	v.selA, v.selB, v.dragging = textMark{}, textMark{}, false
+	clear(v.picked)
 	logErr("chat layout", v.relayout(false))
 	logErr("chat repaint", errors.Join(v.header.Invalidate(), v.canvas.Invalidate()))
 	v.settle()
@@ -585,13 +591,7 @@ func (v *ChatView) focusOn(i int) {
 // describe is message i for screen readers: sender, content, time and delivery state.
 func (v *ChatView) describe(i int) string {
 	m, b := &v.msgs[i], v.lay.cache[v.msgs[i].ID]
-	who := v.title()
-	switch {
-	case m.FromMe:
-		who = "You"
-	case v.lay.group:
-		who = v.lay.sender(m.SenderJID)
-	}
+	who := v.senderOf(*m)
 	text, _ := bubbleText(m, b.info)
 	switch b.kind {
 	case kindImage:
@@ -611,15 +611,37 @@ func (v *ChatView) describe(i int) string {
 	return item
 }
 
-func (v *ChatView) key(k walk.Key) bool {
+// senderOf names who sent m: "You", the member in a group, else the chat's other party.
+func (v *ChatView) senderOf(m store.Message) string {
 	switch {
-	case k == walk.KeyC && walk.ModifiersDown() == walk.ModControl:
-		return v.copySelection()
-	case k == walk.KeyEscape: // only while there is a selection (takeEscape)
+	case m.FromMe:
+		return "You"
+	case v.lay.group:
+		return v.lay.sender(m.SenderJID)
+	}
+	return v.title()
+}
+
+func (v *ChatView) key(k walk.Key) bool {
+	mods := walk.ModifiersDown()
+	switch {
+	case k == walk.KeyC && mods == walk.ModControl:
+		return v.copySelection() || v.copyPicked()
+	case k == walk.KeyEscape: // only while there is a selection or picks (takeEscape)
 		v.setSel(textMark{}, textMark{})
+		v.setPicks(nil)
 		return true
 	}
 	i := v.focusIndex()
+	if mods == walk.ModShift && (k == walk.KeyUp || k == walk.KeyDown) && i >= 0 {
+		next := max(0, min(len(v.msgs)-1, i+1))
+		if k == walk.KeyUp {
+			next = max(0, i-1)
+		}
+		v.setPicks(v.msgs[min(i, next) : max(i, next)+1])
+		v.focusOn(next)
+		return true
+	}
 	if k == walk.KeyReturn || k == walk.KeySpace {
 		if i >= 0 {
 			v.activate(v.msgs[i], true)
@@ -639,11 +661,22 @@ func (v *ChatView) mouseDown(x, y int, b walk.MouseButton) {
 		return
 	}
 	// resolve the message against the view the user saw, then take focus, then act on it
-	i := v.hit(x, y)
+	i, prev := v.hit(x, y), v.focusIndex()
 	if i >= 0 {
 		v.setFocus(i)
 	}
 	focusOn(v.canvas)
+	switch mods := walk.ModifiersDown(); {
+	case i >= 0 && mods == walk.ModControl:
+		v.setSel(textMark{}, textMark{})
+		v.togglePick(v.msgs[i].ID)
+		return
+	case i >= 0 && mods == walk.ModShift:
+		v.setSel(textMark{}, textMark{})
+		v.setPicks(v.msgs[min(i, max(prev, 0)) : max(i, prev)+1])
+		return
+	}
+	v.setPicks(nil)
 	if i < 0 {
 		v.setSel(textMark{}, textMark{})
 		return
@@ -791,13 +824,119 @@ func (v *ChatView) selectionText() string {
 	return selectedText(texts, from, to)
 }
 
+// setPicks makes msgs the picked messages (none for nil) and repaints on a change.
+func (v *ChatView) setPicks(msgs []store.Message) {
+	if len(msgs) == len(v.picked) && !slices.ContainsFunc(msgs, func(m store.Message) bool { return !v.picked[m.ID] }) {
+		return
+	}
+	clear(v.picked)
+	for _, m := range msgs {
+		v.picked[m.ID] = true
+	}
+	logErr("chat repaint", errors.Join(v.header.Invalidate(), v.canvas.Invalidate()))
+}
+
+// togglePick picks message id, or unpicks it when it is picked.
+func (v *ChatView) togglePick(id string) {
+	var msgs []store.Message
+	for _, m := range v.msgs {
+		if v.picked[m.ID] != (m.ID == id) { // the picked ones, with id flipped
+			msgs = append(msgs, m)
+		}
+	}
+	v.setPicks(msgs)
+}
+
+// copyPicked copies the picked messages, else the focused one, and reports whether there was any text
+// to copy. Ctrl+C tries it after the selected text.
+func (v *ChatView) copyPicked() bool {
+	var msgs []store.Message
+	for _, m := range v.msgs {
+		if v.picked[m.ID] {
+			msgs = append(msgs, m)
+		}
+	}
+	if i := v.focusIndex(); len(msgs) == 0 && i >= 0 {
+		msgs = v.msgs[i : i+1]
+	}
+	text := copyMessages(msgs, v.senderOf, time.Local)
+	return text != "" && v.toClipboard(text)
+}
+
+// buildMenu makes the context menu: Copy copies the selected text, else the picked or focused
+// messages; Select picks the focused message.
+func (v *ChatView) buildMenu() error {
+	m, err := walk.NewMenu()
+	if err != nil {
+		return err
+	}
+	v.canvas.Disposing().Attach(m.Dispose)
+	for _, it := range []struct {
+		text string
+		do   func()
+	}{
+		{"Copy\tCtrl+C", func() { _ = v.copySelection() || v.copyPicked() }},
+		{"Select", func() {
+			if i := v.focusIndex(); i >= 0 && !v.picked[v.msgs[i].ID] {
+				v.togglePick(v.msgs[i].ID)
+			}
+		}},
+	} {
+		a := walk.NewAction()
+		if err := a.SetText(it.text); err != nil {
+			return err
+		}
+		a.Triggered().Attach(it.do)
+		if err := m.Actions().Add(a); err != nil {
+			return err
+		}
+	}
+	v.canvas.SetContextMenu(m)
+	return nil
+}
+
+// menuAt decides where the context menu asked for at screen point (x, y) opens: at the pointer over a
+// message (which it focuses, dropping picks and selection that don't include it), at the focused
+// message from the keyboard (x and y are -1), nowhere else.
+func (v *ChatView) menuAt(x, y int32) (int32, int32, bool) {
+	h := v.canvas.Handle()
+	pt := win.POINT{X: x, Y: y}
+	if x == -1 && y == -1 {
+		i := v.focusIndex()
+		if i < 0 {
+			return 0, 0, false
+		}
+		b := v.lay.cache[v.msgs[i].ID].box
+		pt = win.POINT{X: int32(b.X + b.Width/2), Y: int32(max(0, min(v.view-1, v.screenY(i)+b.Height/2)))}
+		win.ClientToScreen(h, &pt)
+		return pt.X, pt.Y, true
+	}
+	win.ScreenToClient(h, &pt)
+	i := v.hit(int(pt.X), int(pt.Y))
+	if i < 0 {
+		return 0, 0, false
+	}
+	v.setFocus(i)
+	focusOn(v.canvas)
+	if from, to, ok := v.selection(); !ok || i < from.msg || i > to.msg {
+		v.setSel(textMark{}, textMark{})
+	}
+	if !v.picked[v.msgs[i].ID] {
+		v.setPicks(nil)
+	}
+	return x, y, true
+}
+
 // copySelection puts the selected text on the clipboard and reports whether there was any to copy.
 // Ctrl+C tries it first.
 func (v *ChatView) copySelection() bool {
 	text := v.selectionText()
-	if text == "" {
-		return false
-	}
+	return text != "" && v.toClipboard(text)
+}
+
+// toClipboard replaces the clipboard's content with text, flashing a notice when that fails. It
+// returns true: the key was handled either way.
+func (v *ChatView) toClipboard(text string) bool {
 	cb := walk.Clipboard()
 	err := cb.Clear() // SetText alone leaves the last copy's other formats (HTML, ANSI text) behind
 	if err == nil {
@@ -860,6 +999,9 @@ func (v *ChatView) paintHeader(c *walk.Canvas, _ walk.Rectangle) error {
 	if v.notice != "" {
 		sub = v.notice
 	}
+	if n := len(v.picked); n > 0 && v.notice == "" {
+		sub = fmt.Sprintf("%d selected", n)
+	}
 	if sub != "" {
 		name.Y, name.Height = b.Height/2-s(22), s(24)
 	}
@@ -891,6 +1033,11 @@ func (v *ChatView) paint(c *walk.Canvas, ub walk.Rectangle) error {
 		if dy+b.box.Height+s(3) <= ub.Y || dy-s(3) >= ub.Y+ub.Height {
 			continue
 		}
+		if v.picked[m.ID] {
+			if err := v.paintPick(c, b, dy); err != nil {
+				return err
+			}
+		}
 		var sel textLine
 		sel.start, sel.end = selSpan(from, to, i, selectableUnits(m, b))
 		if err := v.paintBubble(c, m, b, dy, sel); err != nil {
@@ -908,6 +1055,22 @@ func (v *ChatView) paint(c *walk.Canvas, ub walk.Rectangle) error {
 		return icons.Fill(c, t, theme.Color(p.TextSecondary))
 	}
 	return nil
+}
+
+// paintPick tints the row of picked message bubble b, its top at canvas y dy, with the selection
+// colour and a 3 px accent bar at the left edge.
+func (v *ChatView) paintPick(c *walk.Canvas, b bubble, dy int) error {
+	s, w := scaler(v.canvas.DPI()), v.canvas.ClientBoundsPixels().Width
+	tint, err := brushFor(v.pal.Selection)
+	if err != nil {
+		return err
+	}
+	bar, err := brushFor(v.pal.Accent)
+	if err != nil {
+		return err
+	}
+	row := walk.Rectangle{Y: dy - s(2), Width: w, Height: b.box.Height + s(4)}
+	return errors.Join(c.FillRectanglePixels(tint, row), c.FillRectanglePixels(bar, walk.Rectangle{Width: s(3), Y: row.Y, Height: row.Height}))
 }
 
 var cardIcons = map[string]icons.Icon{"document": icons.IconDocument, "video": icons.IconVideo, "audio": icons.IconAudio, "sticker": icons.IconEmoji}

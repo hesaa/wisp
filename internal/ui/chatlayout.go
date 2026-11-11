@@ -62,6 +62,8 @@ type mediaInfo struct {
 	name    string // document file name
 	w, h    int    // pixel size of an image, video or sticker; 0 when unknown
 	preview []byte // embedded thumbnail (JPEG; PNG for stickers); not kept in layouts
+	gif     bool   // a video sent as a GIF
+	voice   bool   // audio recorded in the app (a voice message)
 }
 
 // parseMedia reads a message's MediaMeta, the marshaled media sub-message of its type.
@@ -77,11 +79,11 @@ func parseMedia(m *store.Message) (mediaInfo, error) {
 	case "video":
 		var x waE2E.VideoMessage
 		err := proto.Unmarshal(m.MediaMeta, &x)
-		return mediaInfo{size: x.GetFileLength(), w: int(x.GetWidth()), h: int(x.GetHeight()), preview: x.GetJPEGThumbnail()}, err
+		return mediaInfo{size: x.GetFileLength(), w: int(x.GetWidth()), h: int(x.GetHeight()), preview: x.GetJPEGThumbnail(), gif: x.GetGifPlayback()}, err
 	case "audio":
 		var x waE2E.AudioMessage
 		err := proto.Unmarshal(m.MediaMeta, &x)
-		return mediaInfo{size: x.GetFileLength()}, err
+		return mediaInfo{size: x.GetFileLength(), voice: x.GetPTT()}, err
 	case "document":
 		var x waE2E.DocumentMessage
 		err := proto.Unmarshal(m.MediaMeta, &x)
