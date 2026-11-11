@@ -638,6 +638,15 @@ func TestInFront(t *testing.T) {
 	}
 }
 
+func TestModalClass(t *testing.T) {
+	for class, want := range map[string]bool{`\o/ Walk_Dialog_Class \o/`: true, "#32770": true, "tooltips_class32": false,
+		`\o/ Walk_MainWindow_Class \o/`: false, "": false} {
+		if got := modalClass(class); got != want {
+			t.Errorf("modalClass(%q) = %v, want %v", class, got, want)
+		}
+	}
+}
+
 func TestToastSettingsPrivateWhileLocked(t *testing.T) {
 	cfg := map[string]string{ui.KeyNotifyPrivate: "false", ui.KeyNotifySound: "true"}
 	if s := toastSettings(cfg, true, 2); !s.PrivateMode || !s.Sound || !s.MultiAccount || !s.Enabled {

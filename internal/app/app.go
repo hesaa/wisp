@@ -93,6 +93,7 @@ type App struct {
 	page       page         // as showPage last set it
 	locked     bool         // the lock page covers the window (Task 5)
 	exiting    bool
+	hiding     bool // closed to the tray and not restored since
 	minimized  bool // as sizeChanged last saw the window
 }
 
@@ -270,7 +271,15 @@ func (a *App) closing(canceled *bool, _ walk.CloseReason) {
 	}
 	*canceled = true
 	a.mw.Hide()
-	a.lockNow()  // locked while hidden: a restore never flashes the chats
+	a.hiding = true
+	a.lockNow() // locked while hidden: a restore never flashes the chats
+	// closing an owned dialog shows its owner again: hide once they are gone
+	a.mw.Synchronize(func() {
+		if a.hiding && a.mw.Visible() {
+			a.mw.Hide()
+			a.showPage()
+		}
+	})
 	a.showPage() // stops pairing while hidden
 	a.sendPresence(true)
 }
@@ -293,6 +302,7 @@ func (a *App) Restore() { a.mw.Synchronize(a.restore) }
 
 // restore brings the window back from the tray (or a minimised state) to the front.
 func (a *App) restore() {
+	a.hiding = false
 	if !a.mw.Visible() {
 		a.mw.Show()
 	}
@@ -311,7 +321,12 @@ func (a *App) restore() {
 // WM_ACTIVATEAPP: see watchActivation.)
 func (a *App) activated() {
 	if a.locked {
-		return // nothing is read behind the lock page
+		closeModals(a.mw.Handle()) // none survives a lock, whatever brought it back
+		a.focusPage()              // walk put the focus back into the hidden chats
+		return
+	}
+	if a.page != pageChats {
+		return // the chat is hidden behind the link page
 	}
 	if c := a.v.open; c.jid != "" && a.v.loaded && a.chatUnread(c.jid) > 0 {
 		a.markChatRead(c)
@@ -321,7 +336,7 @@ func (a *App) activated() {
 // foreground reports whether the user is looking at the window.
 func (a *App) foreground() bool {
 	h := a.mw.Handle()
-	return inFront(a.mw.Visible(), win.IsIconic(h), a.locked, win.GetForegroundWindow() == h)
+	return inFront(a.mw.Visible(), win.IsIconic(h), a.locked || a.page != pageChats, win.GetForegroundWindow() == h)
 }
 
 // sendPresence broadcasts the presence the window's state calls for (see presenceCtl.update).
@@ -387,6 +402,9 @@ func (a *App) typingWorker() {
 
 // nav handles the rail's Chats, Status and Settings buttons.
 func (a *App) nav(n ui.Nav) {
+	if a.locked {
+		return // nothing is shown, opened or sent behind the lock page
+	}
 	switch n {
 	case ui.NavChats:
 		a.side.FocusSearch()
@@ -430,6 +448,9 @@ func (a *App) settingChanged(key string) {
 
 // pair shows the link page over the chats; the paired account arrives as a ConnectionEvent.
 func (a *App) pair() {
+	if a.locked {
+		return // nothing is shown, opened or sent behind the lock page
+	}
 	a.adding = true
 	a.showPage()
 }
@@ -457,8 +478,8 @@ func (a *App) showPage() {
 
 // focusPage puts the keyboard where the page in front wants it, once the window is on screen.
 func (a *App) focusPage() {
-	if !a.mw.Visible() || win.IsIconic(a.mw.Handle()) {
-		return
+	if !a.mw.Visible() || win.IsIconic(a.mw.Handle()) || !win.IsWindowEnabled(a.mw.Handle()) {
+		return // an open dialog keeps the window disabled; activating it again retries
 	}
 	switch a.page {
 	case pageChats:
@@ -474,7 +495,8 @@ func (a *App) lockNow() {
 		return // off, or already locked (a countdown in progress stays)
 	}
 	a.locked = true
-	closeModals(a.mw.Handle()) // Settings, New chat, the status viewer, their dialogs
+	closeModals(a.mw.Handle())    // Settings, New chat, the status viewer, their dialogs
+	a.mw.Synchronize(a.focusPage) // once they are gone
 	a.closeMedia()
 	a.lockPage.Clear()
 	a.showPage()

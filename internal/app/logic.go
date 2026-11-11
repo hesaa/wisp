@@ -236,10 +236,17 @@ func (p *presenceCtl) sessionLocked(locked bool) {
 	p.update(locked)
 }
 
-// inFront reports whether the user is looking at the main window: on screen, not minimised, in the
-// foreground, and not behind the lock page.
-func inFront(visible, iconic, locked, foreground bool) bool {
-	return visible && !iconic && !locked && foreground
+// inFront reports whether the user is looking at the chats: the window is on screen, not minimised,
+// in the foreground, and no other page (lock, link) covers the chats.
+func inFront(visible, iconic, covered, foreground bool) bool {
+	return visible && !iconic && !covered && foreground
+}
+
+// modalClass reports whether a window of this class is a dialog that must not outlive a lock: walk's
+// dialogs (Settings, New chat, status viewer, pickers, PIN) and Windows' dialogs (file dialogs,
+// message boxes). Tooltips and the tray's window are other classes.
+func modalClass(class string) bool {
+	return class == `\o/ Walk_Dialog_Class \o/` || class == "#32770"
 }
 
 // appLock: the lock page covers the window, so the user is not using Wisp; same as a locked session.

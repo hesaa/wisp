@@ -25,6 +25,9 @@ func (a *App) showChatPane(open bool) {
 // off the UI thread, and it is marked read. Opening the open chat again only reads it and focuses
 // the input box, so a draft survives.
 func (a *App) openChat(acct, jid, name string) {
+	if a.locked {
+		return // nothing is shown, opened or sent behind the lock page
+	}
 	c := chatRef{acct, jid}
 	if acct == "" || jid == "" || acct != a.v.active {
 		return
@@ -69,7 +72,9 @@ func (a *App) loadChat(c chatRef, name string) {
 				a.chat.Upsert(m)
 			}
 			a.v.pending = nil
-			a.markChatRead(c)
+			if a.foreground() { // not read behind the lock page, nor while hidden
+				a.markChatRead(c)
+			}
 		})
 	}()
 }
@@ -216,6 +221,9 @@ func (a *App) needMedia(m store.Message) {
 // openMedia opens a downloaded file with its Windows program; a file the cache refuses to open is
 // reported.
 func (a *App) openMedia(path string) {
+	if a.locked {
+		return // nothing is shown, opened or sent behind the lock page
+	}
 	if err := a.cache.OpenInDefaultApp(path); err != nil {
 		logErr("open media", err)
 		a.alert("This file was not opened: " + err.Error())
@@ -225,6 +233,9 @@ func (a *App) openMedia(path string) {
 // send sends text to the open chat; the stored message comes back as a MessageEvent. Failed, the
 // text goes back in the box if its chat is still open and nothing new was typed.
 func (a *App) send(text string) {
+	if a.locked {
+		return // nothing is shown, opened or sent behind the lock page
+	}
 	c := a.v.open
 	a.sendOff("Message not sent", func(ctx context.Context) error {
 		_, err := a.mgr.SendText(ctx, c.acct, c.jid, text)
@@ -238,6 +249,9 @@ func (a *App) send(text string) {
 
 // attach sends a picked file to the open chat.
 func (a *App) attach(path string) {
+	if a.locked {
+		return // nothing is shown, opened or sent behind the lock page
+	}
 	c := a.v.open
 	a.sendOff("File not sent", func(ctx context.Context) error {
 		_, err := a.mgr.SendMedia(ctx, c.acct, c.jid, path, "")
@@ -248,6 +262,9 @@ func (a *App) attach(path string) {
 // sendGIF downloads a picked GIPHY MP4 (allowlist checked again, size capped) and sends it to the
 // open chat as a GIF.
 func (a *App) sendGIF(mp4URL string) {
+	if a.locked {
+		return // nothing is shown, opened or sent behind the lock page
+	}
 	c := a.v.open
 	a.sendOff("GIF not sent", func(ctx context.Context) error {
 		tmp, err := fetchGIF(ctx, gifHTTP, mp4URL, maxGIFBytes)
@@ -282,6 +299,9 @@ func (a *App) sendOff(what string, send func(ctx context.Context) error, timeout
 // typing tells the open chat the user is typing (or stopped), unless ghost typing is on or the user
 // appears offline.
 func (a *App) typing(composing bool) {
+	if a.locked {
+		return // nothing is shown, opened or sent behind the lock page
+	}
 	c := a.v.open
 	if c.jid == "" || !typingOn(a.cfg[ui.KeyGhostTyping], a.cfg[ui.KeyAppearOffline]) {
 		return
@@ -291,6 +311,9 @@ func (a *App) typing(composing bool) {
 
 // newChat fetches the active account's contacts off the UI thread, then shows the New Chat picker.
 func (a *App) newChat() {
+	if a.locked {
+		return // nothing is shown, opened or sent behind the lock page
+	}
 	acct := a.v.active
 	if acct == "" {
 		return
@@ -322,6 +345,9 @@ func contactName(contacts []whatsapp.Contact, jid string) string {
 
 // openStory shows sender's status updates of the last 24 hours in the status viewer.
 func (a *App) openStory(sender string) {
+	if a.locked {
+		return // nothing is shown, opened or sent behind the lock page
+	}
 	acct, name := a.v.active, ""
 	for _, s := range a.stories {
 		if s.SenderJID == sender {

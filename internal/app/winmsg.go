@@ -55,7 +55,10 @@ var (
 )
 
 func collectModal(h, _ uintptr) uintptr {
-	if w := win.HWND(h); win.IsWindowVisible(w) {
+	// hidden ones count: Windows hides a minimised window's owned windows before it tells the window
+	var buf [64]uint16
+	n, _ := win.GetClassName(win.HWND(h), &buf[0], len(buf))
+	if w := win.HWND(h); modalClass(windows.UTF16ToString(buf[:max(n, 0)])) {
 		for o := win.GetWindow(w, win.GW_OWNER); o != 0; o = win.GetWindow(o, win.GW_OWNER) {
 			if o == modalOwner {
 				modals = append(modals, w)
@@ -66,7 +69,7 @@ func collectModal(h, _ uintptr) uintptr {
 	return 1
 }
 
-// closeModals asks every window this thread shows that is owned (directly or through another
+// closeModals asks every dialog this thread has that is owned (directly or through another
 // dialog) by owner to close: the Settings, New chat and status dialogs, their PIN, file and message
 // boxes. They close once control returns to their message loops.
 func closeModals(owner win.HWND) {
