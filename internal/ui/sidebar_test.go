@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"bytes"
 	"slices"
 	"strings"
 	"testing"
@@ -87,13 +88,19 @@ func TestFromMeDoesNotBumpUnread(t *testing.T) {
 	}
 }
 
+func chatEqual(a, b store.Chat) bool {
+	return a.JID == b.JID && a.Name == b.Name && a.LastMessageTS == b.LastMessageTS &&
+		a.Snippet == b.Snippet && a.Unread == b.Unread && a.LastType == b.LastType &&
+		a.LastSender == b.LastSender && a.LastFromMe == b.LastFromMe && bytes.Equal(a.LastMeta, b.LastMeta)
+}
+
 func TestOtherAccountMessageLeavesListAlone(t *testing.T) {
 	m := NewSidebarModel()
 	m.SetChats(acctA, sampleChats())
 	if m.ApplyMessage(store.Message{AccountID: acctB, ChatJID: group, Timestamp: 400, Body: "x", Status: store.StatusReceived}) {
 		t.Fatal("message for another account applied")
 	}
-	if !slices.Equal(m.Rows(), sampleChats()) {
+	if !slices.EqualFunc(m.Rows(), sampleChats(), chatEqual) {
 		t.Fatalf("rows changed: %+v", m.Rows())
 	}
 }

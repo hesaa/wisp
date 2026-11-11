@@ -9,7 +9,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 // unread_count is deliberately not stored on chats: it is derived from messages,
 // so it cannot drift from the data.
@@ -47,6 +47,19 @@ CREATE TABLE settings (
 	value      TEXT NOT NULL,
 	PRIMARY KEY (account_id, key)
 );`
+
+const schemaV2 = `
+CREATE TABLE people (
+	account_id  TEXT NOT NULL,
+	jid         TEXT NOT NULL,
+	pn_jid      TEXT NOT NULL DEFAULT '',
+	full_name   TEXT NOT NULL DEFAULT '',
+	push_name   TEXT NOT NULL DEFAULT '',
+	avatar_id   TEXT NOT NULL DEFAULT '',
+	avatar_ts   INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (account_id, jid)
+);
+ALTER TABLE messages ADD COLUMN mentions TEXT NOT NULL DEFAULT '';`
 
 // DB wraps the SQLite handle.
 type DB struct{ sql *sql.DB }
@@ -89,9 +102,15 @@ func (d *DB) migrate() error {
 		return err
 	}
 	defer tx.Rollback()
-	// later versions: add `if v < 2 { ... }` steps here
-	if _, err := tx.Exec(schemaV1); err != nil {
-		return err
+	if v < 1 {
+		if _, err := tx.Exec(schemaV1); err != nil {
+			return err
+		}
+	}
+	if v < 2 {
+		if _, err := tx.Exec(schemaV2); err != nil {
+			return err
+		}
 	}
 	if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
 		return err

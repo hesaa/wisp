@@ -38,7 +38,8 @@ type Message struct {
 	// Chat and sender exactly as received (an LID or a phone number), for addressing read receipts
 	// back the way the server expects; empty when unknown (history, own messages).
 	WireChatJID, WireSenderJID string
-	ExpiresAt                  int64 // unix seconds a disappearing message goes (PurgeExpired); 0: never
+	ExpiresAt                  int64  // unix seconds a disappearing message goes (PurgeExpired); 0: never
+	Mentions                   string // space-separated JIDs
 }
 
 // Chat is a sidebar row.
@@ -48,6 +49,10 @@ type Chat struct {
 	LastMessageTS int64
 	Snippet       string
 	Unread        int
+	LastType      string
+	LastSender    string
+	LastFromMe    bool
+	LastMeta      []byte
 }
 
 // InsertMessagesBatch stores msgs in transactions of BatchSize rows. Messages already
@@ -79,8 +84,8 @@ func (d *DB) insertChunk(msgs []Message) (int64, error) {
 	defer tx.Rollback()
 	ins, err := tx.Prepare(`INSERT OR IGNORE INTO messages
 		(account_id, chat_jid, id, sender_jid, timestamp, message_type, body, media_path, status, from_me, media_meta,
-		 wire_chat_jid, wire_sender_jid, expires_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,COALESCE(?, x''),?,?,?)`) // COALESCE: a nil []byte binds as NULL
+		 wire_chat_jid, wire_sender_jid, expires_at, mentions)
+		VALUES (?,?,?,?,?,?,?,?,?,?,COALESCE(?, x''),?,?,?,?)`) // COALESCE: a nil []byte binds as NULL
 	if err != nil {
 		return 0, err
 	}
@@ -94,7 +99,7 @@ func (d *DB) insertChunk(msgs []Message) (int64, error) {
 	var inserted int64
 	for _, m := range msgs {
 		res, err := ins.Exec(m.AccountID, m.ChatJID, m.ID, m.SenderJID, m.Timestamp, m.Type, m.Body, m.MediaPath, m.Status, m.FromMe, m.MediaMeta,
-			m.WireChatJID, m.WireSenderJID, m.ExpiresAt)
+			m.WireChatJID, m.WireSenderJID, m.ExpiresAt, m.Mentions)
 		if err != nil {
 			return 0, err
 		}
@@ -144,14 +149,14 @@ func (d *DB) GetMessage(accountID, chatJID, id string) (m Message, ok bool, err 
 }
 
 const messageCols = `id, chat_jid, account_id, sender_jid, timestamp, message_type, body, media_path, status, from_me, media_meta,
-		wire_chat_jid, wire_sender_jid, expires_at`
+		wire_chat_jid, wire_sender_jid, expires_at, mentions`
 
 func scanMessages(rows *sql.Rows) ([]Message, error) {
 	out := []Message{}
 	for rows.Next() {
 		var m Message
 		if err := rows.Scan(&m.ID, &m.ChatJID, &m.AccountID, &m.SenderJID, &m.Timestamp, &m.Type, &m.Body, &m.MediaPath, &m.Status, &m.FromMe, &m.MediaMeta,
-			&m.WireChatJID, &m.WireSenderJID, &m.ExpiresAt); err != nil {
+			&m.WireChatJID, &m.WireSenderJID, &m.ExpiresAt, &m.Mentions); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
@@ -374,7 +379,15 @@ func (d *DB) ListChats(accountID string) ([]Chat, error) {
 		COALESCE((SELECT body FROM messages m WHERE m.account_id = c.account_id AND m.chat_jid = c.jid
 			ORDER BY timestamp DESC, id DESC LIMIT 1), ''),
 		(SELECT COUNT(*) FROM messages m WHERE m.account_id = c.account_id AND m.chat_jid = c.jid
-			AND m.from_me = 0 AND m.status <> 'read') -- a literal, so messages_unread applies
+			AND m.from_me = 0 AND m.status <> 'read'), -- a literal, so messages_unread applies
+		COALESCE((SELECT message_type FROM messages m WHERE m.account_id = c.account_id AND m.chat_jid = c.jid
+			ORDER BY timestamp DESC, id DESC LIMIT 1), ''),
+		COALESCE((SELECT sender_jid FROM messages m WHERE m.account_id = c.account_id AND m.chat_jid = c.jid
+			ORDER BY timestamp DESC, id DESC LIMIT 1), ''),
+		COALESCE((SELECT from_me FROM messages m WHERE m.account_id = c.account_id AND m.chat_jid = c.jid
+			ORDER BY timestamp DESC, id DESC LIMIT 1), 0),
+		COALESCE((SELECT media_meta FROM messages m WHERE m.account_id = c.account_id AND m.chat_jid = c.jid
+			ORDER BY timestamp DESC, id DESC LIMIT 1), x'')
 		FROM chats c WHERE c.account_id = ? ORDER BY c.last_message_ts DESC, c.jid`, accountID)
 	if err != nil {
 		return nil, err
@@ -383,7 +396,8 @@ func (d *DB) ListChats(accountID string) ([]Chat, error) {
 	out := []Chat{}
 	for rows.Next() {
 		var c Chat
-		if err := rows.Scan(&c.JID, &c.Name, &c.LastMessageTS, &c.Snippet, &c.Unread); err != nil {
+		if err := rows.Scan(&c.JID, &c.Name, &c.LastMessageTS, &c.Snippet, &c.Unread,
+			&c.LastType, &c.LastSender, &c.LastFromMe, &c.LastMeta); err != nil {
 			return nil, err
 		}
 		out = append(out, c)

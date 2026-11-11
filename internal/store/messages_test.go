@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -400,5 +401,123 @@ func TestUnreadCountUsesThePartialIndex(t *testing.T) {
 	}
 	if !strings.Contains(plan, "messages_unread") {
 		t.Fatalf("unread count does not use messages_unread:\n%s", plan)
+	}
+}
+
+func TestMentionsRoundTrip(t *testing.T) {
+	db := openTest(t)
+	const acct = "6281234567890"
+
+	m := Message{
+		ID:        "m1",
+		ChatJID:   "c1",
+		AccountID: acct,
+		SenderJID: "s@s.whatsapp.net",
+		Timestamp: 1000,
+		Type:      "text",
+		Body:      "hello @a @b",
+		Mentions:  "a@lid b@s.whatsapp.net",
+		Status:    StatusReceived,
+	}
+
+	newMsg, err := db.InsertMessage(m)
+	if err != nil || !newMsg {
+		t.Fatalf("InsertMessage: new=%v, err=%v", newMsg, err)
+	}
+
+	readM, ok, err := db.GetMessage(acct, "c1", "m1")
+	if err != nil || !ok {
+		t.Fatalf("GetMessage: ok=%v, err=%v", ok, err)
+	}
+	if readM.Mentions != "a@lid b@s.whatsapp.net" {
+		t.Fatalf("GetMessage Mentions = %q, want 'a@lid b@s.whatsapp.net'", readM.Mentions)
+	}
+
+	page, err := db.GetChatMessages(acct, "c1", 0)
+	if err != nil || len(page) != 1 {
+		t.Fatalf("GetChatMessages: len=%d, err=%v", len(page), err)
+	}
+	if page[0].Mentions != "a@lid b@s.whatsapp.net" {
+		t.Fatalf("GetChatMessages Mentions = %q, want 'a@lid b@s.whatsapp.net'", page[0].Mentions)
+	}
+}
+
+func TestListChatsLastMessageFields(t *testing.T) {
+	db := openTest(t)
+	const acct = "6281234567890"
+
+	meta := []byte{0x01, 0x02, 0x03, 0x04}
+	// Older message: text from other sender
+	m1 := Message{
+		ID:        "m1",
+		ChatJID:   "c1",
+		AccountID: acct,
+		SenderJID: "other@s.whatsapp.net",
+		Timestamp: 100,
+		Type:      "text",
+		Body:      "old text",
+		FromMe:    false,
+		Status:    StatusReceived,
+	}
+	// Newest message: own image without body
+	m2 := Message{
+		ID:        "m2",
+		ChatJID:   "c1",
+		AccountID: acct,
+		SenderJID: acct,
+		Timestamp: 200,
+		Type:      "image",
+		Body:      "",
+		FromMe:    true,
+		MediaMeta: meta,
+		Status:    StatusSent,
+	}
+
+	if err := db.InsertMessagesBatch([]Message{m1, m2}); err != nil {
+		t.Fatalf("InsertMessagesBatch: %v", err)
+	}
+
+	chats, err := db.ListChats(acct)
+	if err != nil {
+		t.Fatalf("ListChats: %v", err)
+	}
+	if len(chats) != 1 {
+		t.Fatalf("ListChats len = %d, want 1", len(chats))
+	}
+	c := chats[0]
+	if c.Snippet != "" {
+		t.Fatalf("Snippet = %q, want ''", c.Snippet)
+	}
+	if c.LastType != "image" {
+		t.Fatalf("LastType = %q, want 'image'", c.LastType)
+	}
+	if c.LastSender != acct {
+		t.Fatalf("LastSender = %q, want %q", c.LastSender, acct)
+	}
+	if !c.LastFromMe {
+		t.Fatalf("LastFromMe = false, want true")
+	}
+	if !bytes.Equal(c.LastMeta, meta) {
+		t.Fatalf("LastMeta = %v, want %v", c.LastMeta, meta)
+	}
+
+	// Chat with no messages
+	if err := db.UpsertChat(acct, "c2", "Empty Chat", 0); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	chats, err = db.ListChats(acct)
+	if err != nil {
+		t.Fatalf("ListChats: %v", err)
+	}
+	if len(chats) != 2 {
+		t.Fatalf("ListChats len = %d, want 2", len(chats))
+	}
+	// chats are ordered by last_message_ts DESC, so c1 (ts 200) is first, c2 (ts 0) is second
+	emptyChat := chats[1]
+	if emptyChat.JID != "c2" {
+		emptyChat = chats[0]
+	}
+	if emptyChat.Snippet != "" || emptyChat.LastType != "" || emptyChat.LastSender != "" || emptyChat.LastFromMe != false || len(emptyChat.LastMeta) != 0 {
+		t.Fatalf("emptyChat unexpected: %+v", emptyChat)
 	}
 }
