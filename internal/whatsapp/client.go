@@ -168,7 +168,7 @@ func (m *Manager) handleEvent(ctx context.Context, id string, cli waClient, evt 
 		}
 		if !info.IsFromMe && rawSender.User != "" {
 			pushName := info.PushName
-			if pushName == "-" {
+			if pushName == "-" || maskedName(pushName) {
 				pushName = ""
 			}
 			p := store.Person{

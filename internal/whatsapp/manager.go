@@ -475,12 +475,9 @@ func (m *Manager) upsertPeople(accountID string, people []store.Person) error {
 	if len(people) == 0 {
 		return nil
 	}
-	m.peopleMu.Lock()
-	defer m.peopleMu.Unlock()
-	if m.people == nil {
-		m.people = make(map[string]store.Person)
-	}
+	m.peopleMu.RLock()
 	var changed []store.Person
+	updated := make(map[string]store.Person)
 	for _, p := range people {
 		key := accountID + " " + p.JID
 		cur, exists := m.people[key]
@@ -502,16 +499,42 @@ func (m *Manager) upsertPeople(accountID string, people []store.Person) error {
 			isChanged = true
 		}
 		if isChanged {
-			m.people[key] = cur
+			updated[key] = cur
 			changed = append(changed, p)
 		}
 	}
+	m.peopleMu.RUnlock()
+
 	if len(changed) == 0 {
 		return nil
 	}
+
 	if err := m.store.UpsertPeople(accountID, changed); err != nil {
 		return err
 	}
+
+	m.peopleMu.Lock()
+	if m.people == nil {
+		m.people = make(map[string]store.Person)
+	}
+	for k, v := range updated {
+		cur := m.people[k]
+		if cur.JID == "" {
+			cur.JID = v.JID
+		}
+		if v.PNJID != "" {
+			cur.PNJID = v.PNJID
+		}
+		if v.FullName != "" {
+			cur.FullName = v.FullName
+		}
+		if v.PushName != "" {
+			cur.PushName = v.PushName
+		}
+		m.people[k] = cur
+	}
+	m.peopleMu.Unlock()
+
 	m.emit(PeopleEvent{AccountID: accountID})
 	return nil
 }

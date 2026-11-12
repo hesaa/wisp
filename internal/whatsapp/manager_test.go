@@ -1085,6 +1085,16 @@ func TestMaskedNameNotStored(t *testing.T) {
 	if name != "" {
 		t.Errorf("chats.name = %q, want empty string", name)
 	}
+
+	people, err := db.People(acctA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range people {
+		if p.JID == contact.String() && p.PushName != "" {
+			t.Errorf("people.push_name = %q, want empty string", p.PushName)
+		}
+	}
 }
 
 func TestProfilePictureUnchangedAndMissing(t *testing.T) {
