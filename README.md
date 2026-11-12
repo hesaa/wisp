@@ -52,6 +52,8 @@ The lock hides Wisp's window; it doesn't encrypt Wisp's files.
 ## Media and copying
 
 Photos, stickers, videos and GIFs open inside Wisp: a single click (or Enter) on one opens it.
+Videos and GIFs with embedded thumbnails show in-line preview bubbles with a play indicator or
+a "GIF" badge; clicking opens the media viewer.
 ← and → step through the chat's photos and videos; Esc goes back to the chat. Zoom a photo with the
 mouse wheel, Ctrl + and Ctrl −, or a double-click; 0 fits it again. On a video, Space plays and
 pauses, Shift+← and Shift+→ skip 5 seconds, and m mutes. **Save as…** keeps a copy, and **Open
@@ -62,16 +64,36 @@ Drag across message text to select it, then Ctrl+C to copy; Esc clears the selec
 Shift+click or Shift+↑↓ pick whole messages, and Ctrl+C copies them. Right-click, the Menu key or
 Shift+F10 opens a menu with **Copy** and **Select**. Copying is text only.
 
+## People, pictures and details
+
+Wisp unifies names across the app: your phonebook contact names take precedence, followed by
+push names (`~Name`) and formatted phone numbers (`+62...`). When WhatsApp's privacy hides a
+member's number (LID) and no name is known, they appear as `Unknown`.
+
+- **Mentions**: `@Name` mentions in chat bubbles resolve against known names and appear highlighted
+  in the accent colour.
+- **Pictures**: Profile photos and group avatars are fetched on demand in the background, cached
+  locally, refreshed weekly, and kept in a memory LRU. Group chats show 28 px sender avatars next
+  to incoming message runs.
+- **Details view**: Click a chat's header (or press Enter/Space when focused on it) to see full
+  contact or group info: large photo, about/description, and member lists with admin badges.
+  Click any group member to start a direct chat; Esc returns to messages.
+- **Notification sounds**: Settings › Notifications offers sound choices (**Default**, **Message**,
+  **Mail**, **Reminder**, **SMS**) using Windows notification WAVs, with a preview on selection.
+
 ## Your data
 
 Everything lives in `%LOCALAPPDATA%\Wisp\`:
 
-| Path         | What                                      |
-|--------------|-------------------------------------------|
-| `wisp.db`    | your chats, messages and settings         |
-| `session.db` | the linked-device sessions (keys)         |
-| `cache\`     | downloaded media (Settings can clear it)  |
-| `wisp.log`   | a small log, without message text or keys |
+| Path         | What                                                 |
+|--------------|------------------------------------------------------|
+| `wisp.db`    | your chats, messages, people directory and settings  |
+| `session.db` | the linked-device sessions (keys)                    |
+| `cache\`     | downloaded media and cached profile photos (avatars) |
+| `wisp.log`   | a small log, without message text or keys            |
+
+Settings › Media & Storage can clear the cache, which removes downloaded media and cached avatars
+without affecting your message history.
 
 To start over, quit Wisp from the tray (Exit), then delete that folder. Also remove the device
 under Linked devices on your phone (or use Log out in Settings first).
@@ -94,9 +116,11 @@ under Linked devices on your phone (or use Log out in Settings first).
 ## Known limitations
 
 - No voice or video calls, and you cannot post a status (you can view them).
-- Avatars are initials, not profile photos.
 - Reactions are not shown.
 - In right-to-left and shaped scripts (Arabic, Hebrew, Indic) the selection highlight may sit
   slightly off the text.
 - The GIPHY key built into `wisp.exe` can be extracted from the file: do not share builds made with
   your personal key.
+- Old mentions in imported message history resolve only for contacts known to the directory.
+- Group members with a hidden number (LID) and no known name show as `Unknown`.
+- GIFs do not animate in the chat message list (click to play in the media viewer).
