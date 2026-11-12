@@ -125,3 +125,38 @@ func TestSetAvatarAndReset(t *testing.T) {
 		t.Fatalf("ResetAvatars other-acct unexpected: %+v", otherPeople[0])
 	}
 }
+
+func TestResetEmptyAvatars(t *testing.T) {
+	db := openTest(t)
+	acct := "acct1"
+
+	// user1 has empty avatar_id and non-zero avatar_ts
+	if err := db.SetAvatar(acct, "user1", "", 12345); err != nil {
+		t.Fatal(err)
+	}
+	// user2 has valid avatar_id and non-zero avatar_ts
+	if err := db.SetAvatar(acct, "user2", "pic1", 67890); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.ResetEmptyAvatars(); err != nil {
+		t.Fatal(err)
+	}
+
+	people, err := db.People(acct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range people {
+		if p.JID == "user1" {
+			if p.AvatarTS != 0 {
+				t.Errorf("user1 AvatarTS = %d, want 0", p.AvatarTS)
+			}
+		}
+		if p.JID == "user2" {
+			if p.AvatarTS != 67890 {
+				t.Errorf("user2 AvatarTS = %d, want 67890", p.AvatarTS)
+			}
+		}
+	}
+}

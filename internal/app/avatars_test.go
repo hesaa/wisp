@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -131,6 +132,10 @@ func TestAvatarQueueOneAtATimeNoLoop(t *testing.T) {
 	}
 
 	// 3. A want for a jid no longer wanted is dropped
+	var droppedJID string
+	q.onDrop = func(account, jid string) {
+		droppedJID = jid
+	}
 	q.want("acc1", "cancelled_user")
 	time.Sleep(50 * time.Millisecond)
 	mu.Lock()
@@ -140,6 +145,9 @@ func TestAvatarQueueOneAtATimeNoLoop(t *testing.T) {
 		}
 	}
 	mu.Unlock()
+	if droppedJID != "cancelled_user" {
+		t.Errorf("droppedJID = %q, want 'cancelled_user'", droppedJID)
+	}
 
 	// 4. Failing fake is called once per want, not repeatedly in a loop
 	callsBefore := atomic.LoadInt32(&calls)
@@ -148,5 +156,55 @@ func TestAvatarQueueOneAtATimeNoLoop(t *testing.T) {
 	callsAfter := atomic.LoadInt32(&calls)
 	if diff := callsAfter - callsBefore; diff != 1 {
 		t.Errorf("failing fake called %d times, want exactly 1", diff)
+	}
+}
+
+type fakeFetcher struct {
+	pic      whatsapp.Picture
+	ok       bool
+	err      error
+	data     []byte
+	fetchErr error
+}
+
+func (f *fakeFetcher) ProfilePicture(_ context.Context, accountID, jid, knownID string, full bool) (whatsapp.Picture, bool, error) {
+	return f.pic, f.ok, f.err
+}
+
+func (f *fakeFetcher) FetchPicture(_ context.Context, rawURL string) ([]byte, error) {
+	return f.data, f.fetchErr
+}
+
+func TestFetchAvatarResult(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Picture found (ok = true) -> downloads data
+	f1 := &fakeFetcher{
+		pic:  whatsapp.Picture{ID: "pic999", URL: "http://example.com/pic.jpg"},
+		ok:   true,
+		data: []byte{0xff, 0xd8, 0xff},
+	}
+	res1 := fetchAvatarResult(ctx, f1, "acc", "user1", "")
+	if res1.err != nil || res1.unchanged || res1.id != "pic999" || len(res1.data) == 0 {
+		t.Errorf("expected picture downloaded, got %+v", res1)
+	}
+
+	// 2. Unchanged (ok = false, err = nil) -> unchanged = true, no fetch
+	f2 := &fakeFetcher{
+		ok:  false,
+		err: nil,
+	}
+	res2 := fetchAvatarResult(ctx, f2, "acc", "user2", "pic999")
+	if res2.err != nil || !res2.unchanged || res2.data != nil {
+		t.Errorf("expected unchanged = true, got %+v", res2)
+	}
+
+	// 3. Error from ProfilePicture -> reports error
+	f3 := &fakeFetcher{
+		err: whatsapp.ErrNoPicture,
+	}
+	res3 := fetchAvatarResult(ctx, f3, "acc", "user3", "")
+	if !errors.Is(res3.err, whatsapp.ErrNoPicture) {
+		t.Errorf("expected ErrNoPicture, got %+v", res3)
 	}
 }

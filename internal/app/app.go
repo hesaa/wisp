@@ -145,12 +145,11 @@ func New(db *store.DB, cache *media.Cache, builtinGIFKey string) (*App, error) {
 		return a.fetchAllowed()
 	}
 	a.avatarQ.fetch = func(account, jid string) pictureResult {
-		if a.mgr == nil {
-			return pictureResult{err: errors.New("no manager")}
-		}
 		var knownID string
-		if p, ok := a.dir(account).Person(jid); ok {
-			knownID = p.AvatarID
+		if d := a.dir(account); d != nil {
+			if p, ok := d.Person(jid); ok {
+				knownID = p.AvatarID
+			}
 		}
 		bg := a.bg
 		if bg == nil {
@@ -158,21 +157,18 @@ func New(db *store.DB, cache *media.Cache, builtinGIFKey string) (*App, error) {
 		}
 		ctx, cancel := context.WithTimeout(bg, 20*time.Second)
 		defer cancel()
-		pic, unchanged, err := a.mgr.ProfilePicture(ctx, account, jid, knownID, false)
-		if unchanged {
-			return pictureResult{unchanged: true}
+		return fetchAvatarResult(ctx, a.mgr, account, jid, knownID)
+	}
+	a.avatarQ.onDrop = func(account, jid string) {
+		if a.avatars != nil {
+			a.avatars.Invalidate(jid)
 		}
-		if err != nil {
-			return pictureResult{err: err}
-		}
-		data, err := a.mgr.FetchPicture(ctx, pic.URL)
-		if err != nil {
-			return pictureResult{err: err}
-		}
-		return pictureResult{id: pic.ID, data: data}
 	}
 	a.avatarQ.onDone = func(account, jid string, res pictureResult) {
-		p, _ := a.dir(account).Person(jid)
+		var p store.Person
+		if d := a.dir(account); d != nil {
+			p, _ = d.Person(jid)
+		}
 		id, ts, save := avatarStep(p, time.Now(), res)
 		if save && len(res.data) > 0 {
 			if _, err := a.cache.SaveAvatar(account, jid, res.data); err != nil {
@@ -201,15 +197,19 @@ func New(db *store.DB, cache *media.Cache, builtinGIFKey string) (*App, error) {
 	}
 	a.avatars.OnWant(func(jid string) {
 		if !a.fetchAllowed() {
+			a.avatars.Invalidate(jid)
 			return
 		}
 		acct := a.v.active
 		if acct == "" {
+			a.avatars.Invalidate(jid)
 			return
 		}
-		if p, ok := a.dir(acct).Person(jid); ok {
-			if !ui.AvatarDue(p, time.Now()) {
-				return
+		if d := a.dir(acct); d != nil {
+			if p, ok := d.Person(jid); ok {
+				if !ui.AvatarDue(p, time.Now()) {
+					return
+				}
 			}
 		}
 		a.avatarQ.want(acct, jid)
@@ -342,6 +342,7 @@ func (a *App) Attach(mgr Backend) {
 	go a.typingWorker()
 	a.lockNow() // before the window is first shown: the chats never appear
 	go func() {
+		_ = a.db.ResetEmptyAvatars()
 		a.purgeExpired()                       // before any chat list is read
 		err := mgr.Start(context.Background()) // returns before the accounts connect
 		a.mw.Synchronize(func() {

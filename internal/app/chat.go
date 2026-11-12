@@ -545,8 +545,8 @@ func (a *App) loadInfo(jid string) {
 		}
 
 		// Also query full profile picture
-		pic, unchanged, err := a.mgr.ProfilePicture(ctx, acct, jid, "", true)
-		if err == nil && !unchanged && pic.URL != "" {
+		pic, ok, err := a.mgr.ProfilePicture(ctx, acct, jid, "", true)
+		if err == nil && ok && pic.URL != "" {
 			data, err := a.mgr.FetchPicture(ctx, pic.URL)
 			if err == nil && len(data) > 0 {
 				img, _, err := image.Decode(bytes.NewReader(data))

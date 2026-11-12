@@ -74,3 +74,9 @@ func (d *DB) ResetAvatars() error {
 	_, err := d.sql.Exec(`UPDATE people SET avatar_ts = 0`)
 	return err
 }
+
+// ResetEmptyAvatars sets avatar_ts = 0 for rows where avatar_id is empty.
+func (d *DB) ResetEmptyAvatars() error {
+	_, err := d.sql.Exec(`UPDATE people SET avatar_ts = 0 WHERE avatar_id = ''`)
+	return err
+}

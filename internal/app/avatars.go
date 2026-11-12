@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"time"
@@ -15,6 +16,29 @@ type pictureResult struct {
 	data      []byte
 	unchanged bool
 	err       error
+}
+
+type avatarFetcher interface {
+	ProfilePicture(ctx context.Context, accountID, jid, knownID string, full bool) (whatsapp.Picture, bool, error)
+	FetchPicture(ctx context.Context, rawURL string) ([]byte, error)
+}
+
+func fetchAvatarResult(ctx context.Context, mgr avatarFetcher, account, jid, knownID string) pictureResult {
+	if mgr == nil {
+		return pictureResult{err: errors.New("no manager")}
+	}
+	pic, ok, err := mgr.ProfilePicture(ctx, account, jid, knownID, false)
+	if err != nil {
+		return pictureResult{err: err}
+	}
+	if !ok {
+		return pictureResult{unchanged: true}
+	}
+	data, err := mgr.FetchPicture(ctx, pic.URL)
+	if err != nil {
+		return pictureResult{err: err}
+	}
+	return pictureResult{id: pic.ID, data: data}
 }
 
 func fetchAllowed(visible, iconic, locked bool) bool {
@@ -43,6 +67,7 @@ type avatarQueue struct {
 	inFlight map[string]bool
 	fetch    func(account, jid string) pictureResult
 	wanted   func(account, jid string) bool
+	onDrop   func(account, jid string)
 	onDone   func(account, jid string, res pictureResult)
 }
 
@@ -81,6 +106,9 @@ func (q *avatarQueue) startNext(account string) {
 		q.pending[account] = q.pending[account][:n-1]
 
 		if q.wanted != nil && !q.wanted(account, jid) {
+			if q.onDrop != nil {
+				q.onDrop(account, jid)
+			}
 			continue
 		}
 
