@@ -40,6 +40,9 @@ func (a *App) handle(evt any) {
 		}
 		a.side.Invalidate()
 		a.chat.Invalidate()
+		if a.info != nil {
+			a.info.Invalidate()
+		}
 		a.rail.Invalidate()
 	case whatsapp.PushNameEvent:
 		a.sendPresence(true) // the first one after a pairing failed without the name

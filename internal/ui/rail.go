@@ -510,6 +510,9 @@ func initials(name, jid string) string {
 }
 
 func drawAvatar(c *walk.Canvas, dpi int, r walk.Rectangle, name, jid string, pt int) error {
+	if !strings.Contains(jid, "@") && jid != "" {
+		jid = jid + "@s.whatsapp.net"
+	}
 	if av := getAvatars(); av != nil && jid != "" {
 		if bmp := av.Get(jid, dpi); bmp != nil {
 			return c.DrawImageStretchedPixels(bmp, r)

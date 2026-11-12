@@ -407,6 +407,24 @@ func (v *ChatView) SetDirectory(d *Directory) {
 	logErr("chat header repaint", v.header.Invalidate())
 }
 
+// Invalidate repaints the chat view: header, message canvas, and composite.
+func (v *ChatView) Invalidate() error {
+	if v == nil {
+		return nil
+	}
+	var errs []error
+	if v.header != nil {
+		errs = append(errs, v.header.Invalidate())
+	}
+	if v.canvas != nil {
+		errs = append(errs, v.canvas.Invalidate())
+	}
+	if v.Composite != nil {
+		errs = append(errs, v.Composite.Invalidate())
+	}
+	return errors.Join(errs...)
+}
+
 func (v *ChatView) Directory() *Directory {
 	return v.dir
 }

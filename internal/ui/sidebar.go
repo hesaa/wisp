@@ -259,6 +259,27 @@ func (s *Sidebar) SetStories(st []store.Story) {
 	logErr("stories repaint", s.stories.Invalidate())
 }
 
+// Invalidate repaints the sidebar: its stories strip, header, and chat list.
+func (s *Sidebar) Invalidate() error {
+	if s == nil {
+		return nil
+	}
+	var errs []error
+	if s.stories != nil {
+		errs = append(errs, s.stories.Invalidate())
+	}
+	if s.header != nil {
+		errs = append(errs, s.header.Invalidate())
+	}
+	if s.list != nil {
+		errs = append(errs, s.list.Invalidate())
+	}
+	if s.Composite != nil {
+		errs = append(errs, s.Composite.Invalidate())
+	}
+	return errors.Join(errs...)
+}
+
 // FocusSearch puts the keyboard focus in the search box.
 func (s *Sidebar) FocusSearch() { focusOn(s.search.edit) }
 

@@ -189,6 +189,9 @@ func New(db *store.DB, cache *media.Cache, builtinGIFKey string) (*App, error) {
 				if a.chat != nil {
 					a.chat.Invalidate()
 				}
+				if a.info != nil {
+					a.info.Invalidate()
+				}
 				if a.rail != nil {
 					a.rail.Invalidate()
 				}

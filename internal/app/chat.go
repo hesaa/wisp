@@ -119,6 +119,9 @@ func (a *App) cacheCleared() {
 			if a.chat != nil {
 				a.chat.Invalidate()
 			}
+			if a.info != nil {
+				a.info.Invalidate()
+			}
 			if a.rail != nil {
 				a.rail.Invalidate()
 			}

@@ -305,6 +305,24 @@ func (v *InfoView) SetDirectory(d *Directory) {
 		logErr("info repaint", v.canvas.Invalidate())
 	}
 }
+// Invalidate repaints the info view: header, canvas, and composite.
+func (v *InfoView) Invalidate() error {
+	if v == nil {
+		return nil
+	}
+	var errs []error
+	if v.header != nil {
+		errs = append(errs, v.header.Invalidate())
+	}
+	if v.canvas != nil {
+		errs = append(errs, v.canvas.Invalidate())
+	}
+	if v.Composite != nil {
+		errs = append(errs, v.Composite.Invalidate())
+	}
+	return errors.Join(errs...)
+}
+
 func (v *InfoView) SetPalette(p theme.Palette) error {
 	v.pal = p
 	var errs []error
