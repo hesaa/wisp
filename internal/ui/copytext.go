@@ -34,9 +34,13 @@ func mediaLabel(m store.Message, info mediaInfo) string {
 
 // messageText is message m as copied: its text or caption, else the label of its media. Notices
 // ("This message was deleted") copy nothing, as they cannot be selected either.
-func messageText(m store.Message) string {
+func messageText(m store.Message, d ...*Directory) string {
+	var dir *Directory
+	if len(d) > 0 {
+		dir = d[0]
+	}
 	info, _ := parseMedia(&m) // a damaged MediaMeta only loses the file name and flags
-	text, muted := bubbleText(&m, info)
+	text, _, muted := bubbleText(&m, info, dir)
 	if muted {
 		return ""
 	}
@@ -46,13 +50,17 @@ func messageText(m store.Message) string {
 // copyMessages is msgs (in chat order) as Ctrl+C copies them: one message gives its text, several one
 // "[15:04, 02/01/2006] Sender: text" line each, joined with "\r\n". sender names the sender of a
 // message not from the user, who is "You". Messages with nothing to copy are left out.
-func copyMessages(msgs []store.Message, sender func(store.Message) string, loc *time.Location) string {
+func copyMessages(msgs []store.Message, sender func(store.Message) string, loc *time.Location, d ...*Directory) string {
+	var dir *Directory
+	if len(d) > 0 {
+		dir = d[0]
+	}
 	if len(msgs) == 1 {
-		return messageText(msgs[0])
+		return messageText(msgs[0], dir)
 	}
 	var lines []string
 	for _, m := range msgs {
-		text := messageText(m)
+		text := messageText(m, dir)
 		if text == "" {
 			continue
 		}

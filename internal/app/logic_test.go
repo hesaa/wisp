@@ -569,6 +569,14 @@ func TestToastLabelsComeFromEveryAccountsList(t *testing.T) {
 	}
 }
 
+func TestNoInternalIDShown(t *testing.T) {
+	names := map[string]string{}
+	lid := "35893729566783@lid"
+	if got := labelOf(names, lid); got != "Unknown" {
+		t.Errorf("labelOf(%q) = %q, want %q", lid, got, "Unknown")
+	}
+}
+
 func TestDropMissingMedia(t *testing.T) {
 	dir := t.TempDir()
 	kept := filepath.Join(dir, "kept.jpg")

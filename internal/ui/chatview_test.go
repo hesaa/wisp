@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -325,7 +326,7 @@ func TestDeletedAndUnsupportedText(t *testing.T) {
 		{store.Message{Type: "document", Body: "see this"}, mediaInfo{name: "a.pdf"}, "see this", false},
 		{store.Message{Type: "audio"}, mediaInfo{}, "", false},
 	} {
-		if text, muted := bubbleText(&c.m, c.info); text != c.text || muted != c.muted {
+		if text, _, muted := bubbleText(&c.m, c.info); text != c.text || muted != c.muted {
 			t.Errorf("%s %q: %q muted=%v, want %q %v", c.m.Type, c.m.Body, text, muted, c.text, c.muted)
 		}
 	}
@@ -635,5 +636,55 @@ func TestNoticesAreNotSelectable(t *testing.T) {
 	}
 	if got := selectedText(texts, textPos{0, 0}, textPos{3, 9}); got != "hello\r\na caption" {
 		t.Errorf("a selection across notices copies %q", got)
+	}
+}
+
+func TestBubbleTextRewritesMentions(t *testing.T) {
+	d := NewDirectory([]store.Person{
+		{JID: "35893729566783@lid", PushName: "Sinta"},
+	})
+	msg := store.Message{
+		ID:        "m1",
+		Type:      "text",
+		Body:      "@35893729566783 jumat",
+		Mentions:  "35893729566783@lid",
+		SenderJID: alice,
+	}
+	text, spans, muted := bubbleText(&msg, mediaInfo{}, d)
+	if muted {
+		t.Fatal("unexpected muted notice")
+	}
+	if text != "@Sinta jumat" {
+		t.Errorf("bubble text = %q, want %q", text, "@Sinta jumat")
+	}
+	wantSpans := [][2]int{{0, 6}}
+	if !slices.Equal(spans, wantSpans) {
+		t.Errorf("spans = %v, want %v", spans, wantSpans)
+	}
+
+	l := &chatLayout{dir: d}
+	l.update([]store.Message{msg}, viewW, 96, &monoMeasurer{})
+	b := l.cache[msg.ID]
+	if string(utf16.Decode(selectableUnits(&msg, b))) != "@Sinta jumat" {
+		t.Errorf("selectable text = %q, want %q", string(utf16.Decode(selectableUnits(&msg, b))), "@Sinta jumat")
+	}
+	texts := [][]uint16{selectableUnits(&msg, b)}
+	copied := selectedText(texts, textPos{0, 0}, textPos{0, len(texts[0])})
+	if copied != "@Sinta jumat" {
+		t.Errorf("copied text = %q, want %q", copied, "@Sinta jumat")
+	}
+}
+
+func TestNoInternalIDShown(t *testing.T) {
+	d := NewDirectory(nil) // knows nothing
+	lid := "35893729566783@lid"
+	// Title
+	if got := d.Name(lid, ""); got != "Unknown" {
+		t.Errorf("Name(%q) = %q, want %q", lid, got, "Unknown")
+	}
+	// Sender line
+	l := &chatLayout{group: true, dir: d}
+	if got := l.sender(lid); got != "Unknown" {
+		t.Errorf("sender(%q) = %q, want %q", lid, got, "Unknown")
 	}
 }

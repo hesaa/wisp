@@ -17,7 +17,11 @@ import (
 // number. Clicking a row, Enter on the focused row, or Enter in the search box (the first visible
 // row) calls onPick with its chat JID; Down moves from the search box into the list; Esc or closing
 // calls nothing. UI-thread only.
-func RunNewChat(owner walk.Form, p theme.Palette, chats []store.Chat, contacts []whatsapp.Contact, onPick func(jid string)) error {
+func RunNewChat(owner walk.Form, p theme.Palette, chats []store.Chat, contacts []whatsapp.Contact, onPick func(jid string), d ...*Directory) error {
+	var dir *Directory
+	if len(d) > 0 {
+		dir = d[0]
+	}
 	dlg, err := walk.NewDialog(owner)
 	if err != nil {
 		return err
@@ -36,6 +40,7 @@ func RunNewChat(owner walk.Form, p theme.Palette, chats []store.Chat, contacts [
 	if err != nil {
 		return err
 	}
+	list.dir = dir
 	if err := fillRest(dlg, list); err != nil {
 		return err
 	}
@@ -51,7 +56,7 @@ func RunNewChat(owner walk.Form, p theme.Palette, chats []store.Chat, contacts [
 	}
 
 	cands := newChatCandidates(chats, contacts)
-	show := func() { list.setRows(newChatRows(cands, search.edit.Text()), "", true) }
+	show := func() { list.setRows(newChatRows(cands, search.edit.Text(), dir), "", true) }
 	show()
 	search.edit.TextChanged().Attach(show)
 	picked := ""
@@ -112,7 +117,11 @@ func newChatCandidates(chats []store.Chat, contacts []whatsapp.Contact) []store.
 
 // newChatRows filters candidates by name or number (ignoring case). When the query is a phone number
 // that no candidate has, a row to start a chat with it comes first.
-func newChatRows(cands []store.Chat, query string) []store.Chat {
+func newChatRows(cands []store.Chat, query string, d ...*Directory) []store.Chat {
+	var dir *Directory
+	if len(d) > 0 {
+		dir = d[0]
+	}
 	q := strings.ToLower(strings.TrimSpace(query))
 	digits, numeric := phoneDigits(query)
 	jid, isPhone := phoneJID(query)
@@ -121,7 +130,7 @@ func newChatRows(cands []store.Chat, query string) []store.Chat {
 	for _, c := range cands {
 		user, _, _ := strings.Cut(c.JID, "@")
 		known = known || c.JID == jid
-		if strings.Contains(strings.ToLower(displayName(c)), q) || strings.Contains(c.Snippet, q) ||
+		if strings.Contains(strings.ToLower(dir.Name(c.JID, c.Name)), q) || strings.Contains(c.Snippet, q) ||
 			numeric && digits != "" && strings.Contains(user, digits) {
 			out = append(out, c)
 		}

@@ -396,7 +396,7 @@ func snippetLine(c store.Chat, d *Directory) string {
 	default:
 		msg := store.Message{Type: c.LastType, Body: c.Snippet, MediaMeta: c.LastMeta}
 		info, _ := parseMedia(&msg)
-		text, muted := bubbleText(&msg, info)
+		text, _, muted := bubbleText(&msg, info, d)
 		if muted {
 			content = text
 		} else if text != "" {

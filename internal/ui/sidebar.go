@@ -30,9 +30,28 @@ type SidebarModel struct {
 	rows     []store.Chat // chats matching query; the chats slice itself when there is no filter
 	selected string
 	redraw   func(top bool) // set by the Sidebar; top: scroll back to the first row
+	dir      *Directory
 }
 
 func NewSidebarModel() *SidebarModel { return &SidebarModel{} }
+
+// SetDirectory updates the directory index and repaints the sidebar.
+func (m *SidebarModel) SetDirectory(d *Directory) {
+	m.dir = d
+	m.changed(false)
+}
+
+func (m *SidebarModel) Directory() *Directory {
+	return m.dir
+}
+
+func (m *SidebarModel) displayName(c store.Chat) string {
+	return m.dir.Name(c.JID, c.Name)
+}
+
+func (m *SidebarModel) DisplayName(c store.Chat) string {
+	return m.displayName(c)
+}
 
 // SetChats shows accountID's chats (newest first, as store.ListChats returns them) and takes
 // ownership of the slice. Switching account clears the selection and scrolls to the top; reloading
@@ -122,7 +141,7 @@ func (m *SidebarModel) changed(top bool) {
 	if m.query != "" {
 		m.rows = nil
 		for _, c := range m.chats {
-			if strings.Contains(strings.ToLower(displayName(c)), m.query) || strings.Contains(strings.ToLower(c.Snippet), m.query) {
+			if strings.Contains(strings.ToLower(m.displayName(c)), m.query) || strings.Contains(strings.ToLower(snippetLine(c, m.dir)), m.query) {
 				m.rows = append(m.rows, c)
 			}
 		}
@@ -132,16 +151,9 @@ func (m *SidebarModel) changed(top bool) {
 	}
 }
 
-// displayName is the chat's name, else its phone number.
+// displayName is the chat's name by the name rule.
 func displayName(c store.Chat) string {
-	if c.Name != "" {
-		return c.Name
-	}
-	user, server, _ := strings.Cut(c.JID, "@")
-	if server == "s.whatsapp.net" {
-		return "+" + user
-	}
-	return user
+	return (*Directory)(nil).Name(c.JID, c.Name)
 }
 
 // relTime formats a chat time like WhatsApp: clock time today, then Yesterday, the weekday within a
@@ -223,11 +235,20 @@ func (s *Sidebar) build() error {
 			s.onChat(jid)
 		}
 	}
-	s.model.redraw = func(top bool) { s.list.setRows(s.model.Rows(), s.model.Selected(), top) }
+	s.model.redraw = func(top bool) {
+		s.list.dir = s.model.dir
+		s.list.setRows(s.model.Rows(), s.model.Selected(), top)
+	}
 	return s.SetPalette(s.pal)
 }
 
 func (s *Sidebar) Model() *SidebarModel { return s.model }
+
+// SetDirectory updates the directory index and repaints the sidebar.
+func (s *Sidebar) SetDirectory(d *Directory) {
+	s.model.SetDirectory(d)
+	s.list.dir = d
+}
 
 // SetStories shows the stories strip (contacts with status updates, newest first); it is hidden
 // when there are none.
@@ -549,6 +570,7 @@ type chatList struct {
 	*walk.CustomWidget
 	vscroll
 	pal      *theme.Palette
+	dir      *Directory
 	name     string // accessible name
 	rows     []store.Chat
 	selected string
@@ -592,7 +614,7 @@ func (l *chatList) setFocus(i int) {
 	row := l.rows[i]
 	l.focus = row.JID
 	logErr("chat list repaint", l.Invalidate())
-	item := displayName(row)
+	item := l.dir.Name(row.JID, row.Name)
 	if row.Unread > 0 {
 		item += ", " + strconv.Itoa(row.Unread) + " unread"
 	}
@@ -740,8 +762,8 @@ func (l *chatList) paintRow(c *walk.Canvas, row store.Chat, r walk.Rectangle, no
 	return errors.Join(
 		drawAvatar(c, dpi, av, row.Name, row.JID, 13),
 		drawText(c, dpi, ts, 9, 0, timeColor, walk.Rectangle{X: right - tw, Y: r.Y + s(13), Width: tw, Height: s(24)}, rightText),
-		drawText(c, dpi, displayName(row), 12, 0, theme.Color(p.Text), walk.Rectangle{X: x, Y: r.Y + s(13), Width: right - tw - s(6) - x, Height: s(24)}, leftText),
-		drawText(c, dpi, oneLine(row.Snippet), 10, 0, theme.Color(p.TextSecondary), walk.Rectangle{X: x, Y: r.Y + s(38), Width: snipRight - x, Height: s(22)}, leftText),
+		drawText(c, dpi, l.dir.Name(row.JID, row.Name), 12, 0, theme.Color(p.Text), walk.Rectangle{X: x, Y: r.Y + s(13), Width: right - tw - s(6) - x, Height: s(24)}, leftText),
+		drawText(c, dpi, oneLine(snippetLine(row, l.dir)), 10, 0, theme.Color(p.TextSecondary), walk.Rectangle{X: x, Y: r.Y + s(38), Width: snipRight - x, Height: s(22)}, leftText),
 		c.FillRectanglePixels(line, walk.Rectangle{X: x, Y: r.Y + r.Height - max(1, s(1)), Width: r.Width - x, Height: max(1, s(1))}),
 	)
 }

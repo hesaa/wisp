@@ -32,6 +32,8 @@ func (a *App) handle(evt any) {
 		a.reload(chatRef{e.AccountID, e.ChatJID}, []string{e.ID})
 	case whatsapp.ChatNamedEvent:
 		a.chat.Rename(e.AccountID, e.ChatJID, e.Name)
+	case whatsapp.PeopleEvent:
+		a.loadPeople(e.AccountID)
 	case whatsapp.PushNameEvent:
 		a.sendPresence(true) // the first one after a pairing failed without the name
 	case whatsapp.HistorySyncEvent:
@@ -179,6 +181,7 @@ func (a *App) reloadList(acct string) {
 	seq := a.v.reloadStarted(acct)
 	go func() {
 		chats, err := a.db.ListChats(acct)
+		people, _ := a.db.People(acct)
 		a.mw.Synchronize(func() {
 			if err != nil {
 				logErr("chats of +"+acct, err)
@@ -200,13 +203,42 @@ func (a *App) reloadList(acct string) {
 			}
 			a.v.unread[acct] = n
 			a.v.names[acct] = chatNames(chats)
+			d := ui.NewDirectory(people)
+			if a.v.dirs == nil {
+				a.v.dirs = make(map[string]*ui.Directory)
+			}
+			a.v.dirs[acct] = d
 			if acct == a.v.active {
+				a.side.SetDirectory(d)
+				a.chat.SetDirectory(d)
 				a.side.Model().SetChats(acct, chats)
 				if jid, ok := a.v.takeOpenNext(acct); ok {
 					a.openChat(acct, jid, "")
 				}
 			}
 			a.showUnread()
+		})
+	}()
+}
+
+// loadPeople refreshes acct's directory index when a PeopleEvent arrives.
+func (a *App) loadPeople(acct string) {
+	go func() {
+		people, err := a.db.People(acct)
+		a.mw.Synchronize(func() {
+			if err != nil {
+				logErr("people of +"+acct, err)
+				return
+			}
+			d := ui.NewDirectory(people)
+			if a.v.dirs == nil {
+				a.v.dirs = make(map[string]*ui.Directory)
+			}
+			a.v.dirs[acct] = d
+			if acct == a.v.active {
+				a.side.SetDirectory(d)
+				a.chat.SetDirectory(d)
+			}
 		})
 	}()
 }
@@ -264,11 +296,17 @@ func (a *App) toastClicked(acct, jid string) {
 	a.rail.Model().SetActive(acct) // its chats load, then the chat opens
 }
 
-// chatName is jid's name in acct's chat list (any account), "" when it has none.
-func (a *App) chatName(acct, jid string) string { return a.v.names[acct][jid] }
+// chatName is jid's name in acct's chat list (any account) by the name rule.
+func (a *App) chatName(acct, jid string) string {
+	var stored string
+	if a.v.names != nil && a.v.names[acct] != nil {
+		stored = a.v.names[acct][jid]
+	}
+	return a.v.dirs[acct].Name(jid, stored)
+}
 
-// label is jid's name in acct's chat list, else its phone number.
-func (a *App) label(acct, jid string) string { return labelOf(a.v.names[acct], jid) }
+// label is jid's name in acct's chat list, else its phone number or "Unknown".
+func (a *App) label(acct, jid string) string { return labelOf(a.v.names[acct], jid, a.v.dirs[acct]) }
 
 // chatUnread is the open account's unread count of jid.
 func (a *App) chatUnread(jid string) int {

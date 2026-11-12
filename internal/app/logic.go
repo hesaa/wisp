@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"log"
-	"strings"
 	"sync"
 	"time"
 
@@ -88,16 +87,17 @@ func chatNames(chats []store.Chat) map[string]string {
 	return names
 }
 
-// labelOf is jid's name in names, else its phone number.
-func labelOf(names map[string]string, jid string) string {
-	if n := names[jid]; n != "" {
-		return n
+// labelOf is jid's name in d and names, else its phone number or "Unknown".
+func labelOf(names map[string]string, jid string, d ...*ui.Directory) string {
+	var dir *ui.Directory
+	if len(d) > 0 {
+		dir = d[0]
 	}
-	user, server, _ := strings.Cut(jid, "@")
-	if server == "s.whatsapp.net" {
-		return "+" + user
+	var stored string
+	if names != nil {
+		stored = names[jid]
 	}
-	return user
+	return dir.Name(jid, stored)
 }
 
 // dropMissingMedia forgets the download of each message whose cached file is gone (Clear Cache, or
@@ -347,6 +347,7 @@ type view struct {
 	openNext chatRef         // open this chat once its account's chats load (a toast of another account)
 	unread   map[string]int
 	names    map[string]map[string]string // per account: chat JID to name, from its last applied list
+	dirs     map[string]*ui.Directory     // per account: people directory
 	lists    map[string]*listState        // per account; see reloadArrived
 }
 

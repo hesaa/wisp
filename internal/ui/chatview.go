@@ -61,6 +61,7 @@ type ChatView struct {
 	cache  *media.Cache
 
 	chatModel
+	dir         *Directory
 	name        string // the chat's own name, "" when it has none
 	lay         chatLayout
 	stale       bool              // msgs changed since the last layout
@@ -387,8 +388,21 @@ func (v *ChatView) focusIndex() int {
 	return v.index(v.focus)
 }
 
-// title is the chat's name, else its number.
-func (v *ChatView) title() string { return displayName(store.Chat{JID: v.chat, Name: v.name}) }
+// SetDirectory sets the directory index for name resolution and repaints the view.
+func (v *ChatView) SetDirectory(d *Directory) {
+	v.dir = d
+	v.lay.dir = d
+	v.lay.cache = nil
+	logErr("chat repaint", v.canvas.Invalidate())
+	logErr("chat header repaint", v.header.Invalidate())
+}
+
+func (v *ChatView) Directory() *Directory {
+	return v.dir
+}
+
+// title is the chat's name by the name rule.
+func (v *ChatView) title() string { return v.dir.Name(v.chat, v.name) }
 
 // relayout brings the layout up to date with the messages and the canvas size. The view stays on
 // the end when it showed the end; prepended (older messages added) keeps the messages on screen.
@@ -622,7 +636,7 @@ func (v *ChatView) focusOn(i int) {
 func (v *ChatView) describe(i int) string {
 	m, b := &v.msgs[i], v.lay.cache[v.msgs[i].ID]
 	who := v.senderOf(*m)
-	text, _ := bubbleText(m, b.info)
+	text, _, _ := bubbleText(m, b.info, v.dir)
 	switch b.kind {
 	case kindImage:
 		what := "Photo"
@@ -921,7 +935,7 @@ func (v *ChatView) copyPicked() bool {
 	if i := v.focusIndex(); len(msgs) == 0 && i >= 0 {
 		msgs = v.msgs[i : i+1]
 	}
-	text := copyMessages(msgs, v.senderOf, time.Local)
+	text := copyMessages(msgs, v.senderOf, time.Local, v.dir)
 	return text != "" && v.toClipboard(text)
 }
 
@@ -1058,7 +1072,9 @@ func (v *ChatView) paintHeader(c *walk.Canvas, _ walk.Rectangle) error {
 	x := av.X + av.Width + s(14)
 	name := walk.Rectangle{X: x, Width: b.Width - x - s(16), Height: b.Height}
 	var sub string
-	if user, server, _ := strings.Cut(v.chat, "@"); v.name != "" && server == "s.whatsapp.net" {
+	user, server, _ := strings.Cut(v.chat, "@")
+	title := v.title()
+	if server == "s.whatsapp.net" && title != "+"+user {
 		sub = "+" + user
 	}
 	if v.notice != "" {
@@ -1183,24 +1199,62 @@ func (v *ChatView) paintBubble(c *walk.Canvas, m *store.Message, b bubble, dy in
 		}
 	}
 	if b.text.Width > 0 {
-		_, muted := bubbleText(m, b.info)
+		_, _, muted := bubbleText(m, b.info, v.dir)
 		color, style := theme.Color(p.Text), walk.FontStyle(0)
 		if muted {
 			color, style = secondary, walk.FontItalic
 		}
 		r := at(b.text)
 		r.Height = v.lay.lineH
-		ms := &gdiMeasurer{dpi: dpi, cdpi: v.cdpi} // measures only lines with a selection
+		ms := &gdiMeasurer{dpi: dpi, cdpi: v.cdpi} // measures only lines with a selection or mentions
 		for _, ln := range b.lines {
+			lineUnits := b.units[ln.start:ln.end]
+			var adv []int
+			getAdv := func() []int {
+				if adv == nil {
+					adv = lineAdv(ms, lineUnits, style)
+				}
+				return adv
+			}
 			if lo, hi := max(sel.start, ln.start)-ln.start, min(sel.end, ln.end)-ln.start; lo < hi {
-				x := lineAdv(ms, b.units[ln.start:ln.end], style)
+				x := getAdv()
 				hl, err := brushFor(p.Selection)
 				if err == nil {
 					err = c.FillRectanglePixels(hl, walk.Rectangle{X: r.X + widthOf(x, 0, lo), Y: r.Y, Width: widthOf(x, lo, hi), Height: r.Height})
 				}
 				errs = append(errs, err)
 			}
-			errs = append(errs, drawText(c, dpi, string(utf16.Decode(b.units[ln.start:ln.end])), bodyPt, style, color, r, walk.TextSingleLine|walk.TextNoPrefix))
+			var lineMentions [][2]int
+			if len(b.mentions) > 0 && !muted {
+				for _, sp := range b.mentions {
+					mLo := max(sp[0], ln.start) - ln.start
+					mHi := min(sp[1], ln.end) - ln.start
+					if mLo < mHi {
+						lineMentions = append(lineMentions, [2]int{mLo, mHi})
+					}
+				}
+			}
+			if len(lineMentions) > 0 {
+				x := getAdv()
+				accentColor := theme.Color(p.Accent)
+				lastU := 0
+				for _, mSpan := range lineMentions {
+					mLo, mHi := mSpan[0], mSpan[1]
+					if mLo > lastU {
+						segRect := walk.Rectangle{X: r.X + widthOf(x, 0, lastU), Y: r.Y, Width: widthOf(x, lastU, mLo), Height: r.Height}
+						errs = append(errs, drawText(c, dpi, string(utf16.Decode(lineUnits[lastU:mLo])), bodyPt, style, color, segRect, walk.TextSingleLine|walk.TextNoPrefix))
+					}
+					segRect := walk.Rectangle{X: r.X + widthOf(x, 0, mLo), Y: r.Y, Width: widthOf(x, mLo, mHi), Height: r.Height}
+					errs = append(errs, drawText(c, dpi, string(utf16.Decode(lineUnits[mLo:mHi])), bodyPt, style, accentColor, segRect, walk.TextSingleLine|walk.TextNoPrefix))
+					lastU = mHi
+				}
+				if lastU < len(lineUnits) {
+					segRect := walk.Rectangle{X: r.X + widthOf(x, 0, lastU), Y: r.Y, Width: widthOf(x, lastU, len(lineUnits)), Height: r.Height}
+					errs = append(errs, drawText(c, dpi, string(utf16.Decode(lineUnits[lastU:])), bodyPt, style, color, segRect, walk.TextSingleLine|walk.TextNoPrefix))
+				}
+			} else {
+				errs = append(errs, drawText(c, dpi, string(utf16.Decode(lineUnits)), bodyPt, style, color, r, walk.TextSingleLine|walk.TextNoPrefix))
+			}
 			r.Y += r.Height
 		}
 		errs = append(errs, ms.close())

@@ -107,7 +107,7 @@ type App struct {
 // builtinGIFKey is the GIPHY key used when Settings has none.
 func New(db *store.DB, cache *media.Cache, builtinGIFKey string) (*App, error) {
 	a := &App{db: db, cache: cache, builtin: builtinGIFKey, cfg: map[string]string{},
-		v: view{unread: map[string]int{}, names: map[string]map[string]string{}}, inflight: inflight{}}
+		v: view{unread: map[string]int{}, names: map[string]map[string]string{}, dirs: map[string]*ui.Directory{}}, inflight: inflight{}}
 	a.presence = presenceCtl{
 		window:        func() (bool, bool) { return a.mw.Visible(), win.IsIconic(a.mw.Handle()) },
 		appearOffline: func() bool { return a.cfg[ui.KeyAppearOffline] == "true" },

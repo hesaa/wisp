@@ -111,27 +111,33 @@ func kindOf(m *store.Message, info mediaInfo) bubbleKind {
 	return kindText
 }
 
-// bubbleText is a bubble's text (body, caption or notice) and whether it is a muted notice.
-func bubbleText(m *store.Message, info mediaInfo) (string, bool) {
+// bubbleText is a bubble's text (body, caption or notice), its mention spans, and whether it is a muted notice.
+func bubbleText(m *store.Message, info mediaInfo, d ...*Directory) (string, [][2]int, bool) {
+	var dir *Directory
+	if len(d) > 0 {
+		dir = d[0]
+	}
 	switch m.Type {
 	case "revoked":
-		return "This message was deleted", true
+		return "This message was deleted", nil, true
 	case "unsupported":
-		return "Unsupported message", true
+		return "Unsupported message", nil, true
 	case "audio", "sticker":
-		return "", false
+		return "", nil, false
 	case "document":
 		if info.name == "" || m.Body == info.name { // the body is the file name, shown on the card
-			return "", false
+			return "", nil, false
 		}
 	}
-	return strings.TrimRight(m.Body, " \t\r\n"), false
+	trimmed := strings.TrimRight(m.Body, " \t\r\n")
+	rewritten, spans := rewriteMentions(trimmed, m.Mentions, dir)
+	return rewritten, spans, false
 }
 
 // selectableUnits is the text of message m's bubble b a selection may take: its text or caption,
 // none for a notice ("This message was deleted").
 func selectableUnits(m *store.Message, b bubble) []uint16 {
-	if _, muted := bubbleText(m, b.info); muted {
+	if _, _, muted := bubbleText(m, b.info); muted {
 		return nil
 	}
 	return b.units
@@ -212,20 +218,21 @@ func fitBox(w, h, side, maxW int) (int, int) {
 // bubble is one message's laid-out geometry in pixels: x from the view's left, y from the bubble's
 // top (box.Y is 0). Zero rectangles are parts it does not have.
 type bubble struct {
-	kind    bubbleKind
-	out     bool
-	named   bool      // shows the sender's name
-	preview bool      // MediaMeta has an embedded thumbnail
-	info    mediaInfo // without preview bytes
-	box     walk.Rectangle
-	name    walk.Rectangle // sender name, incoming group messages starting a run
-	text    walk.Rectangle // body, caption or notice: widest line by lines × line height
-	units   []uint16       // the text, UTF-16
-	lines   []textLine     // the text's lines, top to bottom
-	thumb   walk.Rectangle // image box
-	card    walk.Rectangle // media card
-	time    walk.Rectangle
-	ticks   walk.Rectangle // outgoing only
+	kind     bubbleKind
+	out      bool
+	named    bool      // shows the sender's name
+	preview  bool      // MediaMeta has an embedded thumbnail
+	info     mediaInfo // without preview bytes
+	box      walk.Rectangle
+	name     walk.Rectangle // sender name, incoming group messages starting a run
+	text     walk.Rectangle // body, caption or notice: widest line by lines × line height
+	units    []uint16       // the text, UTF-16
+	mentions [][2]int       // UTF-16 spans of rewritten mentions
+	lines    []textLine     // the text's lines, top to bottom
+	thumb    walk.Rectangle // image box
+	card     walk.Rectangle // media card
+	time     walk.Rectangle
+	ticks    walk.Rectangle // outgoing only
 }
 
 // cardParts splits a media card into its type icon, title, size line and download button.
@@ -242,6 +249,7 @@ func cardParts(card walk.Rectangle, dpi int) (icon, title, sub, download walk.Re
 // chatLayout lays out a chat's messages and keeps each bubble, by message ID, until the width or
 // DPI changes or the message is forgotten, so text is measured once, not on every paint.
 type chatLayout struct {
+	dir        *Directory
 	group      bool                    // names the senders of incoming messages
 	senderName func(jid string) string // a sender's display name, "" when unknown; may be nil
 	width, dpi int                     // what the cache was laid out for
@@ -252,7 +260,7 @@ type chatLayout struct {
 }
 
 // reset drops everything, for another chat.
-func (l *chatLayout) reset() { *l = chatLayout{senderName: l.senderName} }
+func (l *chatLayout) reset() { *l = chatLayout{dir: l.dir, senderName: l.senderName} }
 
 // forget drops a changed message's bubble, to be laid out again.
 func (l *chatLayout) forget(id string) { delete(l.cache, id) }
@@ -262,7 +270,7 @@ func (l *chatLayout) sender(jid string) string {
 	if l.senderName != nil {
 		name = l.senderName(jid)
 	}
-	return displayName(store.Chat{JID: jid, Name: name})
+	return l.dir.Name(jid, name)
 }
 
 // update lays msgs (oldest first) out top to bottom for a view width pixels wide at dpi,
@@ -309,7 +317,8 @@ func (l *chatLayout) layout(m *store.Message, named bool, ms measurer) bubble {
 	}
 	maxW := l.width * bubbleMaxPct / 100
 	padX := s(bubblePadX)
-	text, muted := bubbleText(m, info)
+	text, spans, muted := bubbleText(m, info, l.dir)
+	b.mentions = spans
 	style := walk.FontStyle(0)
 	if muted {
 		style = walk.FontItalic

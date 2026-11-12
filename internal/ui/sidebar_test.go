@@ -348,3 +348,34 @@ func TestInitialsAndDisplayName(t *testing.T) {
 		t.Errorf("displayName fallback %q", got)
 	}
 }
+
+func TestSidebarUsesNameRuleAndPreviewLine(t *testing.T) {
+	m := NewSidebarModel()
+	lidChat := store.Chat{
+		JID:      "35893729566783@lid",
+		Name:     "",
+		LastType: "image",
+	}
+	d := NewDirectory([]store.Person{
+		{JID: "35893729566783@lid", PushName: "Sinta"},
+	})
+	m.SetDirectory(d)
+	m.SetChats(acctA, []store.Chat{lidChat})
+
+	if got := m.displayName(lidChat); got != "~Sinta" {
+		t.Errorf("displayName = %q, want %q", got, "~Sinta")
+	}
+	if got := snippetLine(lidChat, m.Directory()); got != "Photo" {
+		t.Errorf("snippetLine = %q, want %q", got, "Photo")
+	}
+
+	m.SetFilter("sinta")
+	if len(m.Rows()) != 1 || m.Rows()[0].JID != lidChat.JID {
+		t.Errorf("filter 'sinta' didn't match: %v", m.Rows())
+	}
+
+	m.SetFilter("photo")
+	if len(m.Rows()) != 1 || m.Rows()[0].JID != lidChat.JID {
+		t.Errorf("filter 'photo' didn't match: %v", m.Rows())
+	}
+}
