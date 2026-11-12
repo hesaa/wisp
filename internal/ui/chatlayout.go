@@ -229,6 +229,7 @@ type bubble struct {
 	kind     bubbleKind
 	out      bool
 	named    bool      // shows the sender's name
+	avatar   bool      // group incoming message starting a run shows sender avatar
 	preview  bool      // MediaMeta has an embedded thumbnail
 	play     bool      // video or GIF preview
 	gifBadge bool      // GIF preview
@@ -319,7 +320,7 @@ func (l *chatLayout) layout(m *store.Message, named bool, ms measurer) bubble {
 	s := scaler(l.dpi)
 	info, err := parseMedia(m)
 	logErr("media details of message "+m.ID, err)
-	b := bubble{kind: kindOf(m, info), out: m.FromMe, named: named, preview: len(info.preview) > 0}
+	b := bubble{kind: kindOf(m, info), out: m.FromMe, named: named, avatar: l.group && !m.FromMe && named, preview: len(info.preview) > 0}
 	if b.kind == kindImage && m.Type == "video" {
 		b.play = true
 		b.gifBadge = info.gif
@@ -400,7 +401,11 @@ func (l *chatLayout) layout(m *store.Message, named bool, ms measurer) bubble {
 	}
 	b.time = walk.Rectangle{X: right - timeW, Y: metaY, Width: timeW, Height: s(metaH)}
 
-	b.box = walk.Rectangle{X: s(bubbleEdge), Width: boxW, Height: y}
+	boxX := s(bubbleEdge)
+	if l.group && !m.FromMe {
+		boxX = s(bubbleEdge + 36)
+	}
+	b.box = walk.Rectangle{X: boxX, Width: boxW, Height: y}
 	if m.FromMe {
 		b.box.X = l.width - s(bubbleEdge) - boxW
 	}

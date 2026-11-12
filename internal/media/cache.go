@@ -3,6 +3,7 @@
 package media
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"strings"
 
 	"golang.org/x/image/draw"
+	_ "golang.org/x/image/webp" // register WebP decoder
 	"golang.org/x/sys/windows"
 )
 
@@ -178,7 +180,62 @@ func (c *Cache) GetCacheSizeBytes() (int64, error) {
 	return total, err
 }
 
-// ClearMediaCache deletes <root>\*\media\ directories only.
+// AvatarPath returns the path where jid's avatar is stored: <root>\<accountID>\avatars\<sha256 hex of jid>.jpg.
+func (c *Cache) AvatarPath(accountID, jid string) string {
+	h := sha256.Sum256([]byte(jid))
+	return filepath.Join(c.root, accountID, "avatars", hex.EncodeToString(h[:])+".jpg")
+}
+
+// SaveAvatar decodes (JPEG/PNG/WebP, refuses > 4 MP), scales to 96 px, and writes JPEG atomically.
+func (c *Cache) SaveAvatar(accountID, jid string, data []byte) (string, error) {
+	if !accountRe.MatchString(accountID) {
+		return "", fmt.Errorf("media: invalid account id %q", accountID)
+	}
+	if jid == "" {
+		return "", errors.New("media: empty jid")
+	}
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 || int64(cfg.Width)*int64(cfg.Height) > 4_000_000 {
+		return "", ErrImageTooLarge
+	}
+	src, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, 96, 96))
+	b := src.Bounds()
+	w, h := b.Dx(), b.Dy()
+	side := min(w, h)
+	crop := image.Rect(b.Min.X+(w-side)/2, b.Min.Y+(h-side)/2, b.Min.X+(w+side)/2, b.Min.Y+(h+side)/2)
+	draw.ApproxBiLinear.Scale(dst, dst.Bounds(), src, crop, draw.Src, nil)
+
+	out := c.AvatarPath(accountID, jid)
+	dir := filepath.Dir(out)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return "", err
+	}
+	err = jpeg.Encode(tmp, dst, &jpeg.Options{Quality: 85})
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp.Name(), out)
+	}
+	if err != nil {
+		os.Remove(tmp.Name())
+		return "", err
+	}
+	return out, nil
+}
+
+// ClearMediaCache deletes <root>\*\media\ and <root>\*\avatars\ directories.
 func (c *Cache) ClearMediaCache() error {
 	accounts, err := os.ReadDir(c.root)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -193,11 +250,16 @@ func (c *Cache) ClearMediaCache() error {
 			continue
 		}
 		m := filepath.Join(c.root, a.Name(), "media")
-		if fi, err := os.Lstat(m); err != nil || !fi.IsDir() { // skip missing, files, symlinks/junctions
-			continue
+		if fi, err := os.Lstat(m); err == nil && fi.IsDir() {
+			if err := os.RemoveAll(m); err != nil {
+				errs = append(errs, err)
+			}
 		}
-		if err := os.RemoveAll(m); err != nil {
-			errs = append(errs, err)
+		av := filepath.Join(c.root, a.Name(), "avatars")
+		if fi, err := os.Lstat(av); err == nil && fi.IsDir() {
+			if err := os.RemoveAll(av); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 	return errors.Join(errs...)

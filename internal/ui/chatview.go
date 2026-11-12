@@ -1167,6 +1167,10 @@ func (v *ChatView) paintBubble(c *walk.Canvas, m *store.Message, b bubble, dy in
 		return err
 	}
 	var errs []error
+	if b.avatar {
+		avRect := walk.Rectangle{X: b.box.X - s(36), Y: dy, Width: s(28), Height: s(28)}
+		errs = append(errs, drawAvatar(c, dpi, avRect, v.lay.sender(m.SenderJID), m.SenderJID, 9))
+	}
 	if b.named {
 		errs = append(errs, drawText(c, dpi, v.lay.sender(m.SenderJID), namePt, walk.FontBold, avatarColor(m.SenderJID), at(b.name), leftText))
 	}

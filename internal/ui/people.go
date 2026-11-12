@@ -424,17 +424,21 @@ func snippetLine(c store.Chat, d *Directory) string {
 	return prefix + content
 }
 
-// avatarDue reports whether person p's profile picture is due to be checked.
+// AvatarDue reports whether person p's profile picture is due to be checked.
 // Due when never checked (AvatarTS == 0), or now − AvatarTS ≥ avatarRefresh.
-func avatarDue(p store.Person, now time.Time) bool {
+func AvatarDue(p store.Person, now time.Time) bool {
 	if p.AvatarTS == 0 {
 		return true
 	}
 	return now.Sub(time.Unix(p.AvatarTS, 0)) >= avatarRefresh
 }
 
-// avatarFailedTS returns the AvatarTS to store after a failed fetch so it is
+var avatarDue = AvatarDue
+
+// AvatarFailedTS returns the AvatarTS to store after a failed fetch so it is
 // due again after avatarRetry.
-func avatarFailedTS(now time.Time) int64 {
+func AvatarFailedTS(now time.Time) int64 {
 	return now.Add(avatarRetry - avatarRefresh).Unix()
 }
+
+var avatarFailedTS = AvatarFailedTS

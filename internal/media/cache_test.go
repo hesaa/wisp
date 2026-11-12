@@ -10,6 +10,7 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
+	"image/png"
 	"io"
 	"os"
 	"os/exec"
@@ -339,5 +340,61 @@ func TestMissing(t *testing.T) {
 	os.Remove(p)
 	if !Missing(p) {
 		t.Fatal("a deleted download did not count as missing")
+	}
+}
+
+func pngBytes(t *testing.T, w, h int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.Set(x, y, color.RGBA{uint8(x), uint8(y), 128, 255})
+		}
+	}
+	var b bytes.Buffer
+	if err := png.Encode(&b, img); err != nil {
+		t.Fatal(err)
+	}
+	return b.Bytes()
+}
+
+func TestSaveAvatarScalesAndClears(t *testing.T) {
+	c, _ := newCache(t)
+	pngData := pngBytes(t, 640, 640)
+	jid := "alice@s.whatsapp.net"
+	path, err := c.SaveAvatar("acct", jid, pngData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPath := c.AvatarPath("acct", jid)
+	if path != wantPath {
+		t.Fatalf("AvatarPath = %q, want %q", path, wantPath)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, format, err := image.DecodeConfig(f)
+	f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if format != "jpeg" {
+		t.Errorf("saved format = %q, want jpeg", format)
+	}
+	if cfg.Width != 96 || cfg.Height != 96 {
+		t.Errorf("saved dimensions = %dx%d, want 96x96", cfg.Width, cfg.Height)
+	}
+
+	bigData := jpegBytes(t, 2500, 2000)
+	if _, err := c.SaveAvatar("acct", "bob@s.whatsapp.net", bigData); !errors.Is(err, ErrImageTooLarge) {
+		t.Errorf("5 MP image returned err = %v, want ErrImageTooLarge", err)
+	}
+
+	if err := c.ClearMediaCache(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("avatar survived ClearMediaCache: %v", err)
 	}
 }

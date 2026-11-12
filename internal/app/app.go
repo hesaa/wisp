@@ -41,6 +41,9 @@ type Backend interface {
 	SetPresenceAll(ctx context.Context, p types.Presence) error
 	MarkRead(ctx context.Context, msgs []store.Message, selfOnly bool) error
 	DownloadMedia(ctx context.Context, msg store.Message) (string, error)
+	ProfilePicture(ctx context.Context, accountID, jid, knownID string, full bool) (whatsapp.Picture, bool, error)
+	FetchPicture(ctx context.Context, rawURL string) ([]byte, error)
+	GroupDetails(ctx context.Context, accountID, jid string) (whatsapp.GroupDetails, error)
 	SetProxy(addr string) error
 	Close() error
 }
@@ -81,6 +84,9 @@ type App struct {
 	bar   *ui.InputBar
 	media *ui.MediaView
 	tray  *notify.Tray
+
+	avatars *ui.Avatars
+	avatarQ *avatarQueue
 
 	v          view
 	stories    []store.Story
@@ -128,6 +134,82 @@ func New(db *store.DB, cache *media.Cache, builtinGIFKey string) (*App, error) {
 		logErr("read setting "+k, err) // the default stands in
 		a.cfg[k] = v
 	}
+	a.avatars = ui.NewAvatars(cache)
+	ui.SetAvatars(a.avatars)
+	a.avatarQ = newAvatarQueue()
+	a.avatarQ.wanted = func(account, jid string) bool {
+		return a.fetchAllowed()
+	}
+	a.avatarQ.fetch = func(account, jid string) pictureResult {
+		if a.mgr == nil {
+			return pictureResult{err: errors.New("no manager")}
+		}
+		var knownID string
+		if p, ok := a.dir(account).Person(jid); ok {
+			knownID = p.AvatarID
+		}
+		bg := a.bg
+		if bg == nil {
+			bg = context.Background()
+		}
+		ctx, cancel := context.WithTimeout(bg, 20*time.Second)
+		defer cancel()
+		pic, unchanged, err := a.mgr.ProfilePicture(ctx, account, jid, knownID, false)
+		if unchanged {
+			return pictureResult{unchanged: true}
+		}
+		if err != nil {
+			return pictureResult{err: err}
+		}
+		data, err := a.mgr.FetchPicture(ctx, pic.URL)
+		if err != nil {
+			return pictureResult{err: err}
+		}
+		return pictureResult{id: pic.ID, data: data}
+	}
+	a.avatarQ.onDone = func(account, jid string, res pictureResult) {
+		p, _ := a.dir(account).Person(jid)
+		id, ts, save := avatarStep(p, time.Now(), res)
+		if save && len(res.data) > 0 {
+			if _, err := a.cache.SaveAvatar(account, jid, res.data); err != nil {
+				logErr("save avatar "+jid, err)
+			}
+		}
+		if err := a.db.SetAvatar(account, jid, id, ts); err != nil {
+			logErr("db set avatar "+jid, err)
+		}
+		if a.avatars != nil {
+			a.avatars.Invalidate(jid)
+		}
+		if a.mw != nil {
+			a.mw.Synchronize(func() {
+				if a.side != nil {
+					a.side.Invalidate()
+				}
+				if a.chat != nil {
+					a.chat.Invalidate()
+				}
+				if a.rail != nil {
+					a.rail.Invalidate()
+				}
+			})
+		}
+	}
+	a.avatars.OnWant(func(jid string) {
+		if !a.fetchAllowed() {
+			return
+		}
+		acct := a.v.active
+		if acct == "" {
+			return
+		}
+		if p, ok := a.dir(acct).Person(jid); ok {
+			if !ui.AvatarDue(p, time.Now()) {
+				return
+			}
+		}
+		a.avatarQ.want(acct, jid)
+	})
 	if err := a.build(); err != nil {
 		if a.mw != nil {
 			a.mw.Dispose()
@@ -368,6 +450,18 @@ func (a *App) sendPresence(force bool) { a.presence.update(force) }
 // which every route sends: the minimise button, the taskbar button, Win+Down): minimised, every
 // account goes unavailable at once, as when closed to the tray; restored, available again unless
 // appearing offline.
+func (a *App) fetchAllowed() bool {
+	visible := a.mw != nil && a.mw.Visible() && !a.hiding
+	return fetchAllowed(visible, a.minimized, a.locked)
+}
+
+func (a *App) dir(acct string) *ui.Directory {
+	if a.v.dirs != nil {
+		return a.v.dirs[acct]
+	}
+	return nil
+}
+
 func (a *App) sizeChanged() {
 	if m := win.IsIconic(a.mw.Handle()); m != a.minimized {
 		a.minimized = m

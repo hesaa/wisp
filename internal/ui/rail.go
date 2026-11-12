@@ -510,6 +510,11 @@ func initials(name, jid string) string {
 }
 
 func drawAvatar(c *walk.Canvas, dpi int, r walk.Rectangle, name, jid string, pt int) error {
+	if av := getAvatars(); av != nil && jid != "" {
+		if bmp := av.Get(jid, dpi); bmp != nil {
+			return c.DrawImageStretchedPixels(bmp, r)
+		}
+	}
 	if err := icons.Fill(c, r, avatarColor(jid)); err != nil {
 		return err
 	}

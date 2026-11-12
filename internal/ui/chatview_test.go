@@ -791,3 +791,64 @@ func TestClickOpensVideoPreview(t *testing.T) {
 		t.Errorf("second click of double click should not open again")
 	}
 }
+
+func TestGroupRunsGetOneAvatar(t *testing.T) {
+	// incoming A,A,B,A in a group → avatar flags true,false,true,true
+	// own messages and direct chats: none, no inset
+	const (
+		senderA = "62811111111@s.whatsapp.net"
+		senderB = "62822222222@s.whatsapp.net"
+	)
+	m1 := store.Message{ID: "m1", SenderJID: senderA, Body: "first from A"}
+	m2 := store.Message{ID: "m2", SenderJID: senderA, Body: "second from A"}
+	m3 := store.Message{ID: "m3", SenderJID: senderB, Body: "first from B"}
+	m4 := store.Message{ID: "m4", SenderJID: senderA, Body: "third from A"}
+	m5 := store.Message{ID: "m5", SenderJID: senderA, Body: "own message", FromMe: true}
+
+	// 1. Group chat
+	lGroup := layOut(t, true, m1, m2, m3, m4, m5)
+	b1 := lGroup.cache["m1"]
+	b2 := lGroup.cache["m2"]
+	b3 := lGroup.cache["m3"]
+	b4 := lGroup.cache["m4"]
+	b5 := lGroup.cache["m5"]
+
+	if !b1.avatar {
+		t.Errorf("m1 avatar = false, want true")
+	}
+	if b2.avatar {
+		t.Errorf("m2 avatar = true, want false (run continuation)")
+	}
+	if !b3.avatar {
+		t.Errorf("m3 avatar = false, want true")
+	}
+	if !b4.avatar {
+		t.Errorf("m4 avatar = false, want true")
+	}
+	if b5.avatar {
+		t.Errorf("m5 avatar = true, want false (FromMe)")
+	}
+
+	// In a group, incoming bubbles are inset 36 px from standard 18 px edge: X == 54
+	for _, b := range []bubble{b1, b2, b3, b4} {
+		if b.box.X != 18+36 {
+			t.Errorf("incoming group bubble X = %d, want %d", b.box.X, 18+36)
+		}
+	}
+	// Own message has no 36 px inset: right edge aligns with viewW - 18
+	if b5.box.X+b5.box.Width != viewW-18 {
+		t.Errorf("own message right edge = %d, want %d", b5.box.X+b5.box.Width, viewW-18)
+	}
+
+	// 2. Direct chat (group = false)
+	lDirect := layOut(t, false, m1, m2, m3, m4)
+	for _, id := range []string{"m1", "m2", "m3", "m4"} {
+		bd := lDirect.cache[id]
+		if bd.avatar {
+			t.Errorf("direct chat %s avatar = true, want false", id)
+		}
+		if bd.box.X != 18 {
+			t.Errorf("direct chat %s box.X = %d, want 18 (no inset)", id, bd.box.X)
+		}
+	}
+}

@@ -34,6 +34,13 @@ func (a *App) handle(evt any) {
 		a.chat.Rename(e.AccountID, e.ChatJID, e.Name)
 	case whatsapp.PeopleEvent:
 		a.loadPeople(e.AccountID)
+	case whatsapp.AvatarEvent:
+		if a.avatars != nil {
+			a.avatars.Invalidate(e.JID)
+		}
+		a.side.Invalidate()
+		a.chat.Invalidate()
+		a.rail.Invalidate()
 	case whatsapp.PushNameEvent:
 		a.sendPresence(true) // the first one after a pairing failed without the name
 	case whatsapp.HistorySyncEvent:
@@ -154,6 +161,9 @@ func (a *App) refreshAccounts() {
 // accountChanged switches the window to acct ("" when no account is left): the chat pane empties
 // and acct's chats and stories load.
 func (a *App) accountChanged(acct string) {
+	if a.avatars != nil {
+		a.avatars.SetAccount(acct)
+	}
 	a.closeMedia()
 	a.bar.Reset() // before the switch: it may still tell the chat being left that typing stopped
 	a.v.switchAccount(acct)

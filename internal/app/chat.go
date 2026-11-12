@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"log"
 	"os"
 	"slices"
@@ -95,13 +96,25 @@ func (a *App) purgeExpired() bool {
 	return n > 0
 }
 
-// cacheCleared forgets every download after Clear Cache in Settings and shows the open chat again,
-// its media downloadable.
+// cacheCleared forgets every download and resets avatar timestamps after Clear Cache in Settings,
+// and shows the open chat again.
 func (a *App) cacheCleared() {
 	go func() {
-		err := a.db.ClearMediaPaths()
+		err := errors.Join(a.db.ClearMediaPaths(), a.db.ResetAvatars())
 		a.mw.Synchronize(func() {
-			logErr("forget downloads", err) // the views still treat a missing file as not downloaded
+			logErr("forget downloads and avatars", err) // the views still treat a missing file as not downloaded
+			if a.avatars != nil {
+				a.avatars.Dispose()
+			}
+			if a.side != nil {
+				a.side.Invalidate()
+			}
+			if a.chat != nil {
+				a.chat.Invalidate()
+			}
+			if a.rail != nil {
+				a.rail.Invalidate()
+			}
 			if c := a.v.open; c.jid != "" {
 				a.loadChat(c, a.chatName(c.acct, c.jid))
 			}
