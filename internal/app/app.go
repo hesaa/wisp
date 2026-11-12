@@ -667,6 +667,10 @@ func (a *App) unlock(pin string) {
 		a.showPage() // focuses the search box
 		a.presence.appLock(false)
 		a.activated() // the chat in front is read now
+		if a.v.active != "" {
+			a.reloadList(a.v.active)
+		}
+		a.refreshAccounts()
 		return
 	}
 	now := time.Now()
