@@ -38,12 +38,22 @@ func (a *App) handle(evt any) {
 		if a.avatars != nil {
 			a.avatars.Invalidate(e.JID)
 		}
-		a.side.Invalidate()
-		a.chat.Invalidate()
+		if d := a.dir(e.AccountID); d != nil {
+			d.SetAvatar(e.JID, "", 0)
+		}
+		if a.side != nil {
+			a.side.Invalidate()
+		}
+		if a.chat != nil {
+			a.chat.Invalidate()
+		}
 		if a.info != nil {
 			a.info.Invalidate()
 		}
-		a.rail.Invalidate()
+		if a.rail != nil {
+			a.rail.Invalidate()
+		}
+		a.avatarQ.want(e.AccountID, e.JID)
 	case whatsapp.PushNameEvent:
 		a.sendPresence(true) // the first one after a pairing failed without the name
 	case whatsapp.HistorySyncEvent:
@@ -151,6 +161,16 @@ func (a *App) refreshAccounts() {
 				a.loadChats(id)
 			}
 		}
+		ownJID := id + "@s.whatsapp.net"
+		due := true
+		if d := a.dir(id); d != nil {
+			if p, ok := d.Person(ownJID); ok {
+				due = ui.AvatarDue(p, time.Now())
+			}
+		}
+		if due {
+			a.avatarQ.want(id, ownJID)
+		}
 	}
 	a.showUnread()
 	hint := "Choose a chat, or start a new one."
@@ -194,6 +214,15 @@ func (a *App) reloadList(acct string) {
 	seq := a.v.reloadStarted(acct)
 	go func() {
 		chats, err := a.db.ListChats(acct)
+		var groupPeople []store.Person
+		for _, c := range chats {
+			if strings.HasSuffix(c.JID, "@g.us") {
+				groupPeople = append(groupPeople, store.Person{JID: c.JID, FullName: c.Name})
+			}
+		}
+		if len(groupPeople) > 0 {
+			_ = a.db.UpsertPeople(acct, groupPeople)
+		}
 		people, _ := a.db.People(acct)
 		a.mw.Synchronize(func() {
 			if err != nil {
@@ -230,6 +259,20 @@ func (a *App) reloadList(acct string) {
 				}
 			}
 			a.showUnread()
+
+			const statusBroadcast = "status@broadcast"
+			for i := len(chats) - 1; i >= 0; i-- {
+				c := chats[i]
+				if c.JID == statusBroadcast {
+					continue
+				}
+				if p, ok := d.Person(c.JID); ok {
+					if !ui.AvatarDue(p, time.Now()) {
+						continue
+					}
+				}
+				a.avatarQ.want(acct, c.JID)
+			}
 		})
 	}()
 }

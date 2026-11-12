@@ -178,6 +178,9 @@ func New(db *store.DB, cache *media.Cache, builtinGIFKey string) (*App, error) {
 		if err := a.db.SetAvatar(account, jid, id, ts); err != nil {
 			logErr("db set avatar "+jid, err)
 		}
+		if d := a.dir(account); d != nil {
+			d.SetAvatar(jid, id, ts)
+		}
 		if a.avatars != nil {
 			a.avatars.Invalidate(jid)
 		}

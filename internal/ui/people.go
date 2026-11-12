@@ -3,6 +3,7 @@ package ui
 import (
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -17,6 +18,7 @@ const (
 // Directory indexes people known to an account, merging LID and phone number rows.
 // A nil *Directory is valid and knows nobody.
 type Directory struct {
+	mu    sync.RWMutex
 	byJID map[string]store.Person
 }
 
@@ -134,7 +136,12 @@ func phoneDigitsFromJID(jid string) string {
 
 // Person returns the row for jid merged with the row linked through PNJID in either direction.
 func (d *Directory) Person(jid string) (store.Person, bool) {
-	if d == nil || d.byJID == nil {
+	if d == nil {
+		return store.Person{}, false
+	}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.byJID == nil {
 		return store.Person{}, false
 	}
 	p, ok := d.byJID[jid]
@@ -144,6 +151,28 @@ func (d *Directory) Person(jid string) (store.Person, bool) {
 		}
 	}
 	return p, ok
+}
+
+// SetAvatar updates the avatar fields for jid in the directory index.
+func (d *Directory) SetAvatar(jid, avatarID string, ts int64) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.byJID == nil {
+		d.byJID = make(map[string]store.Person)
+	}
+	p, ok := d.byJID[jid]
+	if !ok {
+		p = store.Person{JID: jid}
+	}
+	p.AvatarID = avatarID
+	p.AvatarTS = ts
+	d.byJID[jid] = p
+	if clean := cleanJID(jid); clean != jid {
+		d.byJID[clean] = p
+	}
 }
 
 // maskedName reports whether s is a masked number (+, then only digits, spaces and at least one

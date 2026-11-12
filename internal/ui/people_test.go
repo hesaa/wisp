@@ -443,3 +443,34 @@ func TestAvatarDue(t *testing.T) {
 		t.Fatalf("after failed fetch at +10m want true")
 	}
 }
+
+func TestDirectorySetAvatar(t *testing.T) {
+	d := NewDirectory([]store.Person{
+		{JID: "111@s.whatsapp.net", FullName: "Alice"},
+	})
+
+	// 1. Set avatar on existing person
+	d.SetAvatar("111@s.whatsapp.net", "pic1", 12345678)
+	p, ok := d.Person("111@s.whatsapp.net")
+	if !ok || p.AvatarID != "pic1" || p.AvatarTS != 12345678 || p.FullName != "Alice" {
+		t.Fatalf("expected updated avatar on existing person, got %+v", p)
+	}
+
+	// 2. Set avatar on new jid
+	d.SetAvatar("222@s.whatsapp.net", "pic2", 98765432)
+	p2, ok2 := d.Person("222@s.whatsapp.net")
+	if !ok2 || p2.AvatarID != "pic2" || p2.AvatarTS != 98765432 {
+		t.Fatalf("expected new person created with avatar, got %+v", p2)
+	}
+
+	// 3. Set avatar with cleanJID support
+	d.SetAvatar("333:2@s.whatsapp.net", "pic3", 11111)
+	p3, ok3 := d.Person("333@s.whatsapp.net")
+	if !ok3 || p3.AvatarID != "pic3" || p3.AvatarTS != 11111 {
+		t.Fatalf("expected cleanJID mapping to match, got %+v", p3)
+	}
+
+	// 4. Nil directory does not panic
+	var nilDir *Directory
+	nilDir.SetAvatar("111@s.whatsapp.net", "pic", 100)
+}
