@@ -1176,9 +1176,23 @@ func (v *ChatView) paintBubble(c *walk.Canvas, m *store.Message, b bubble, dy in
 			errs = append(errs, c.DrawImageStretchedPixels(bmp, r))
 		} else {
 			errs = append(errs, icons.FillRounded(c, r, s(4), theme.Color(p.ChatBg)))
-			if m.MediaPath == "" {
+			if !b.play && m.MediaPath == "" {
 				errs = append(errs, icons.Draw(c, icons.IconDownload, square(r.X+r.Width/2, r.Y+r.Height/2, s(36)), secondary))
 			}
+		}
+		if b.play {
+			disc := square(r.X+r.Width/2, r.Y+r.Height/2, s(40))
+			errs = append(errs,
+				icons.FillARGB(c, disc, 0x99000000),
+				icons.Draw(c, icons.IconPlay, disc, walk.RGB(255, 255, 255)),
+			)
+		}
+		if b.gifBadge {
+			badge := walk.Rectangle{X: r.X + s(8), Y: r.Y + s(8), Width: s(28), Height: s(18)}
+			errs = append(errs,
+				icons.FillRoundedARGB(c, badge, s(4), 0x99000000),
+				drawText(c, dpi, "GIF", 9, walk.FontBold, walk.RGB(255, 255, 255), badge, centerText),
+			)
 		}
 	}
 	if b.card.Width > 0 {

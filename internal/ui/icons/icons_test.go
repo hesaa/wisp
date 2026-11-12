@@ -130,3 +130,23 @@ func TestFillRounded(t *testing.T) {
 		}
 	}
 }
+
+func TestFillARGBAndFillRoundedARGB(t *testing.T) {
+	bmp, err := walk.NewBitmapForDPI(walk.Size{Width: 40, Height: 40}, 96)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bmp.Dispose()
+	c, err := walk.NewCanvasFromImage(bmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Semi-transparent black 0x99000000 on transparent bitmap
+	if err := FillARGB(c, walk.Rectangle{Width: 40, Height: 40}, 0x99000000); err != nil {
+		t.Fatal(err)
+	}
+	if err := FillRoundedARGB(c, walk.Rectangle{Width: 30, Height: 20}, 4, 0x99000000); err != nil {
+		t.Fatal(err)
+	}
+	c.Dispose()
+}

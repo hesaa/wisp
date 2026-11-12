@@ -105,7 +105,12 @@ func kindOf(m *store.Message, info mediaInfo) bubbleKind {
 			return kindImage
 		}
 		return kindCard
-	case "video", "audio", "document":
+	case "video":
+		if len(info.preview) > 0 {
+			return kindImage
+		}
+		return kindCard
+	case "audio", "document":
 		return kindCard
 	}
 	return kindText
@@ -152,6 +157,9 @@ func cardLabels(m *store.Message, info mediaInfo) (title, sub string) {
 		ext := strings.ToUpper(strings.TrimPrefix(filepath.Ext(title), "."))
 		return title, strings.Join(slices.DeleteFunc([]string{size, ext}, func(s string) bool { return s == "" }), " · ")
 	case "video":
+		if info.gif {
+			return "GIF", size
+		}
 		return "Video", size
 	case "audio":
 		return "Audio", size
@@ -222,6 +230,8 @@ type bubble struct {
 	out      bool
 	named    bool      // shows the sender's name
 	preview  bool      // MediaMeta has an embedded thumbnail
+	play     bool      // video or GIF preview
+	gifBadge bool      // GIF preview
 	info     mediaInfo // without preview bytes
 	box      walk.Rectangle
 	name     walk.Rectangle // sender name, incoming group messages starting a run
@@ -310,6 +320,10 @@ func (l *chatLayout) layout(m *store.Message, named bool, ms measurer) bubble {
 	info, err := parseMedia(m)
 	logErr("media details of message "+m.ID, err)
 	b := bubble{kind: kindOf(m, info), out: m.FromMe, named: named, preview: len(info.preview) > 0}
+	if b.kind == kindImage && m.Type == "video" {
+		b.play = true
+		b.gifBadge = info.gif
+	}
 	info.preview = nil
 	b.info = info
 	if l.lineH == 0 {

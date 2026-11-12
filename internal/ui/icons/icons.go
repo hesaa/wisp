@@ -219,7 +219,12 @@ func Draw(c *walk.Canvas, id Icon, bounds walk.Rectangle, color walk.Color) erro
 // Fill paints an anti-aliased capsule in color filling bounds (pixels): a circle when bounds is
 // square, a pill along the longer side otherwise. For avatars, status dots, badges and scroll thumbs.
 func Fill(c *walk.Canvas, bounds walk.Rectangle, color walk.Color) error {
-	return withBrush(c, bounds, color, func(g, brush uintptr) error {
+	return FillARGB(c, bounds, argb(color))
+}
+
+// FillARGB paints an anti-aliased capsule in 32-bit ARGB color filling bounds (pixels).
+func FillARGB(c *walk.Canvas, bounds walk.Rectangle, color uint32) error {
+	return withBrushARGB(c, bounds, color, func(g, brush uintptr) error {
 		b := bounds
 		d := min(b.Width, b.Height)
 		rect := walk.Rectangle{X: b.X + d/2, Y: b.Y, Width: b.Width - d, Height: b.Height}
@@ -239,7 +244,13 @@ func Fill(c *walk.Canvas, bounds walk.Rectangle, color walk.Color) error {
 // FillRounded paints an anti-aliased rectangle in color filling bounds (pixels), its corners
 // rounded with radius r. For message bubbles and cards.
 func FillRounded(c *walk.Canvas, bounds walk.Rectangle, r int, color walk.Color) error {
-	return withBrush(c, bounds, color, func(g, brush uintptr) error {
+	return FillRoundedARGB(c, bounds, r, argb(color))
+}
+
+// FillRoundedARGB paints an anti-aliased rectangle in 32-bit ARGB color filling bounds (pixels),
+// its corners rounded with radius r.
+func FillRoundedARGB(c *walk.Canvas, bounds walk.Rectangle, r int, color uint32) error {
+	return withBrushARGB(c, bounds, color, func(g, brush uintptr) error {
 		b := bounds
 		r := max(1, min(r, b.Width/2, b.Height/2))
 		d := 2 * r
@@ -265,6 +276,11 @@ func fillRect(g, brush uintptr, r walk.Rectangle) error {
 
 // withBrush runs fill with anti-aliased GDI+ graphics on c and a solid brush in color.
 func withBrush(c *walk.Canvas, bounds walk.Rectangle, color walk.Color, fill func(g, brush uintptr) error) error {
+	return withBrushARGB(c, bounds, argb(color), fill)
+}
+
+// withBrushARGB runs fill with anti-aliased GDI+ graphics on c and a solid brush in 32-bit ARGB color.
+func withBrushARGB(c *walk.Canvas, bounds walk.Rectangle, argb uint32, fill func(g, brush uintptr) error) error {
 	if bounds.Width <= 0 || bounds.Height <= 0 {
 		return fmt.Errorf("icons: empty bounds")
 	}
@@ -283,7 +299,7 @@ func withBrush(c *walk.Canvas, bounds walk.Rectangle, color walk.Color, fill fun
 	if err := call(pSetPixelOffsetMode, g, pixelOffsetHalf); err != nil {
 		return err
 	}
-	if err := call(pCreateSolidFill, uintptr(argb(color)), uintptr(unsafe.Pointer(&brush))); err != nil {
+	if err := call(pCreateSolidFill, uintptr(argb), uintptr(unsafe.Pointer(&brush))); err != nil {
 		return err
 	}
 	defer call(pDeleteBrush, brush)

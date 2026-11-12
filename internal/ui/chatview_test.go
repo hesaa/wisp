@@ -225,6 +225,7 @@ func TestDocumentCardLayout(t *testing.T) {
 		{store.Message{Type: "document", Body: "report.pdf"}, mediaInfo{name: "report.pdf", size: 250880}, "report.pdf", "245 KB · PDF"},
 		{store.Message{Type: "document", Body: "notes"}, mediaInfo{}, "notes", ""},
 		{store.Message{Type: "video"}, mediaInfo{size: 3565158}, "Video", "3.4 MB"},
+		{store.Message{Type: "video"}, mediaInfo{size: 3565158, gif: true}, "GIF", "3.4 MB"},
 		{store.Message{Type: "audio"}, mediaInfo{size: 900}, "Audio", "900 B"},
 		{store.Message{Type: "sticker"}, mediaInfo{}, "Sticker", ""},
 	} {
@@ -242,7 +243,8 @@ func TestMediaKinds(t *testing.T) {
 	}{
 		{"text", mediaInfo{}, kindText},
 		{"image", mediaInfo{}, kindImage},
-		{"video", mediaInfo{preview: []byte{1}}, kindCard},
+		{"video", mediaInfo{}, kindCard},
+		{"video", mediaInfo{preview: []byte{1}}, kindImage},
 		{"audio", mediaInfo{}, kindCard},
 		{"document", mediaInfo{}, kindCard},
 		{"sticker", mediaInfo{}, kindCard},
@@ -686,5 +688,106 @@ func TestNoInternalIDShown(t *testing.T) {
 	l := &chatLayout{group: true, dir: d}
 	if got := l.sender(lid); got != "Unknown" {
 		t.Errorf("sender(%q) = %q, want %q", lid, got, "Unknown")
+	}
+}
+
+func TestVideoWithPreviewIsImageBubble(t *testing.T) {
+	vMeta := meta(t, &waE2E.VideoMessage{
+		JPEGThumbnail: []byte{0xff, 0xd8, 0xff},
+		Width:         proto.Uint32(640),
+		Height:        proto.Uint32(480),
+		FileLength:    proto.Uint64(1024),
+	})
+	mVideo := store.Message{ID: "v1", Type: "video", MediaMeta: vMeta}
+
+	gifMeta := meta(t, &waE2E.VideoMessage{
+		JPEGThumbnail: []byte{0xff, 0xd8, 0xff},
+		GifPlayback:   proto.Bool(true),
+		Width:         proto.Uint32(320),
+		Height:        proto.Uint32(240),
+		FileLength:    proto.Uint64(512),
+	})
+	mGIF := store.Message{ID: "g1", Type: "video", MediaMeta: gifMeta}
+
+	noPrevMeta := meta(t, &waE2E.VideoMessage{
+		FileLength: proto.Uint64(2048),
+	})
+	mNoPrev := store.Message{ID: "v2", Type: "video", MediaMeta: noPrevMeta}
+
+	gifNoPrevMeta := meta(t, &waE2E.VideoMessage{
+		GifPlayback: proto.Bool(true),
+		FileLength:  proto.Uint64(4096),
+	})
+	mGIFNoPrev := store.Message{ID: "g2", Type: "video", MediaMeta: gifNoPrevMeta}
+
+	l := layOut(t, false, mVideo, mGIF, mNoPrev, mGIFNoPrev)
+
+	bVideo := l.cache["v1"]
+	if bVideo.kind != kindImage {
+		t.Errorf("video with preview kind = %v, want kindImage", bVideo.kind)
+	}
+	if !bVideo.play {
+		t.Errorf("video with preview play = false, want true")
+	}
+	if bVideo.gifBadge {
+		t.Errorf("video with preview gifBadge = true, want false")
+	}
+
+	bGIF := l.cache["g1"]
+	if bGIF.kind != kindImage {
+		t.Errorf("gif with preview kind = %v, want kindImage", bGIF.kind)
+	}
+	if !bGIF.play {
+		t.Errorf("gif with preview play = false, want true")
+	}
+	if !bGIF.gifBadge {
+		t.Errorf("gif with preview gifBadge = false, want true")
+	}
+
+	bNoPrev := l.cache["v2"]
+	if bNoPrev.kind != kindCard {
+		t.Errorf("video without preview kind = %v, want kindCard", bNoPrev.kind)
+	}
+	if title, _ := cardLabels(&mNoPrev, bNoPrev.info); title != "Video" {
+		t.Errorf("video without preview title = %q, want Video", title)
+	}
+
+	bGIFNoPrev := l.cache["g2"]
+	if bGIFNoPrev.kind != kindCard {
+		t.Errorf("gif without preview kind = %v, want kindCard", bGIFNoPrev.kind)
+	}
+	if title, _ := cardLabels(&mGIFNoPrev, bGIFNoPrev.info); title != "GIF" {
+		t.Errorf("gif without preview title = %q, want GIF", title)
+	}
+}
+
+func TestClickOpensVideoPreview(t *testing.T) {
+	vMeta := meta(t, &waE2E.VideoMessage{
+		JPEGThumbnail: []byte{0xff, 0xd8, 0xff},
+		Width:         proto.Uint32(640),
+		Height:        proto.Uint32(480),
+		FileLength:    proto.Uint64(1024),
+	})
+	mVideo := store.Message{ID: "v1", Type: "video", MediaMeta: vMeta}
+	l := layOut(t, false, mVideo)
+	b := l.cache["v1"]
+
+	if b.thumb.Width == 0 || b.thumb.Height == 0 {
+		t.Fatalf("expected non-empty thumb for video with preview, got %+v", b.thumb)
+	}
+	cx := b.thumb.X + b.thumb.Width/2
+	cy := b.thumb.Y + b.thumb.Height/2
+
+	if !clickOpens("video", b, cx, cy, 1, 0, false) {
+		t.Errorf("single click on video preview thumb did not open")
+	}
+	if clickOpens("video", b, cx, cy, 1, walk.ModControl, false) {
+		t.Errorf("click with modifier should not open")
+	}
+	if clickOpens("video", b, cx, cy, 1, 0, true) {
+		t.Errorf("dragged click should not open")
+	}
+	if clickOpens("video", b, cx, cy, 2, 0, false) {
+		t.Errorf("second click of double click should not open again")
 	}
 }
