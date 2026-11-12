@@ -5,7 +5,6 @@ import (
 	"image"
 	"image/color"
 	"strconv"
-	"time"
 	"unicode/utf16"
 	"unsafe"
 
@@ -32,15 +31,7 @@ type Tray struct {
 // onExit quits. base is owned by the caller. Walk does not publish double-click, so a single
 // left click restores. Call on the UI thread.
 func NewTray(form walk.Form, base walk.Image, appName string, onOpen, onExit func()) (*Tray, error) {
-	var ni *walk.NotifyIcon
-	var err error
-	for attempt := 0; attempt < 10; attempt++ {
-		ni, err = walk.NewNotifyIcon(form)
-		if err == nil {
-			break
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
+	ni, err := walk.NewNotifyIcon(form)
 	if err != nil {
 		return nil, err
 	}

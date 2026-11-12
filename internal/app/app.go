@@ -359,15 +359,17 @@ func (a *App) Attach(mgr Backend) {
 // Run shows the window and the tray icon and returns after Exit, once every account has been set
 // unavailable and disconnected. Call Attach first.
 func (a *App) Run() (reset bool, err error) {
-	tray, err := notify.NewTray(a.mw, a.icon, "Wisp", a.restore, a.exit)
-	if err != nil {
-		logErr("tray", err)
-	} else {
-		a.tray = tray
-		a.tray.OnToastClick(a.toastClicked)
-	}
 	a.mw.Show()
 	a.showPage() // the first page may have been picked before the window was visible
+	a.mw.Synchronize(func() {
+		tray, terr := notify.NewTray(a.mw, a.icon, "Wisp", a.restore, a.exit)
+		if terr != nil {
+			logErr("tray", terr)
+		} else {
+			a.tray = tray
+			a.tray.OnToastClick(a.toastClicked)
+		}
+	})
 	a.mw.Run()
 	// the window is gone: blocking here is fine
 	if a.tray != nil { // the loop ended some other way than Exit
