@@ -32,6 +32,7 @@ const (
 	KeyNotify             = "notify.enabled"            // toasts for new messages
 	KeyNotifyPrivate      = "notify.private"            // toasts without sender or text
 	KeyNotifySound        = "notify.sound"              // toasts with the notification sound
+	KeyNotifySoundName    = "notify.sound.name"         // sound file name: default, message, mail, reminder, sms
 	KeyTheme              = "ui.theme"                  // system, dark or light
 	KeyLockPIN            = "lock.pin"                  // the app-lock PIN's hash (see package lock); "" is lock off
 )
@@ -43,6 +44,7 @@ var (
 	visibilityOptions = []option{{"Everyone", "all"}, {"My contacts", "contacts"}, {"Contacts except…", "contact_blacklist"}, {"Nobody", "none"}}
 	timerOptions      = []option{{"Off", "0"}, {"24 hours", "86400"}, {"7 days", "604800"}, {"90 days", "7776000"}}
 	themeOptions      = []option{{"System default", "system"}, {"Dark", "dark"}, {"Light", "light"}}
+	soundOptions      = []option{{"Default", "default"}, {"Message", "message"}, {"Mail", "mail"}, {"Reminder", "reminder"}, {"SMS", "sms"}}
 )
 
 // privacyKeys are the per-account settings, with the values WhatsApp accepts for each.
@@ -63,6 +65,7 @@ var settingNames = map[string]string{
 	KeyDisappearing: "Default message timer", KeyGhostTyping: "Ghost typing", KeyAppearOffline: "Appear offline",
 	KeyAutoDownloadImages: "Auto-download images", KeyGiphyAPIKey: "GIPHY API key", KeyProxy: "Proxy",
 	KeyNotify: "Notifications", KeyNotifyPrivate: "Private notifications", KeyNotifySound: "Notification sound",
+	KeyNotifySoundName: "Sound",
 	KeyTheme: "Theme", KeyLockPIN: "App lock",
 }
 
@@ -70,7 +73,7 @@ var settingNames = map[string]string{
 var defaults = map[string]string{
 	KeyLastSeen: "all", KeyReadReceipts: "all", KeyProfilePhoto: "all", KeyDisappearing: "0",
 	KeyGhostTyping: "false", KeyAppearOffline: "false", KeyAutoDownloadImages: "true", KeyGiphyAPIKey: "",
-	KeyProxy: "", KeyNotify: "true", KeyNotifyPrivate: "false", KeyNotifySound: "true", KeyTheme: "system", KeyLockPIN: "",
+	KeyProxy: "", KeyNotify: "true", KeyNotifyPrivate: "false", KeyNotifySound: "true", KeyNotifySoundName: "default", KeyTheme: "system", KeyLockPIN: "",
 }
 
 // SettingsStore is the part of *store.DB the settings use.

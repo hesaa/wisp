@@ -282,7 +282,7 @@ func (p *presenceCtl) appLock(locked bool) {
 // app is locked.
 func toastSettings(cfg map[string]string, locked bool, accounts int) notify.Settings {
 	return notify.Settings{Enabled: true, PrivateMode: locked || cfg[ui.KeyNotifyPrivate] == "true",
-		Sound: cfg[ui.KeyNotifySound] == "true", MultiAccount: accounts > 1}
+		Sound: cfg[ui.KeyNotifySound] == "true", SoundName: cfg[ui.KeyNotifySoundName], MultiAccount: accounts > 1}
 }
 
 // presenceState remembers the last broadcast presence, so window activations do not repeat it.

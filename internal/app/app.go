@@ -60,7 +60,7 @@ const (
 
 // globalKeys are the app-global settings kept in memory (account "" of the settings table).
 var globalKeys = []string{ui.KeyGhostTyping, ui.KeyAppearOffline, ui.KeyAutoDownloadImages, ui.KeyGiphyAPIKey,
-	ui.KeyProxy, ui.KeyNotify, ui.KeyNotifyPrivate, ui.KeyNotifySound, ui.KeyTheme, ui.KeyLockPIN}
+	ui.KeyProxy, ui.KeyNotify, ui.KeyNotifyPrivate, ui.KeyNotifySound, ui.KeyNotifySoundName, ui.KeyTheme, ui.KeyLockPIN}
 
 // App is the running main window.
 type App struct {

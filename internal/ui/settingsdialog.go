@@ -3,14 +3,17 @@ package ui
 import (
 	"context"
 	"errors"
+	"os"
 	"slices"
 	"strings"
 	"sync"
 
 	"github.com/lxn/walk"
 	"github.com/lxn/win"
+	"golang.org/x/sys/windows"
 
 	"wa-go/internal/media"
+	"wa-go/internal/notify"
 	"wa-go/internal/theme"
 	"wa-go/internal/ui/icons"
 	"wa-go/internal/whatsapp"
@@ -112,9 +115,10 @@ type settingsDialog struct {
 	globals    map[string]valueWidget // by key
 	nav        *sectionNav
 	pages      [len(sectionNames)]*walk.Composite
-	notes      [len(sectionNames)]*label // each section's status line
-	acctPick   *choice
-	cacheSize  *label
+	notes       [len(sectionNames)]*label // each section's status line
+	acctPick    *choice
+	soundChoice *choice
+	cacheSize   *label
 	keyEdit    *walk.LineEdit
 	proxyEdit  *walk.LineEdit
 	accounts   *walk.Composite
@@ -392,6 +396,7 @@ func (d *settingsDialog) buildAccounts(pg *walk.Composite) error {
 }
 
 func (d *settingsDialog) buildNotify(pg *walk.Composite) error {
+	var soundToggle *toggle
 	for _, t := range []struct{ key, name, desc string }{
 		{KeyNotify, "Notifications", "Show a Windows notification for new messages."},
 		{KeyNotifyPrivate, "Private notifications", "Hide the sender and the message text."},
@@ -401,7 +406,26 @@ func (d *settingsDialog) buildNotify(pg *walk.Composite) error {
 		if err != nil {
 			return err
 		}
+		if t.key == KeyNotifySound {
+			soundToggle = w
+		}
 		d.bind(secNotify, t.key, w)
+	}
+	soundChoice, err := d.newChoice(pg, "Sound", soundOptions)
+	if err != nil {
+		return err
+	}
+	d.soundChoice = soundChoice
+	d.bind(secNotify, KeyNotifySoundName, soundChoice)
+	soundChoice.listen(func(v string) {
+		d.saveGlobal(secNotify, KeyNotifySoundName, "Sound", v)
+		d.previewSound(v)
+	})
+	if soundToggle != nil {
+		soundToggle.listen(func(v string) {
+			soundChoice.SetEnabled(v == "true")
+			d.saveGlobal(secNotify, KeyNotifySound, "Notification sound", v)
+		})
 	}
 	th, err := d.newChoice(pg, "Theme", themeOptions)
 	if err != nil {
@@ -462,12 +486,27 @@ func (d *settingsDialog) loadGlobals() {
 			w.setValue(vals[key])
 			w.setBusy(false)
 		}
+		if d.soundChoice != nil {
+			d.soundChoice.SetEnabled(vals[KeyNotifySound] == "true")
+		}
 		if err == nil { // else the PIN state is unknown: no button, so Set PIN can't replace a PIN unasked
 			d.showLock(vals[KeyLockPIN])
 		}
 		logErr("GIPHY key field", d.keyEdit.SetText(vals[KeyGiphyAPIKey]))
 		logErr("proxy field", d.proxyEdit.SetText(vals[KeyProxy]))
 	})
+}
+
+var pMessageBeep = windows.NewLazySystemDLL("user32.dll").NewProc("MessageBeep")
+
+func (d *settingsDialog) previewSound(v string) {
+	if strings.EqualFold(v, "default") {
+		_, _, _ = pMessageBeep.Call(0x40) // MB_ICONASTERISK
+		return
+	}
+	if f := notify.SoundFile(v, os.Getenv("WINDIR"), nil); f != "" {
+		_ = notify.Play(f)
+	}
 }
 
 // loadPrivacy shows the privacy account's saved values, then WhatsApp's current ones. Its controls
@@ -1233,7 +1272,7 @@ func (ch *choice) changed() {
 }
 
 func (ch *choice) pick(i int) {
-	if ch.busy || i < 0 || i >= len(ch.opts) || i == ch.sel {
+	if !ch.Enabled() || ch.busy || i < 0 || i >= len(ch.opts) || i == ch.sel {
 		return
 	}
 	ch.sel = i
@@ -1244,6 +1283,9 @@ func (ch *choice) pick(i int) {
 }
 
 func (ch *choice) key(k walk.Key) bool {
+	if !ch.Enabled() {
+		return false
+	}
 	if k == walk.KeySpace || k == walk.KeyReturn {
 		ch.pick(ch.cur)
 		return true
@@ -1269,6 +1311,9 @@ func (ch *choice) segments() []walk.Rectangle {
 }
 
 func (ch *choice) hit(x, y int) func() {
+	if !ch.Enabled() {
+		return nil
+	}
 	for i, seg := range ch.segments() {
 		if x >= seg.X && x < seg.X+seg.Width && y >= seg.Y && y < seg.Y+seg.Height {
 			return func() {
@@ -1288,8 +1333,12 @@ func (ch *choice) paint(c *walk.Canvas, _ walk.Rectangle) error {
 	if err != nil {
 		return err
 	}
+	labelCol := theme.Color(p.Text)
+	if !ch.Enabled() {
+		labelCol = theme.Color(p.TextSecondary)
+	}
 	if err := errors.Join(c.FillRectanglePixels(bg, r),
-		drawText(c, dpi, ch.label, 10, 0, theme.Color(p.Text), walk.Rectangle{Width: r.Width, Height: s(22)}, leftText)); err != nil {
+		drawText(c, dpi, ch.label, 10, 0, labelCol, walk.Rectangle{Width: r.Width, Height: s(22)}, leftText)); err != nil {
 		return err
 	}
 	segs := ch.segments()
@@ -1300,11 +1349,16 @@ func (ch *choice) paint(c *walk.Canvas, _ walk.Rectangle) error {
 	if err := icons.FillRounded(c, bar, s(8), theme.Color(p.Header)); err != nil {
 		return err
 	}
-	focused := focusCues(ch)
+	focused := focusCues(ch) && ch.Enabled()
 	for i, seg := range segs {
 		in := inset(seg, s(3))
 		fill, fg, style := theme.Color(p.Header), theme.Color(p.Text), walk.FontStyle(0)
-		if i == ch.sel {
+		if !ch.Enabled() {
+			fg = theme.Color(p.TextSecondary)
+			if i == ch.sel {
+				fill = theme.Color(p.Header)
+			}
+		} else if i == ch.sel {
 			fill, fg, style = theme.Color(p.Accent), walk.RGB(255, 255, 255), walk.FontBold
 			if ch.busy {
 				fill = theme.Color(p.TextSecondary)

@@ -345,7 +345,7 @@ func TestThemeChangeFiresTheCallbackAtOnce(t *testing.T) {
 func TestSettingDefaults(t *testing.T) {
 	h := newSettingsHarness(t)
 	for key, want := range map[string]string{KeyAutoDownloadImages: "true", KeyNotify: "true", KeyNotifySound: "true",
-		KeyNotifyPrivate: "false", KeyGiphyAPIKey: "", KeyProxy: ""} {
+		KeyNotifySoundName: "default", KeyNotifyPrivate: "false", KeyGiphyAPIKey: "", KeyProxy: ""} {
 		if v, err := Setting(h.db, "", key); v != want || err != nil {
 			t.Errorf("%s: %q %v, want %q", key, v, err, want)
 		}

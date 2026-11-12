@@ -737,12 +737,12 @@ func TestModalClass(t *testing.T) {
 }
 
 func TestToastSettingsPrivateWhileLocked(t *testing.T) {
-	cfg := map[string]string{ui.KeyNotifyPrivate: "false", ui.KeyNotifySound: "true"}
-	if s := toastSettings(cfg, true, 2); !s.PrivateMode || !s.Sound || !s.MultiAccount || !s.Enabled {
-		t.Errorf("locked: %+v, want private, sound, multi-account", s)
+	cfg := map[string]string{ui.KeyNotifyPrivate: "false", ui.KeyNotifySound: "true", ui.KeyNotifySoundName: "mail"}
+	if s := toastSettings(cfg, true, 2); !s.PrivateMode || !s.Sound || !s.MultiAccount || !s.Enabled || s.SoundName != "mail" {
+		t.Errorf("locked: %+v, want private, sound, multi-account, mail", s)
 	}
-	if s := toastSettings(cfg, false, 1); s.PrivateMode || !s.Sound || s.MultiAccount {
-		t.Errorf("unlocked: %+v, want not private, sound, single account", s)
+	if s := toastSettings(cfg, false, 1); s.PrivateMode || !s.Sound || s.MultiAccount || s.SoundName != "mail" {
+		t.Errorf("unlocked: %+v, want not private, sound, single account, mail", s)
 	}
 	if s := toastSettings(map[string]string{ui.KeyNotifyPrivate: "true"}, false, 1); !s.PrivateMode {
 		t.Errorf("unlocked, private setting: %+v, want private", s)

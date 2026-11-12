@@ -22,6 +22,7 @@ type Settings struct {
 	Enabled      bool
 	PrivateMode  bool // hide sender/chat name and message text
 	Sound        bool
+	SoundName    string
 	MultiAccount bool // more than one account connected: title names the account
 }
 
@@ -29,6 +30,7 @@ type Settings struct {
 type Notification struct {
 	Title, Body string
 	Silent      bool
+	Sound       string
 }
 
 var mediaWord = map[string]string{
@@ -42,7 +44,20 @@ func Format(in Input, s Settings) (Notification, bool) {
 		in.Type == "revoked" || in.Type == "unsupported" {
 		return Notification{}, false
 	}
-	n := Notification{Silent: !s.Sound}
+	n := Notification{}
+	if !s.Sound {
+		n.Silent = true
+		n.Sound = ""
+	} else {
+		soundPath := SoundFile(s.SoundName, winDirEnv(), pathExists)
+		if soundPath != "" {
+			n.Silent = true
+			n.Sound = soundPath
+		} else {
+			n.Silent = false
+			n.Sound = ""
+		}
+	}
 	if s.PrivateMode {
 		n.Title, n.Body = "WhatsApp", "New message"
 	} else {
@@ -106,6 +121,9 @@ func (d *Dispatcher) Notify(in Input, s Settings) error {
 	}
 	if err := d.b.show(n.Title, n.Body, n.Silent); err != nil {
 		return err
+	}
+	if n.Sound != "" {
+		_ = playSound(n.Sound)
 	}
 	d.account, d.chat, d.has = in.AccountID, in.ChatJID, true
 	return nil
