@@ -361,10 +361,11 @@ func (a *App) Attach(mgr Backend) {
 func (a *App) Run() (reset bool, err error) {
 	tray, err := notify.NewTray(a.mw, a.icon, "Wisp", a.restore, a.exit)
 	if err != nil {
-		return false, err
+		logErr("tray", err)
+	} else {
+		a.tray = tray
+		a.tray.OnToastClick(a.toastClicked)
 	}
-	a.tray = tray
-	a.tray.OnToastClick(a.toastClicked)
 	a.mw.Show()
 	a.showPage() // the first page may have been picked before the window was visible
 	a.mw.Run()
@@ -384,7 +385,7 @@ func (a *App) Run() (reset bool, err error) {
 // closing hides the window to the tray instead of closing it, and every account goes unavailable at
 // once; only Exit closes it.
 func (a *App) closing(canceled *bool, _ walk.CloseReason) {
-	if a.exiting {
+	if a.exiting || a.tray == nil {
 		return
 	}
 	*canceled = true
