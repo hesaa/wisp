@@ -519,6 +519,9 @@ func pairingRuns(pg page, visible, iconic bool) bool { return pg == pageLink && 
 // the chats are the page, and the window is on screen.
 func mediaStays(pg page, visible, iconic bool) bool { return pg == pageChats && visible && !iconic }
 
+// infoStays shares the same lifecycle rule as mediaStays: only stays open when chats are on screen.
+func infoStays(pg page, visible, iconic bool) bool { return mediaStays(pg, visible, iconic) }
+
 // linkCancellable: Cancel returns to the chats, so it needs an account and an add in progress.
 func linkCancellable(adding bool, accounts int) bool { return adding && accounts > 0 }
 

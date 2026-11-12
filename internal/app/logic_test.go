@@ -657,6 +657,43 @@ func TestMediaStays(t *testing.T) {
 	}
 }
 
+func TestInfoClosesWithTheChats(t *testing.T) {
+	if !infoStays(pageChats, true, false) {
+		t.Errorf("infoStays(pageChats, true, false) = false, want true")
+	}
+	if infoStays(pageLock, true, false) {
+		t.Errorf("infoStays(pageLock, true, false) = true, want false (locked)")
+	}
+	if infoStays(pageChats, true, true) {
+		t.Errorf("infoStays(pageChats, true, true) = true, want false (iconic)")
+	}
+	if infoStays(pageChats, false, false) {
+		t.Errorf("infoStays(pageChats, false, false) = true, want false (hidden)")
+	}
+
+	gen := 1
+	var openJID string
+	var showingInfo bool
+	openInfo := func(jid string) int {
+		gen++
+		openJID = jid
+		showingInfo = true
+		return gen
+	}
+	closeInfo := func() {
+		gen++
+		showingInfo = false
+		openJID = ""
+	}
+
+	g1 := openInfo("chat1")
+	closeInfo()
+	accepted := (g1 == gen && showingInfo && openJID == "chat1")
+	if accepted {
+		t.Errorf("late reply accepted after close")
+	}
+}
+
 func TestPairingRuns(t *testing.T) {
 	cases := []struct {
 		pg              page

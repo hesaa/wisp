@@ -1,11 +1,14 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"image"
 	"log"
 	"os"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/lxn/win"
@@ -19,11 +22,14 @@ import (
 // gifHTTP downloads picked GIFs, through the proxy in Settings.
 var gifHTTP = newGIFClient(ui.GIFTransport, time.Minute)
 
-// showChatPane shows the chat and the input bar, or the empty state.
+// showChatPane shows the chat and the input bar, the details view, or the empty state.
 func (a *App) showChatPane(open bool) {
 	a.empty.SetVisible(!open)
-	a.chat.SetVisible(open)
-	a.bar.SetVisible(open)
+	a.chat.SetVisible(open && !a.viewing && !a.showingInfo)
+	a.bar.SetVisible(open && !a.viewing && !a.showingInfo)
+	if a.info != nil {
+		a.info.SetVisible(open && a.showingInfo)
+	}
 }
 
 // openChat opens acct's chat jid (named name, or as the chat list names it): its newest page loads
@@ -39,6 +45,7 @@ func (a *App) openChat(acct, jid, name string) {
 	}
 	a.side.Model().Select(jid)
 	a.closeMedia()
+	a.closeInfo()
 	if c == a.v.open {
 		if a.chatUnread(jid) > 0 {
 			a.markChatRead(c)
@@ -256,6 +263,7 @@ func (a *App) openMedia(m store.Message) {
 		if i < 0 {
 			return
 		}
+		a.closeInfo()
 		a.viewing = true
 		a.chat.SetVisible(false)
 		a.bar.SetVisible(false)
@@ -450,3 +458,106 @@ func (a *App) openStory(sender string) {
 
 // senderName names a group member in the chat view.
 func (a *App) senderName(jid string) string { return a.chatName(a.v.active, jid) }
+
+// openInfo opens the details view for the currently open chat.
+func (a *App) openInfo() {
+	c := a.v.open
+	if c.jid == "" || a.info == nil {
+		return
+	}
+	a.closeMedia()
+	a.showingInfo = true
+	a.showChatPane(true)
+	name, _ := a.db.ChatName(c.acct, c.jid)
+	if name == "" {
+		name = a.chatName(c.acct, c.jid)
+	}
+	chat := store.Chat{JID: c.jid, Name: name}
+	a.info.Open(chat, a.dir(c.acct))
+	a.loadInfo(c.jid)
+}
+
+// closeInfo closes the details view and shows the chat again.
+func (a *App) closeInfo() {
+	if !a.showingInfo {
+		return
+	}
+	a.infoGen++
+	a.showingInfo = false
+	if a.info != nil {
+		a.info.Close()
+	}
+	if c := a.v.open; c.jid != "" {
+		a.showChatPane(true)
+	}
+}
+
+// loadInfo fetches contact or group details asynchronously.
+func (a *App) loadInfo(jid string) {
+	c := a.v.open
+	if c.jid != jid || a.mgr == nil {
+		return
+	}
+	a.infoGen++
+	gen := a.infoGen
+	acct := c.acct
+	isGroup := strings.HasSuffix(jid, "@g.us")
+
+	go func() {
+		bg := a.bg
+		if bg == nil {
+			bg = context.Background()
+		}
+		ctx, cancel := context.WithTimeout(bg, 20*time.Second)
+		defer cancel()
+
+		if isGroup {
+			details, err := a.mgr.GroupDetails(ctx, acct, jid)
+			a.mw.Synchronize(func() {
+				if gen != a.infoGen || !a.showingInfo || a.v.open.jid != jid {
+					return
+				}
+				if err != nil {
+					a.info.SetError(jid)
+					return
+				}
+				var members []ui.InfoMember
+				for _, m := range details.Members {
+					members = append(members, ui.InfoMember{JID: m.JID, Admin: m.Admin})
+				}
+				a.info.SetGroup(jid, ui.GroupInfo{
+					Description: details.Description,
+					Members:     members,
+				})
+			})
+		} else {
+			about, err := a.mgr.About(ctx, acct, jid)
+			a.mw.Synchronize(func() {
+				if gen != a.infoGen || !a.showingInfo || a.v.open.jid != jid {
+					return
+				}
+				if err != nil {
+					a.info.SetError(jid)
+					return
+				}
+				a.info.SetAbout(jid, about)
+			})
+		}
+
+		// Also query full profile picture
+		pic, unchanged, err := a.mgr.ProfilePicture(ctx, acct, jid, "", true)
+		if err == nil && !unchanged && pic.URL != "" {
+			data, err := a.mgr.FetchPicture(ctx, pic.URL)
+			if err == nil && len(data) > 0 {
+				img, _, err := image.Decode(bytes.NewReader(data))
+				if err == nil {
+					a.mw.Synchronize(func() {
+						if gen == a.infoGen && a.showingInfo && a.v.open.jid == jid {
+							a.info.SetPicture(jid, img)
+						}
+					})
+				}
+			}
+		}
+	}()
+}

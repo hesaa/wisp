@@ -43,6 +43,7 @@ type Backend interface {
 	DownloadMedia(ctx context.Context, msg store.Message) (string, error)
 	ProfilePicture(ctx context.Context, accountID, jid, knownID string, full bool) (whatsapp.Picture, bool, error)
 	FetchPicture(ctx context.Context, rawURL string) ([]byte, error)
+	About(ctx context.Context, accountID, jid string) (string, error)
 	GroupDetails(ctx context.Context, accountID, jid string) (whatsapp.GroupDetails, error)
 	SetProxy(addr string) error
 	Close() error
@@ -83,6 +84,7 @@ type App struct {
 	chat  *ui.ChatView
 	bar   *ui.InputBar
 	media *ui.MediaView
+	info  *ui.InfoView
 	tray  *notify.Tray
 
 	avatars *ui.Avatars
@@ -105,8 +107,10 @@ type App struct {
 	resetting  bool // Reset Wisp's confirmation, logout and exit are under way: the lock leaves its dialog be
 	didReset   bool // the run ends through Reset Wisp
 	hiding     bool // closed to the tray and not restored since
-	minimized  bool // as sizeChanged last saw the window
-	viewing    bool // the media view replaces the chat and the input bar
+	minimized   bool // as sizeChanged last saw the window
+	viewing     bool // the media view replaces the chat and the input bar
+	showingInfo bool // the details view replaces the chat and the input bar
+	infoGen     int
 }
 
 // New builds the main window, themed by the settings in db; nothing connects until Attach.
@@ -264,7 +268,10 @@ func (a *App) build() error {
 	if a.media, err = ui.NewMediaView(right, p); err != nil {
 		return err
 	}
-	if err := errors.Join(rl.SetStretchFactor(a.empty, 1000), rl.SetStretchFactor(a.chat, 1000), rl.SetStretchFactor(a.media, 1000)); err != nil {
+	if a.info, err = ui.NewInfoView(right, p); err != nil {
+		return err
+	}
+	if err := errors.Join(rl.SetStretchFactor(a.empty, 1000), rl.SetStretchFactor(a.chat, 1000), rl.SetStretchFactor(a.media, 1000), rl.SetStretchFactor(a.info, 1000)); err != nil {
 		return err
 	}
 	if a.link, err = ui.NewLinkPage(mw, p, func(ctx context.Context) (<-chan whatsmeow.QRChannelItem, error) { return a.mgr.Pair(ctx) }); err != nil {
@@ -297,6 +304,12 @@ func (a *App) build() error {
 	a.media.OnClose(a.closeMedia)
 	a.media.OnNeedMedia(a.needMedia)
 	a.media.OnOpenWith(a.openFile)
+	a.info.OnClose(a.closeInfo)
+	a.info.OnRetry(a.loadInfo)
+	a.info.OnOpenChat(func(jid string) {
+		a.openChat(a.v.active, jid, "")
+	})
+	a.chat.OnOpenInfo(a.openInfo)
 	a.bar.OnSend(a.send)
 	a.bar.OnTyping(a.typing)
 	a.bar.OnAttach(a.attach)
@@ -537,7 +550,7 @@ func (a *App) nav(n ui.Nav) {
 func (a *App) applyTheme(mode theme.ThemeMode) {
 	a.pal = theme.GetPalette(mode)
 	logErr("theme", errors.Join(a.rail.SetPalette(a.pal), a.side.SetPalette(a.pal), a.chat.SetPalette(a.pal),
-		a.bar.SetPalette(a.pal), a.empty.SetPalette(a.pal), a.link.SetPalette(a.pal), a.media.SetPalette(a.pal), a.lockPage.SetPalette(a.pal)))
+		a.bar.SetPalette(a.pal), a.empty.SetPalette(a.pal), a.link.SetPalette(a.pal), a.media.SetPalette(a.pal), a.info.SetPalette(a.pal), a.lockPage.SetPalette(a.pal)))
 	logErr("title bar", theme.ApplyTitleBar(uintptr(a.mw.Handle()), theme.Resolve(mode) == theme.ThemeDark))
 }
 
@@ -580,6 +593,7 @@ func (a *App) showPage() {
 	pg := pageFor(n, a.loaded, a.locked, a.adding)
 	if !mediaStays(pg, a.mw.Visible(), win.IsIconic(a.mw.Handle())) {
 		a.closeMedia() // to the tray, minimised, linking: nothing plays unseen
+		a.closeInfo()
 	}
 	chats := pg == pageChats
 	a.rail.SetVisible(chats)
@@ -622,6 +636,7 @@ func (a *App) lockNow() {
 	}
 	a.mw.Synchronize(a.focusPage) // once they are gone
 	a.closeMedia()
+	a.closeInfo()
 	a.lockPage.Clear()
 	a.showPage()
 	a.presence.appLock(true)

@@ -89,6 +89,11 @@ type ChatView struct {
 	onLoadPrevious func()
 	onNeedMedia    func(store.Message)
 	onOpenMedia    func(store.Message)
+	onOpenInfo     func()
+}
+
+func (v *ChatView) OnOpenInfo(fn func()) {
+	v.onOpenInfo = fn
 }
 
 // chatModel is the open chat's messages and paging state, kept apart from the window so its rules
@@ -219,9 +224,14 @@ func (v *ChatView) build() error {
 	}
 	cw := v.canvas
 	if err := errors.Join(v.header.SetMinMaxSize(walk.Size{Height: chatHeaderH}, walk.Size{Height: chatHeaderH}),
-		fillRest(v.Composite, cw), focusable(cw, walk.AccRoleList, "Messages", v.key)); err != nil {
+		fillRest(v.Composite, cw), focusable(v.header, walk.AccRolePushbutton, "Chat details", v.headerKey), focusable(cw, walk.AccRoleList, "Messages", v.key)); err != nil {
 		return err
 	}
+	v.header.MouseDown().Attach(func(x, y int, button walk.MouseButton) {
+		if button == walk.LeftButton && v.onOpenInfo != nil && v.chat != "" {
+			v.onOpenInfo()
+		}
+	})
 	cw.MouseDown().Attach(v.mouseDown)
 	cw.MouseMove().Attach(v.mouseMove)
 	cw.MouseUp().Attach(func(_, _ int, b walk.MouseButton) {
@@ -1058,6 +1068,16 @@ func (v *ChatView) activate(m store.Message, open bool) {
 // never was, or its file is gone (Clear Cache, or deleted by hand).
 func needsDownload(m store.Message) bool { return m.MediaPath == "" || media.Missing(m.MediaPath) }
 
+func (v *ChatView) headerKey(k walk.Key) bool {
+	if k == walk.KeyReturn || k == walk.KeySpace {
+		if v.onOpenInfo != nil && v.chat != "" {
+			v.onOpenInfo()
+			return true
+		}
+	}
+	return false
+}
+
 func (v *ChatView) paintHeader(c *walk.Canvas, _ walk.Rectangle) error {
 	dpi, b, p := v.header.DPI(), v.header.ClientBoundsPixels(), v.pal
 	s := scaler(dpi)
@@ -1067,6 +1087,10 @@ func (v *ChatView) paintHeader(c *walk.Canvas, _ walk.Rectangle) error {
 	}
 	if err := c.FillRectanglePixels(bg, b); err != nil || v.chat == "" {
 		return err
+	}
+	var errs []error
+	if focusCues(v.header) {
+		errs = append(errs, focusRect(c, b, s(2), p.Accent))
 	}
 	av := walk.Rectangle{X: s(16), Y: (b.Height - s(40)) / 2, Width: s(40), Height: s(40)}
 	x := av.X + av.Width + s(14)
@@ -1086,11 +1110,12 @@ func (v *ChatView) paintHeader(c *walk.Canvas, _ walk.Rectangle) error {
 	if sub != "" {
 		name.Y, name.Height = b.Height/2-s(22), s(24)
 	}
-	return errors.Join(
+	errs = append(errs,
 		drawAvatar(c, dpi, av, v.name, v.chat, 13),
 		drawText(c, dpi, v.title(), 12, 0, theme.Color(p.Text), name, leftText),
 		drawText(c, dpi, sub, 9, 0, theme.Color(p.TextSecondary), walk.Rectangle{X: x, Y: b.Height / 2, Width: name.Width, Height: s(20)}, leftText),
 	)
+	return errors.Join(errs...)
 }
 
 func (v *ChatView) paint(c *walk.Canvas, ub walk.Rectangle) error {
