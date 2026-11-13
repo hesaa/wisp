@@ -535,15 +535,28 @@ func drawBadge(c *walk.Canvas, dpi, right, top, h int, label string, fill, text 
 }
 
 // drawText draws non-empty text in Segoe UI at pt points for a widget at dpi (DrawTextEx reports an
-// empty string as a failure). walk sizes fonts by the canvas DPI, and its buffered canvas is a memory
+// empty string as a failure); text with emoji goes through drawColorText. walk sizes fonts by the canvas DPI, and its buffered canvas is a memory
 // DC that reports the system DPI, not the window's: pt is rescaled so text matches the layout, which
 // uses the window DPI. walk caches each resulting size.
 func drawText(c *walk.Canvas, dpi int, text string, pt int, style walk.FontStyle, color walk.Color, r walk.Rectangle, format walk.DrawTextFormat) error {
 	if text == "" || r.Width <= 0 || r.Height <= 0 {
 		return nil
 	}
+	if hasEmoji(text) { // GDI draws emoji as outlines: DirectWrite draws them in colour
+		cdpi := c.DPI()
+		err := drawColorText(c.HDC(), text, float32(max(1, (pt*dpi+cdpi/2)/cdpi)*cdpi)/72, style, color, r, format)
+		if err == nil {
+			return nil
+		}
+		if !colourFailed { // once: every emoji drawn would say the same
+			colourFailed = true
+			logErr("colour emoji, drawn as outlines instead", err)
+		}
+	}
 	return c.DrawTextPixels(text, textFont(pt, style, dpi, c.DPI()), color, r, format)
 }
+
+var colourFailed bool // drawColorText failed once and was reported
 
 // textFont is the font drawText uses for pt points in a widget at dpi on a canvas that reports cdpi.
 func textFont(pt int, style walk.FontStyle, dpi, cdpi int) *walk.Font {
