@@ -7,6 +7,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/lxn/walk"
+
+	"wa-go/internal/store"
 )
 
 func TestEnterSendsShiftEnterBreaksTheLine(t *testing.T) {
@@ -233,5 +235,110 @@ func TestRestorePutsAFailedMessageBackOnlyIntoABlankBox(t *testing.T) {
 	box.SetText("new draft")
 	if c.restore("hello") || box.Text() != "new draft" {
 		t.Fatalf("a new draft was replaced: %q", box.Text())
+	}
+}
+
+func TestInputBarReplyBannerState(t *testing.T) {
+	c := &composer{box: &fakeBox{}}
+	if _, ok := c.replyTarget(); ok {
+		t.Fatal("a fresh composer has a reply target")
+	}
+	c.setReply(store.Message{ID: "m1", Body: "hello"}, "Alice")
+	if m, ok := c.replyTarget(); !ok || m.ID != "m1" || c.replyAuthor != "Alice" {
+		t.Fatalf("reply target = %+v %v, author %q", m, ok, c.replyAuthor)
+	}
+	c.clearReply()
+	if _, ok := c.replyTarget(); ok || c.replyAuthor != "" {
+		t.Fatal("ClearReply left the target")
+	}
+}
+
+var testMembers = []GroupMember{
+	{JID: "111@lid", Name: "Budi Santoso", Phone: "62811"},
+	{JID: "62822@s.whatsapp.net", Name: "Puteri", Push: "putri99", Phone: "62822"},
+	{JID: "62833@s.whatsapp.net", Name: "62833", Phone: "62833"},
+}
+
+func names(ms []GroupMember) []string {
+	var out []string
+	for _, m := range ms {
+		out = append(out, m.Name)
+	}
+	return out
+}
+
+func TestMentionAutocompleteFiltering(t *testing.T) {
+	for q, want := range map[string][]string{
+		"P":     {"all", "Puteri"},
+		"z":     {"all"},
+		"":      {"all", "Budi Santoso", "Puteri", "62833"},
+		"SANT":  {"all", "Budi Santoso"},
+		"putri": {"all", "Puteri"},                // push name
+		"6281":  {"all", "Budi Santoso"},          // phone digits
+		"+6283": {"all", "62833"},
+	} {
+		if got := names(filterMentions(testMembers, q)); !slices.Equal(got, want) {
+			t.Errorf("filter %q = %v, want %v", q, got, want)
+		}
+	}
+	for before, want := range map[string]string{"@": "", "hi @Pu": "Pu", "line\r\n@x": "x"} {
+		if q, ok := mentionQuery(before); !ok || q != want {
+			t.Errorf("mentionQuery(%q) = %q %v, want %q", before, q, ok, want)
+		}
+	}
+	for _, before := range []string{"", "hello", "mail me@x", "@Pu teri", "@all "} {
+		if q, ok := mentionQuery(before); ok {
+			t.Errorf("mentionQuery(%q) = %q: no mention is being typed", before, q)
+		}
+	}
+}
+
+func TestMentionPickerKeysAndCompletion(t *testing.T) {
+	p := mentionPicker{}
+	if p.refresh("@"); len(p.items) != 0 {
+		t.Fatal("the list opened outside a group")
+	}
+	p.members = testMembers
+	p.refresh("hi @")
+	if len(p.items) != 4 || p.sel != 0 {
+		t.Fatalf("items %v sel %d, want everyone with @all selected", names(p.items), p.sel)
+	}
+	p.move(-1)
+	p.move(1)
+	p.move(1)
+	p.move(9)
+	if p.sel != 3 {
+		t.Fatalf("sel = %d, want clamped to the last row", p.sel)
+	}
+	// typing a name selects its first match, not @all, so Enter completes what was typed
+	p.refresh("hi @Pu")
+	if p.sel != 1 {
+		t.Fatalf("sel = %d, want the first member match", p.sel)
+	}
+	text, caret := p.complete("hi @Pu", " there")
+	if text != "hi @Puteri  there" || caret != len("hi @Puteri ") || len(p.items) != 0 {
+		t.Fatalf("complete = %q caret %d, list %v", text, caret, names(p.items))
+	}
+	// the caret counts UTF-16 units, as the edit control does
+	p.refresh("😀 @al")
+	if text, caret = p.complete("😀 @al", ""); text != "😀 @all " || caret != 8 {
+		t.Fatalf("complete = %q caret %d", text, caret)
+	}
+	p.refresh("@z")
+	if p.close(); len(p.items) != 0 {
+		t.Fatal("close left the list open")
+	}
+}
+
+func TestWireMentionsReplaceNamesWithNumbers(t *testing.T) {
+	text, jids := wireMentions("@Budi Santoso and @Puteri, not mail@Puteri or @Puterium; @all @Puteri", testMembers)
+	if want := "@111 and @62822, not mail@Puteri or @Puterium; @all @62822"; text != want {
+		t.Fatalf("wire text = %q, want %q", text, want)
+	}
+	if !slices.Equal(jids, []string{"111@lid", "62822@s.whatsapp.net"}) {
+		t.Fatalf("mentioned = %v", jids)
+	}
+	if text, jids = wireMentions("plain @all", nil); text != "plain @all" || len(jids) != 0 {
+		t.Fatalf("no members: %q %v", text, jids)
 	}
 }
