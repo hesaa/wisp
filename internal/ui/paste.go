@@ -36,6 +36,7 @@ type attachItem struct {
 	path, name string
 	size       int64
 	blocked    string // why it cannot be sent; "": it can
+	caption    string // typed in the preview
 	temp       bool   // a pasted picture saved by us: removed once sent or declined
 }
 
@@ -66,26 +67,18 @@ func newAttachItem(path string, temp bool) attachItem {
 	return it
 }
 
-// sendablePaths are the items that can be sent, in order.
-func sendablePaths(items []attachItem) []string {
-	var out []string
+// Attachment is a file to send and the caption to send it with.
+type Attachment struct{ Path, Caption string }
+
+// sendable are the items that can be sent, in order.
+func sendable(items []attachItem) []Attachment {
+	var out []Attachment
 	for _, it := range items {
 		if it.blocked == "" {
-			out = append(out, it.path)
+			out = append(out, Attachment{Path: it.path, Caption: it.caption})
 		}
 	}
 	return out
-}
-
-// attachTitle heads the preview of ok sendable and blocked unsendable files.
-func attachTitle(ok, blocked int) string {
-	switch ok {
-	case 0:
-		return "Nothing to send"
-	case 1:
-		return "Send 1 file"
-	}
-	return fmt.Sprintf("Send %d files", ok)
 }
 
 // clipboardItems are the files on the clipboard, or its picture saved as a PNG; none when it holds
@@ -172,7 +165,7 @@ func (b *InputBar) pasteMedia() bool {
 
 // offer shows items in the preview and, confirmed, hands the sendable ones to OnAttach.
 func (b *InputBar) offer(items []attachItem) {
-	send, err := previewAttachments(b.Form(), b.pal, items)
+	items, send, err := previewAttachments(b.Form(), b.pal, items)
 	logErr("attachment preview", err)
 	done := func() {
 		for _, it := range items {
@@ -181,8 +174,8 @@ func (b *InputBar) offer(items []attachItem) {
 			}
 		}
 	}
-	if paths := sendablePaths(items); send && len(paths) > 0 && b.onAttach != nil {
-		b.onAttach(paths, done)
+	if files := sendable(items); send && len(files) > 0 && b.onAttach != nil {
+		b.onAttach(files, done)
 	} else {
 		done()
 	}

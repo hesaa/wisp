@@ -35,15 +35,10 @@ func TestAttachCheckBlocksWhatCannotBeSent(t *testing.T) {
 	}
 }
 
-func TestSendablePathsKeepOrderAndLeaveBlockedOut(t *testing.T) {
-	items := []attachItem{{path: "a.jpg"}, {path: "b.exe", blocked: "x"}, {path: "c.pdf"}}
-	if got := sendablePaths(items); !slices.Equal(got, []string{"a.jpg", "c.pdf"}) {
-		t.Fatalf("sendablePaths = %v", got)
-	}
-	for n, want := range map[[2]int]string{{1, 0}: "Send 1 file", {3, 0}: "Send 3 files", {2, 1}: "Send 2 files", {0, 2}: "Nothing to send"} {
-		if got := attachTitle(n[0], n[1]); got != want {
-			t.Errorf("attachTitle(%d, %d) = %q, want %q", n[0], n[1], got, want)
-		}
+func TestSendableKeepsOrderAndCaptionsAndLeavesBlockedOut(t *testing.T) {
+	items := []attachItem{{path: "a.jpg", caption: "hi"}, {path: "b.exe", blocked: "x"}, {path: "c.pdf"}}
+	if got := sendable(items); !slices.Equal(got, []Attachment{{"a.jpg", "hi"}, {"c.pdf", ""}}) {
+		t.Fatalf("sendable = %v", got)
 	}
 }
 

@@ -55,7 +55,7 @@ type InputBar struct {
 	popup                       *walk.Dialog                                       // the open popup, nil for none
 	after                       func(d time.Duration, f func()) (stop func() bool) // one-shot timer; f runs on the UI thread
 	onSendGIF                   func(mp4URL string)
-	onAttach                    func(paths []string, done func())
+	onAttach                    func(files []Attachment, done func())
 }
 
 // NewInputBar creates the bar in parent. gifKey returns the user's GIPHY API key ("" when none is
@@ -154,7 +154,7 @@ func (b *InputBar) OnSendGIF(fn func(mp4URL string)) { b.onSendGIF = fn }
 
 // OnAttach sets the handler of files to send, in order: picked with the Attach button or pasted
 // into the box, and confirmed in the preview. It calls done once they are sent or given up on.
-func (b *InputBar) OnAttach(fn func(paths []string, done func())) { b.onAttach = fn }
+func (b *InputBar) OnAttach(fn func(files []Attachment, done func())) { b.onAttach = fn }
 
 // Reset empties the box for another chat and drops its pending reply and mention list. Call it
 // before switching: it may fire OnTyping(false) for the chat being left.
