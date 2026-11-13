@@ -57,9 +57,9 @@ func filterMentions(members []GroupMember, query string) []GroupMember {
 
 // mentionPicker is the mention list's state.
 type mentionPicker struct {
-	members []GroupMember // the open group's, sorted by name; none outside groups
-	items   []GroupMember // the rows listed now; none: the list is closed
-	sel     int           // the highlighted row
+	members []GroupMember     // the open group's, sorted by name; none outside groups
+	items   []GroupMember     // the rows listed now; none: the list is closed
+	sel     int               // the highlighted row
 	picked  map[string]string // name to JID of the rows picked for this draft: namesakes are told apart
 }
 
