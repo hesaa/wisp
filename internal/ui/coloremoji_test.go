@@ -127,3 +127,17 @@ func TestTypingBoxEmojiArePaintedOverInColour(t *testing.T) {
 		t.Fatalf("%d vivid pixels in columns %d..%d, want the emoji at %d", n, lo, hi, at)
 	}
 }
+
+// A symbol the text font has a plain glyph of its own for must still come from the emoji font.
+func TestHeartIsDrawnRed(t *testing.T) {
+	px := renderText(t, "\u2665\ufe0f", 64, 64)
+	red := 0
+	for i := 0; i < len(px); i += 4 {
+		if px[i+2] > 180 && px[i+1] < 90 && px[i] < 100 {
+			red++
+		}
+	}
+	if red < 100 {
+		t.Fatalf("%d red pixels: the heart was drawn as a plain glyph", red)
+	}
+}

@@ -52,13 +52,15 @@ const (
 
 	d2dFactoryCreateDCRenderTarget = 16
 	rtCreateSolidColorBrush        = 8
-	rtDrawText                     = 27
+	rtDrawTextLayout               = 28
 	rtBeginDraw                    = 48
 	rtEndDraw                      = 49
 	rtBindDC                       = 57
 
 	dwFactoryCreateTextFormat   = 15
+	dwFactoryCreateTextLayout   = 18
 	dwFactoryCreateEllipsisSign = 20
+	layoutSetFontFamilyName     = 31
 	fmtSetTextAlignment         = 3
 	fmtSetParagraphAlignment    = 4
 	fmtSetWordWrapping          = 5
@@ -68,6 +70,10 @@ const (
 )
 
 // com calls method slot of COM object obj and turns a failed HRESULT into an error.
+// The directive makes pointers converted to uintptr in a call's arguments escape to the heap and stay
+// alive for the call: a stack-allocated out-parameter would otherwise go stale if the stack moved.
+//
+//go:uintptrescapes
 func com(obj unsafe.Pointer, slot int, args ...uintptr) error {
 	vt := *(**[64]uintptr)(obj)
 	hr, _, _ := syscall.SyscallN(vt[slot], append([]uintptr{uintptr(obj)}, args...)...)
@@ -209,21 +215,39 @@ func drawColorText(hdc win.HDC, text string, px float32, style walk.FontStyle, c
 		return err
 	}
 	defer com(brush, comRelease)
-	units, err := syscall.UTF16FromString(text)
-	if err != nil {
+	units := utf16.Encode([]rune(text))
+	if len(units) == 0 {
+		return nil
+	}
+	// A layout, so that every emoji can be given the emoji font. Left to font fallback, a symbol the
+	// text font has a plain glyph of its own for (♥, ☺) is drawn with that one. Sizes are floats
+	// passed on the stack: their bits go in as they are.
+	var tl unsafe.Pointer
+	if err := com(colour.dw, dwFactoryCreateTextLayout, uintptr(unsafe.Pointer(&units[0])), uintptr(len(units)), uintptr(tf),
+		uintptr(math.Float32bits(float32(r.Width))), uintptr(math.Float32bits(float32(r.Height))), uintptr(unsafe.Pointer(&tl))); err != nil {
 		return err
 	}
-	layout := [4]float32{float32(int32(r.X) - left), float32(int32(r.Y) - top), float32(int32(r.X+r.Width) - left), float32(int32(r.Y+r.Height) - top)}
+	defer com(tl, comRelease)
+	for i := 0; i < len(units); {
+		_, k := cluster(units, i)
+		if hasEmoji(string(utf16.Decode(units[i : i+k]))) {
+			// the range {start, length} is an 8-byte struct passed by value: one register
+			if err := com(tl, layoutSetFontFamilyName, uintptr(unsafe.Pointer(emojiFamily)), uintptr(i)|uintptr(k)<<32); err != nil {
+				return err
+			}
+		}
+		i += k
+	}
+	// the origin {x, y} is two floats passed by value: one register too
+	origin := uintptr(math.Float32bits(float32(int32(r.X)-left))) | uintptr(math.Float32bits(float32(int32(r.Y)-top)))<<32
 	const clipToRect, colourFont = 2, 4
 	vt := *(**[64]uintptr)(rt)
-	syscall.SyscallN(vt[rtBeginDraw], uintptr(rt)) // BeginDraw and DrawText return nothing: EndDraw reports
-	syscall.SyscallN(vt[rtDrawText], uintptr(rt), uintptr(unsafe.Pointer(&units[0])), uintptr(len(units)-1),
-		uintptr(tf), uintptr(unsafe.Pointer(&layout)), uintptr(brush), clipToRect|colourFont, 0)
+	syscall.SyscallN(vt[rtBeginDraw], uintptr(rt)) // BeginDraw and DrawTextLayout return nothing: EndDraw reports
+	syscall.SyscallN(vt[rtDrawTextLayout], uintptr(rt), origin, uintptr(tl), uintptr(brush), clipToRect|colourFont)
 	hr, _, _ := syscall.SyscallN(vt[rtEndDraw], uintptr(rt), 0, 0)
 	runtime.KeepAlive(&bound)
 	runtime.KeepAlive(&rgba)
 	runtime.KeepAlive(units)
-	runtime.KeepAlive(&layout)
 	if uint32(hr) == d2dRecreateTarget { // the display device changed: make a new target next time
 		com(rt, comRelease)
 		colour.rt = nil
@@ -259,9 +283,9 @@ func paintEmojiOver(h win.HWND, hdc win.HDC, bg, fg walk.Color) error {
 	units = units[:win.SendMessage(h, win.WM_GETTEXT, uintptr(n+1), uintptr(unsafe.Pointer(&units[0])))]
 	px, lh := float32(max(lf.LfHeight, -lf.LfHeight)), lineHeight(h)
 	var area win.RECT
-	win.SendMessage(h, win.EM_GETRECT, 0, uintptr(unsafe.Pointer(&area)))
+	sendPtr(h, win.EM_GETRECT, 0, uintptr(unsafe.Pointer(&area)))
 	var selA, selB uint32
-	win.SendMessage(h, win.EM_GETSEL, uintptr(unsafe.Pointer(&selA)), uintptr(unsafe.Pointer(&selB)))
+	sendPtr(h, win.EM_GETSEL, uintptr(unsafe.Pointer(&selA)), uintptr(unsafe.Pointer(&selB)))
 	if win.GetFocus() != h {
 		selA, selB = 0, 0 // the selection shows only while the control has the focus
 	}
@@ -319,4 +343,14 @@ func (b *InputBar) overEmoji() {
 		colourFailed = true
 		logErr("colour emoji in the message box, left as outlines", err)
 	}
+}
+
+// emojiFamily is the font every emoji is drawn with.
+var emojiFamily = syscall.StringToUTF16Ptr("Segoe UI Emoji")
+
+// sendPtr is SendMessage for messages that carry pointers (see com on the directive).
+//
+//go:uintptrescapes
+func sendPtr(h win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
+	return win.SendMessage(h, msg, wParam, lParam)
 }
