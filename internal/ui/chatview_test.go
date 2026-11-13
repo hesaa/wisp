@@ -852,3 +852,57 @@ func TestGroupRunsGetOneAvatar(t *testing.T) {
 		}
 	}
 }
+
+func TestBubbleLayoutWithQuote(t *testing.T) {
+	plain := store.Message{ID: "p", Type: "text", Body: "ok", SenderJID: alice}
+	reply := plain
+	reply.ID, reply.AccountID = "r", "628999"
+	reply.QuotedID, reply.QuotedSender, reply.QuotedBody, reply.QuotedType = "q1", bob, "a rather long original message\nsecond line", "text"
+	l := layOut(t, false, plain, reply)
+	p, r := l.cache["p"], l.cache["r"]
+	if p.quotedBox.Width != 0 || p.quotedSender != "" {
+		t.Fatalf("plain message has a quote: %+v", p)
+	}
+	if r.box.Height <= p.box.Height || r.quotedBox.Width == 0 || !inside(r.quotedBox, r.box) || !below(r.text, r.quotedBox) {
+		t.Fatalf("quote %+v in box %+v (plain %+v), text %+v", r.quotedBox, r.box, p.box, r.text)
+	}
+	if r.quotedSender != "+6284444444444" || r.quotedSnippet != "a rather long original message second line" {
+		t.Fatalf("quote labels %q, %q", r.quotedSender, r.quotedSnippet)
+	}
+
+	// our own message is quoted as "You", media without a caption by its kind, above the picture
+	img := store.Message{ID: "i", AccountID: "628999", Type: "image", SenderJID: alice,
+		QuotedID: "q2", QuotedSender: "628999@s.whatsapp.net", QuotedType: "image"}
+	b := layOut(t, false, img).cache["i"]
+	if b.quotedSender != "You" || b.quotedSnippet != "Photo" || !below(b.thumb, b.quotedBox) || !inside(b.quotedBox, b.box) {
+		t.Fatalf("image reply: %q %q quote %+v thumb %+v", b.quotedSender, b.quotedSnippet, b.quotedBox, b.thumb)
+	}
+}
+
+func TestHitTestQuotedBox(t *testing.T) {
+	m := store.Message{ID: "r", Type: "text", Body: "ok", SenderJID: alice, QuotedID: "q1", QuotedSender: bob, QuotedBody: "orig"}
+	b := layOut(t, false, m).cache["r"]
+	q := b.quotedBox
+	if !in(q, q.X+1, q.Y+1) || in(q, b.text.X+1, b.text.Y+1) || in(q, q.X-1, q.Y+1) {
+		t.Fatalf("quote box %+v hit-test wrong (text %+v)", q, b.text)
+	}
+}
+
+func TestJumpToMessageLocatesIndex(t *testing.T) {
+	var m chatModel
+	m.open("a", "c", page("c", "m", 1000, store.PageSize)) // a full page: older ones may exist
+	if i, more := m.jumpStep("m3"); i != m.index("m3") || i < 0 || more {
+		t.Fatalf("loaded message: index %d more %v", i, more)
+	}
+	if i, more := m.jumpStep("old"); i != -1 || !more {
+		t.Fatalf("message above the loaded window: index %d more %v, want -1 and more to load", i, more)
+	}
+	m.noMore("a", "c")
+	if i, more := m.jumpStep("old"); i != -1 || more {
+		t.Fatalf("history exhausted: index %d more %v", i, more)
+	}
+	// the target ends up centred in the view
+	if off := centerOn(1000, 40, 600); off != 720 {
+		t.Fatalf("centerOn = %d, want 720", off)
+	}
+}

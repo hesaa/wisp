@@ -36,6 +36,11 @@ const (
 	runGap       = 2 // between messages of one sender in a row
 	newRunGap    = 8 // between runs
 	listPad      = 8 // above the first message and below the last
+	quoteH       = 38 // quoted-message card of a reply: author over one line of the original
+	quoteGap     = 4  // under the card
+	quotePadL    = 10 // card text from the card's left edge, past the 3 px accent bar
+	quotePadR    = 8
+	quoteMaxLen  = 120 // runes of the original kept for the card's line
 
 	bodyPt, namePt, metaPt = 10, 9, 8
 )
@@ -244,6 +249,9 @@ type bubble struct {
 	card     walk.Rectangle // media card
 	time     walk.Rectangle
 	ticks    walk.Rectangle // outgoing only
+	// a reply's card of the message it answers, above everything but the sender's name
+	quotedBox                   walk.Rectangle
+	quotedSender, quotedSnippet string
 }
 
 // cardParts splits a media card into its type icon, title, size line and download button.
@@ -282,6 +290,21 @@ func (l *chatLayout) sender(jid string) string {
 		name = l.senderName(jid)
 	}
 	return l.dir.Name(jid, name)
+}
+
+var quotedKinds = map[string]string{"image": "Photo", "video": "Video", "audio": "Audio", "document": "Document", "sticker": "Sticker"}
+
+// quoteLabels are the author and the one-line excerpt on reply m's card of the message it answers.
+func (l *chatLayout) quoteLabels(m *store.Message) (sender, snippet string) {
+	sender = "You"
+	if user, _, _ := strings.Cut(m.QuotedSender, "@"); m.AccountID == "" || user != m.AccountID {
+		sender = l.sender(m.QuotedSender)
+	}
+	snippet = strings.Join(strings.Fields(m.QuotedBody), " ")
+	if r := []rune(snippet); len(r) > quoteMaxLen {
+		snippet = string(r[:quoteMaxLen]) + "…"
+	}
+	return sender, cmp.Or(snippet, quotedKinds[m.QuotedType], "Message")
 }
 
 // update lays msgs (oldest first) out top to bottom for a view width pixels wide at dpi,
@@ -351,8 +374,18 @@ func (l *chatLayout) layout(m *store.Message, named bool, ms measurer) bubble {
 		b.name = walk.Rectangle{X: padX, Y: y, Height: s(nameH)}
 		y += s(nameH)
 	}
+	quoteW := 0
+	if m.QuotedID != "" {
+		b.quotedSender, b.quotedSnippet = l.quoteLabels(m)
+		pad := s(quotePadL + quotePadR)
+		sw, _ := ms.measure(b.quotedSender, namePt, walk.FontBold, 1<<20)
+		tw, _ := ms.measure(b.quotedSnippet, namePt, 0, 1<<20)
+		quoteW = min(max(sw, tw), maxW-2*padX-pad) + pad
+		b.quotedBox = walk.Rectangle{X: padX, Y: y, Height: s(quoteH)}
+		y += s(quoteH + quoteGap)
+	}
 	if b.kind != kindText {
-		if !named {
+		if !named && m.QuotedID == "" {
 			y = s(bubbleInset)
 		}
 		media := walk.Rectangle{X: s(bubbleInset), Y: y}
@@ -391,6 +424,12 @@ func (l *chatLayout) layout(m *store.Message, named bool, ms measurer) bubble {
 	}
 	y += s(bubblePadY)
 	boxW = max(boxW, nameW+2*padX, metaW+2*padX)
+	if m.QuotedID != "" {
+		if b.kind == kindText { // media keeps its width: the card's line is cut short instead
+			boxW = max(boxW, quoteW+2*padX)
+		}
+		b.quotedBox.Width = boxW - 2*padX
+	}
 	if named {
 		b.name.Width = min(nameW, boxW-2*padX)
 	}
@@ -409,7 +448,7 @@ func (l *chatLayout) layout(m *store.Message, named bool, ms measurer) bubble {
 	if m.FromMe {
 		b.box.X = l.width - s(bubbleEdge) - boxW
 	}
-	for _, r := range []*walk.Rectangle{&b.name, &b.text, &b.thumb, &b.card, &b.time, &b.ticks} {
+	for _, r := range []*walk.Rectangle{&b.name, &b.text, &b.thumb, &b.card, &b.time, &b.ticks, &b.quotedBox} {
 		if r.Width > 0 {
 			r.X += b.box.X
 		}

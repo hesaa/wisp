@@ -85,11 +85,16 @@ type ChatView struct {
 	picked      map[string]bool // messages picked for copying (Ctrl+click, Shift+click, Shift+Up/Down)
 	notice      string          // shown in the header for a while instead of the number
 	noticeGen   int             // bumped per notice: only the latest one's timer clears it
+	glow        string          // message briefly highlighted after a jump to it
+	glowGen     int             // bumped per glow: only the latest one's timer clears it
+	jumping     string          // quoted message a jump is paging back to; "" for none
 
 	onLoadPrevious func()
 	onNeedMedia    func(store.Message)
 	onOpenMedia    func(store.Message)
 	onOpenInfo     func()
+	onReply        func(store.Message)
+	hasMessage     func(id string) bool
 }
 
 func (v *ChatView) OnOpenInfo(fn func()) {
@@ -140,6 +145,18 @@ func (m *chatModel) prepend(accountID, chatJID string, page []store.Message) int
 	m.msgs = append(older, m.msgs...)
 	return len(older)
 }
+
+// jumpStep says how a jump to message id goes on: i is its index once loaded (-1 before), more
+// whether older pages remain to look in.
+func (m *chatModel) jumpStep(id string) (i int, more bool) {
+	if i = m.index(id); i >= 0 {
+		return i, false
+	}
+	return -1, !m.exhausted
+}
+
+// centerOn is the scroll offset that centres something h high at top in a view.
+func centerOn(top, h, view int) int { return top + h/2 - view/2 }
 
 // noMore answers a request for an older page of a chat that has none.
 func (m *chatModel) noMore(accountID, chatJID string) {
@@ -276,6 +293,75 @@ func (v *ChatView) OnNeedMedia(fn func(store.Message)) { v.onNeedMedia = fn }
 // the media view, or opens its file, or asks for the download first.
 func (v *ChatView) OnOpenMedia(fn func(store.Message)) { v.onOpenMedia = fn }
 
+// OnReply sets the handler of a reply started on a message: Ctrl+R on the focused one, Reply in
+// the context menu, or a double-click on a text bubble beside its text.
+func (v *ChatView) OnReply(fn func(store.Message)) { v.onReply = fn }
+
+// OnHasMessage sets the lookup of whether the open chat has message id stored, loaded or not: a click
+// on a reply's quote pages back to an unloaded original only when it has.
+func (v *ChatView) OnHasMessage(fn func(id string) bool) { v.hasMessage = fn }
+
+func (v *ChatView) triggerReply(m store.Message) {
+	if v.onReply != nil && m.Type != "revoked" && m.Type != "unsupported" {
+		v.onReply(m)
+	}
+}
+
+// replyFocused starts a reply to the focused message.
+func (v *ChatView) replyFocused() {
+	if i := v.focusIndex(); i >= 0 {
+		v.triggerReply(v.msgs[i])
+	}
+}
+
+// jumpToMessage shows message id (the original of a reply) centred and briefly highlighted, loading
+// older pages up to it when it is stored but not loaded.
+func (v *ChatView) jumpToMessage(id string) {
+	if v.index(id) < 0 && (v.hasMessage == nil || !v.hasMessage(id)) {
+		v.flash("Original message isn't available")
+		return
+	}
+	v.jumping = id
+	v.chase()
+}
+
+// chase goes on with a jump: it shows the message once loaded, else asks for the next older page
+// (PrependPage and NoMoreHistory come back here).
+func (v *ChatView) chase() {
+	if v.jumping == "" {
+		return
+	}
+	i, more := v.jumpStep(v.jumping)
+	switch {
+	case i >= 0:
+		v.jumping = ""
+		logErr("chat layout", v.relayout(false))
+		if len(v.lay.tops) != len(v.msgs) {
+			return
+		}
+		id := v.msgs[i].ID
+		v.setFocus(i)
+		v.scroll.scrollTo(centerOn(v.lay.tops[i], v.lay.cache[id].box.Height, v.view))
+		v.glow = id
+		v.glowGen++
+		gen := v.glowGen
+		time.AfterFunc(400*time.Millisecond, func() {
+			v.canvas.Synchronize(func() {
+				if gen == v.glowGen && !v.canvas.IsDisposed() {
+					v.glow = ""
+					logErr("chat repaint", v.canvas.Invalidate())
+				}
+			})
+		})
+	case !more || v.onLoadPrevious == nil:
+		v.jumping = ""
+		v.flash("Original message isn't available")
+	case !v.loading:
+		v.loading = true
+		v.onLoadPrevious()
+	}
+}
+
 // Messages are the loaded messages, oldest first; the caller must not change them.
 func (v *ChatView) Messages() []store.Message { return v.msgs }
 
@@ -298,6 +384,7 @@ func (v *ChatView) SetChat(accountID, chatJID, name string, isGroup bool, firstP
 	v.selA, v.selB, v.dragging = textMark{}, textMark{}, false
 	clear(v.picked)
 	v.pickAnchor = ""
+	v.jumping, v.glow = "", ""
 	logErr("chat layout", v.relayout(false))
 	logErr("chat repaint", errors.Join(v.header.Invalidate(), v.canvas.Invalidate()))
 	v.settle()
@@ -315,11 +402,15 @@ func (v *ChatView) PrependPage(accountID, chatJID string, page []store.Message) 
 		logErr("chat repaint", v.canvas.Invalidate())
 	}
 	v.settle()
+	v.chase()
 }
 
 // NoMoreHistory answers OnLoadPrevious for accountID's chat chatJID when there is nothing older; an
 // answer for a chat that is no longer open is ignored.
-func (v *ChatView) NoMoreHistory(accountID, chatJID string) { v.noMore(accountID, chatJID) }
+func (v *ChatView) NoMoreHistory(accountID, chatJID string) {
+	v.noMore(accountID, chatJID)
+	v.chase()
+}
 
 // Upsert adds a new message of the open chat or replaces a changed one (status, edit, deletion); an
 // empty MediaPath keeps the downloaded one. The view follows new messages only when it was showing
@@ -676,6 +767,9 @@ func (v *ChatView) describe(i int) string {
 		title, sub := cardLabels(m, b.info)
 		text = strings.Join(slices.DeleteFunc([]string{title, sub, text}, func(s string) bool { return s == "" }), ", ")
 	}
+	if b.quotedSender != "" {
+		text = "in reply to " + b.quotedSender + ", " + b.quotedSnippet + ": " + text
+	}
 	item := who + ": " + text + ", " + clock(m.Timestamp)
 	if m.FromMe && m.Status != "" {
 		item += ", " + m.Status
@@ -699,6 +793,9 @@ func (v *ChatView) key(k walk.Key) bool {
 	switch {
 	case k == walk.KeyC && mods == walk.ModControl:
 		return v.copySelection() || v.copyPicked()
+	case k == walk.KeyR && mods == walk.ModControl:
+		v.replyFocused()
+		return true
 	case k == walk.KeyEscape: // only while there is a selection or picks (takeEscape)
 		v.setSel(textMark{}, textMark{})
 		v.setPicks(nil)
@@ -763,6 +860,12 @@ func (v *ChatView) mouseDown(x, y int, b walk.MouseButton) {
 		n = v.clicks + 1
 	}
 	v.lastClickID, v.lastClickAt, v.clicks = m.ID, now, n
+	bub := v.lay.cache[m.ID]
+	if in(bub.quotedBox, x, y-v.screenY(i)) {
+		v.setSel(textMark{}, textMark{})
+		v.jumpToMessage(m.QuotedID)
+		return
+	}
 	// a press on text selects, so a double-click on a caption picks a word and leaves the media be
 	if t := v.lay.cache[m.ID].text; len(v.selText(i)) > 0 && x >= t.X && x < t.X+t.Width && y >= v.screenY(i)+t.Y && y < v.screenY(i)+t.Y+t.Height {
 		v.pressText(x, y, n)
@@ -771,6 +874,10 @@ func (v *ChatView) mouseDown(x, y int, b walk.MouseButton) {
 	v.setSel(textMark{}, textMark{})
 	if n == 2 {
 		v.lastClickID = "" // a third click starts over
+		if bub.kind == kindText { // on its text the double-click picks a word, on media it opens
+			v.triggerReply(m)
+			return
+		}
 	}
 	v.activate(m, clickOpens(m.Type, v.lay.cache[m.ID], x, y-v.screenY(i), n, mods, v.dragging))
 }
@@ -979,6 +1086,7 @@ func (v *ChatView) buildMenu() error {
 		text string
 		do   func()
 	}{
+		{"Reply\tCtrl+R", v.replyFocused},
 		{"Copy\tCtrl+C", func() { _ = v.copySelection() || v.copyPicked() }},
 		{"Select", func() {
 			if i := v.focusIndex(); i >= 0 && !v.picked[v.msgs[i].ID] {
@@ -1157,7 +1265,7 @@ func (v *ChatView) paint(c *walk.Canvas, ub walk.Rectangle) error {
 		if dy+b.box.Height+s(3) <= ub.Y || dy-s(3) >= ub.Y+ub.Height {
 			continue
 		}
-		if v.picked[m.ID] {
+		if v.picked[m.ID] || m.ID == v.glow {
 			if err := v.paintPick(c, b, dy); err != nil {
 				return err
 			}
@@ -1216,6 +1324,19 @@ func (v *ChatView) paintBubble(c *walk.Canvas, m *store.Message, b bubble, dy in
 	}
 	if b.named {
 		errs = append(errs, drawText(c, dpi, v.lay.sender(m.SenderJID), namePt, walk.FontBold, avatarColor(m.SenderJID), at(b.name), leftText))
+	}
+	if b.quotedBox.Width > 0 {
+		q, accent := at(b.quotedBox), theme.Color(p.Accent)
+		line := walk.Rectangle{X: q.X + s(quotePadL), Y: q.Y + s(3), Width: q.Width - s(quotePadL+quotePadR), Height: s(16)}
+		bar, err := brushFor(p.Accent)
+		errs = append(errs, err,
+			icons.FillRoundedARGB(c, q, s(4), 0x26000000|uint32(accent.R())<<16|uint32(accent.G())<<8|uint32(accent.B())))
+		if err == nil {
+			errs = append(errs, c.FillRectanglePixels(bar, walk.Rectangle{X: q.X, Y: q.Y, Width: s(3), Height: q.Height}))
+		}
+		errs = append(errs, drawText(c, dpi, b.quotedSender, namePt, walk.FontBold, accent, line, leftText))
+		line.Y += s(16)
+		errs = append(errs, drawText(c, dpi, b.quotedSnippet, namePt, 0, secondary, line, leftText))
 	}
 	if b.thumb.Width > 0 {
 		r := at(b.thumb)
