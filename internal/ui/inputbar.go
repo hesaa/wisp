@@ -131,7 +131,7 @@ func (b *InputBar) build() error {
 	}
 	b.box = b.edit
 	b.edit.SetFont(font(bodyPt, 0))
-	if err := errors.Join(noBorder(b.edit), fillRest(b.Composite, b.field), fillRest(b.field, b.edit), enterSendsIn(b.edit, b.sendNow, b.boxKey),
+	if err := errors.Join(noBorder(b.edit), fillRest(b.Composite, b.field), fillRest(b.field, b.edit), enterSendsIn(b.edit, b.sendNow, b.boxKey, b.overEmoji),
 		b.edit.Accessibility().SetName("Type a message")); err != nil {
 		return err
 	}
@@ -628,6 +628,7 @@ type enterHook struct {
 	prev uintptr // the window procedure walk installed
 	send func()
 	key  func(k walk.Key, act bool) bool // takes a key before the box does; act false: only asks
+	over func()                          // paints over what the box just drew (colour emoji); may be nil
 }
 
 var (
@@ -661,15 +662,31 @@ func enterHookProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 		}
 	case win.WM_NCDESTROY:
 		delete(enterHooks, hwnd)
+		return win.CallWindowProc(h.prev, hwnd, msg, wParam, lParam)
 	}
-	return win.CallWindowProc(h.prev, hwnd, msg, wParam, lParam)
+	r := win.CallWindowProc(h.prev, hwnd, msg, wParam, lParam)
+	if h.over != nil {
+		// an edit control redraws text on these, in WM_PAINT or straight away: paint over it again
+		switch msg {
+		case win.WM_PAINT, win.WM_KEYDOWN, win.WM_CHAR, win.WM_LBUTTONDOWN, win.WM_LBUTTONUP, win.WM_LBUTTONDBLCLK,
+			win.WM_MOUSEWHEEL, win.WM_VSCROLL, win.WM_TIMER, win.WM_SETTEXT, win.WM_PASTE, win.WM_CUT, win.WM_UNDO,
+			win.WM_SETFOCUS, win.WM_KILLFOCUS, win.EM_REPLACESEL, win.EM_SETSEL, win.EM_LINESCROLL:
+			h.over()
+		case win.WM_MOUSEMOVE:
+			if wParam&win.MK_LBUTTON != 0 { // a drag changes the selection
+				h.over()
+			}
+		}
+	}
+	return r
 }
 
 // enterSendsIn makes Enter in te call send instead of breaking the line; Shift+Enter still does.
-// key sees every key first and reports whether it took it (enterHook.key).
-func enterSendsIn(te *walk.TextEdit, send func(), key func(k walk.Key, act bool) bool) error {
+// key sees every key first and reports whether it took it (enterHook.key); over runs after the box
+// redrew its text (enterHook.over).
+func enterSendsIn(te *walk.TextEdit, send func(), key func(k walk.Key, act bool) bool, over func()) error {
 	h := te.Handle()
-	enterHooks[h] = &enterHook{prev: win.GetWindowLongPtr(h, win.GWLP_WNDPROC), send: send, key: key}
+	enterHooks[h] = &enterHook{prev: win.GetWindowLongPtr(h, win.GWLP_WNDPROC), send: send, key: key, over: over}
 	if win.SetWindowLongPtr(h, win.GWLP_WNDPROC, enterHookPtr) == 0 {
 		delete(enterHooks, h)
 		return errors.New("ui: subclassing the message box failed")

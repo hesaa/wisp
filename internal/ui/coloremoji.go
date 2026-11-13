@@ -5,11 +5,14 @@ import (
 	"math"
 	"runtime"
 	"syscall"
+	"unicode/utf16"
 	"unsafe"
 
 	"github.com/lxn/walk"
 	"github.com/lxn/win"
 	"golang.org/x/sys/windows"
+
+	"wa-go/internal/theme"
 )
 
 // Colour emoji. GDI's DrawText, which draws all other text, renders Segoe UI Emoji as monochrome
@@ -229,4 +232,91 @@ func drawColorText(hdc win.HDC, text string, px float32, style walk.FontStyle, c
 		return fmt.Errorf("ui: Direct2D EndDraw: 0x%08x", uint32(hr))
 	}
 	return nil
+}
+
+var (
+	user32          = windows.NewLazySystemDLL("user32.dll")
+	pFillRect       = user32.NewProc("FillRect")
+	pHideCaret      = user32.NewProc("HideCaret")
+	pShowCaret      = user32.NewProc("ShowCaret")
+	pCreateSolidBr  = gdi32.NewProc("CreateSolidBrush")
+	pRestoreDC      = gdi32.NewProc("RestoreDC")
+	pGetSysColorRGB = user32.NewProc("GetSysColor")
+)
+
+// paintEmojiOver paints the emoji of edit control h in colour on hdc (the control's DC, or one it was
+// printed to) over the outlines the control itself drew: the control cannot draw colour fonts, so
+// it keeps doing the editing and this redraws each emoji where EM_POSFROMCHAR says it is. bg and fg
+// are the control's colours; a selected emoji gets the system highlight colours, as its text does.
+func paintEmojiOver(h win.HWND, hdc win.HDC, bg, fg walk.Color) error {
+	n := int(win.SendMessage(h, win.WM_GETTEXTLENGTH, 0, 0))
+	font := win.HGDIOBJ(win.SendMessage(h, win.WM_GETFONT, 0, 0))
+	var lf win.LOGFONT
+	if n == 0 || font == 0 || win.GetObject(font, unsafe.Sizeof(lf), unsafe.Pointer(&lf)) == 0 {
+		return nil
+	}
+	units := make([]uint16, n+1)
+	units = units[:win.SendMessage(h, win.WM_GETTEXT, uintptr(n+1), uintptr(unsafe.Pointer(&units[0])))]
+	px, lh := float32(max(lf.LfHeight, -lf.LfHeight)), lineHeight(h)
+	var area win.RECT
+	win.SendMessage(h, win.EM_GETRECT, 0, uintptr(unsafe.Pointer(&area)))
+	var selA, selB uint32
+	win.SendMessage(h, win.EM_GETSEL, uintptr(unsafe.Pointer(&selA)), uintptr(unsafe.Pointer(&selB)))
+	if win.GetFocus() != h {
+		selA, selB = 0, 0 // the selection shows only while the control has the focus
+	}
+	saved := win.SaveDC(hdc)
+	defer pRestoreDC.Call(uintptr(hdc), uintptr(saved))
+	win.IntersectClipRect(hdc, area.Left, area.Top, area.Right, area.Bottom)
+	win.SelectObject(hdc, font) // to measure with
+	for i := 0; i < len(units); {
+		_, k := cluster(units, i)
+		text := string(utf16.Decode(units[i : i+k]))
+		pos := uint32(win.SendMessage(h, win.EM_POSFROMCHAR, uintptr(i), 0))
+		x, y := int(int16(pos)), int(int16(pos>>16))
+		if hasEmoji(text) && pos != 0xffffffff && y+lh > int(area.Top) && y < int(area.Bottom) {
+			var m win.RECT
+			win.DrawTextEx(hdc, &units[i], int32(k), &m, win.DT_CALCRECT|win.DT_SINGLELINE|win.DT_NOPREFIX, nil)
+			cell := win.RECT{Left: int32(x), Top: int32(y), Right: int32(x) + m.Right - m.Left, Bottom: int32(y + lh)}
+			back, ink := bg, fg
+			if uint32(i) >= selA && uint32(i) < selB {
+				b, f := sysColor(win.COLOR_HIGHLIGHT), sysColor(win.COLOR_HIGHLIGHTTEXT)
+				back, ink = b, f
+			}
+			brush, _, _ := pCreateSolidBr.Call(uintptr(back))
+			pFillRect.Call(uintptr(hdc), uintptr(unsafe.Pointer(&cell)), brush)
+			win.DeleteObject(win.HGDIOBJ(brush))
+			r := walk.Rectangle{X: x, Y: y, Width: int(cell.Right - cell.Left), Height: lh}
+			if err := drawColorText(hdc, text, px, 0, ink, r, walk.TextSingleLine|walk.TextNoPrefix); err != nil {
+				return err
+			}
+		}
+		i += k
+	}
+	return nil
+}
+
+func sysColor(index int) walk.Color {
+	c, _, _ := pGetSysColorRGB.Call(uintptr(index))
+	return walk.Color(c)
+}
+
+// overEmoji repaints the emoji of the message box in colour (paintEmojiOver), right after the box
+// drew itself.
+func (b *InputBar) overEmoji() {
+	if colourFailed || !hasEmoji(b.edit.Text()) {
+		return
+	}
+	h := b.edit.Handle()
+	hdc := win.GetDC(h)
+	if hdc == 0 {
+		return
+	}
+	defer win.ReleaseDC(h, hdc)
+	pHideCaret.Call(uintptr(h)) // painting over a shown caret would leave its ghost behind
+	defer pShowCaret.Call(uintptr(h))
+	if err := paintEmojiOver(h, hdc, theme.Color(b.pal.Sidebar), theme.Color(b.pal.Text)); err != nil {
+		colourFailed = true
+		logErr("colour emoji in the message box, left as outlines", err)
+	}
 }
