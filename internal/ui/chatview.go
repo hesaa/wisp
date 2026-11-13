@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"image/color"
 	_ "image/jpeg" // embedded previews and cached thumbnails
 	_ "image/png"  // sticker previews
 	"io"
@@ -611,18 +612,35 @@ func (v *ChatView) settle() {
 	}
 	first, last := v.visible()
 	for _, m := range slices.Clone(v.msgs[first:last]) {
-		switch {
-		case m.Type != "image":
-		case m.MediaPath == "":
-			if v.onNeedMedia != nil && fetchOnSight(m.ID, v.autoFetch, v.requested) {
-				v.onNeedMedia(m)
-			}
-		default:
-			if _, done := v.thumbFiles[m.ID]; !done && !v.thumbBusy[m.ID] {
-				v.makeThumb(m.ID, m.MediaPath)
-			}
+		fetch, thumb := onSight(m)
+		if fetch && v.onNeedMedia != nil && fetchOnSight(m.ID, v.autoFetch, v.requested) {
+			v.onNeedMedia(m)
+		}
+		if _, done := v.thumbFiles[m.ID]; thumb && !done && !v.thumbBusy[m.ID] {
+			v.makeThumb(m.ID, m.MediaPath)
 		}
 	}
+}
+
+// onSight is what a message coming into view asks for: its download when it is a photo or a sticker
+// not fetched yet (small files; video waits for a click), or the thumbnail of its downloaded
+// picture, sticker or video.
+func onSight(m store.Message) (fetch, thumb bool) {
+	switch m.Type {
+	case "image", "sticker":
+		return m.MediaPath == "", m.MediaPath != ""
+	case "video":
+		return false, m.MediaPath != ""
+	}
+	return false, false
+}
+
+// flatten paints img over bg in place: a sticker's transparent parts take the bubble's colour.
+func flatten(img *image.RGBA, bg walk.Color) {
+	out := image.NewRGBA(img.Bounds())
+	draw.Draw(out, out.Bounds(), image.NewUniform(color.RGBA{R: bg.R(), G: bg.G(), B: bg.B(), A: 0xff}), image.Point{}, draw.Src)
+	draw.Draw(out, out.Bounds(), img, img.Bounds().Min, draw.Over)
+	copy(img.Pix, out.Pix)
 }
 
 // makeThumb has the cache make a downloaded image's thumbnail off the UI thread (it decodes the
@@ -665,6 +683,9 @@ func (v *ChatView) thumbFor(m *store.Message, preview bool, w, h int) *walk.Bitm
 	}
 	img, err := v.decodeThumb(m, src, w, h)
 	var bmp *walk.Bitmap
+	if err == nil && m.Type == "sticker" {
+		flatten(img, theme.Color(bubbleColor(v.pal, m.FromMe)))
+	}
 	if err == nil {
 		bmp, err = walk.NewBitmapFromImageForDPI(img, v.canvas.DPI())
 	}

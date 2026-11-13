@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"image"
 	"image/jpeg"
+	"image/png"
 	_ "image/png" // register PNG decoder
 	"io"
 	"io/fs"
@@ -95,35 +96,83 @@ func (c *Cache) Save(accountID, ext string, r io.Reader) (string, error) {
 	return final, nil
 }
 
-// Thumbnail writes <name>_thumb.jpg (fit within 200x200) next to a cached JPEG/PNG
-// and returns its path. Other types return ErrNoThumbnail without reading the file.
+// Thumbnail writes a thumbnail (fit within 200x200) next to a cached file and returns its path:
+// <name>_thumb.jpg of a JPEG or PNG; <name>_thumb.png, which keeps transparency, of a WebP sticker;
+// <name>_thumb.jpg as Windows pictures it of a video. One already made is returned as it is. Other
+// types return ErrNoThumbnail without reading the file.
 func (c *Cache) Thumbnail(path string) (string, error) {
 	resolved, err := c.inRoot(path)
 	if err != nil {
 		return "", err
 	}
 	ext := strings.ToLower(filepath.Ext(resolved))
-	if ext != ".jpg" && ext != ".jpeg" && ext != ".png" {
+	out, video := strings.TrimSuffix(resolved, filepath.Ext(resolved))+"_thumb.jpg", false
+	switch ext {
+	case ".jpg", ".jpeg", ".png":
+	case ".webp":
+		out = strings.TrimSuffix(out, ".jpg") + ".png"
+	case ".mp4", ".mov", ".mkv", ".avi", ".webm", ".3gp":
+		video = true
+	default:
 		return "", ErrNoThumbnail
 	}
-	f, err := os.Open(resolved)
+	if _, err := os.Stat(out); err == nil {
+		return out, nil
+	}
+	var dst image.Image
+	if video {
+		if dst, err = shellThumbnail(resolved, thumbMax); err != nil {
+			err = fmt.Errorf("%w: %v", ErrNoThumbnail, err) // not a video Windows can picture
+		}
+	} else {
+		dst, err = scaledDown(resolved)
+	}
 	if err != nil {
 		return "", err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(out), ".tmp-*")
+	if err != nil {
+		return "", err
+	}
+	if ext == ".webp" {
+		err = png.Encode(tmp, dst)
+	} else {
+		err = jpeg.Encode(tmp, dst, &jpeg.Options{Quality: 80})
+	}
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp.Name(), out)
+	}
+	if err != nil {
+		os.Remove(tmp.Name())
+		return "", err
+	}
+	return out, nil
+}
+
+// scaledDown decodes the image file at path, fitted within thumbMax x thumbMax; one of more than
+// maxPixels is refused undecoded.
+func scaledDown(path string) (image.Image, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
 	}
 	defer f.Close()
 	cfg, _, err := image.DecodeConfig(f)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if cfg.Width <= 0 || cfg.Height <= 0 || int64(cfg.Width)*int64(cfg.Height) > maxPixels {
-		return "", ErrImageTooLarge
+		return nil, ErrImageTooLarge
 	}
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return "", err
+		return nil, err
 	}
 	src, _, err := image.Decode(f)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	w, h := cfg.Width, cfg.Height
 	if w > thumbMax || h > thumbMax {
@@ -137,25 +186,7 @@ func (c *Cache) Thumbnail(path string) (string, error) {
 	}
 	dst := image.NewRGBA(image.Rect(0, 0, w, h))
 	draw.ApproxBiLinear.Scale(dst, dst.Bounds(), src, src.Bounds(), draw.Src, nil)
-	src = nil // let the full-size image be collected before encoding
-
-	out := strings.TrimSuffix(resolved, filepath.Ext(resolved)) + "_thumb.jpg"
-	tmp, err := os.CreateTemp(filepath.Dir(out), ".tmp-*")
-	if err != nil {
-		return "", err
-	}
-	err = jpeg.Encode(tmp, dst, &jpeg.Options{Quality: 80})
-	if cerr := tmp.Close(); err == nil {
-		err = cerr
-	}
-	if err == nil {
-		err = os.Rename(tmp.Name(), out)
-	}
-	if err != nil {
-		os.Remove(tmp.Name())
-		return "", err
-	}
-	return out, nil
+	return dst, nil
 }
 
 // GetCacheSizeBytes sums regular-file sizes under the root; a missing root is 0.

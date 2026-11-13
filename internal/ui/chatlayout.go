@@ -28,6 +28,7 @@ const (
 	bubbleInset  = 3   // around thumbnails and cards
 	bubbleRadius = 8   // corner radius
 	thumbSide    = 240 // thumbnails fit a square this big
+	stickerSide  = 140 // stickers a smaller one
 	cardW, cardH = 280, 64
 	nameH        = 18 // sender name line in groups
 	metaH        = 15 // time and ticks
@@ -105,13 +106,10 @@ func kindOf(m *store.Message, info mediaInfo) bubbleKind {
 	switch m.Type {
 	case "image":
 		return kindImage
-	case "sticker":
-		if len(info.preview) > 0 {
-			return kindImage
-		}
-		return kindCard
-	case "video":
-		if len(info.preview) > 0 {
+	case "sticker": // its file is a picture: shown once downloaded, its embedded preview until then
+		return kindImage
+	case "video": // a preview picture, or once downloaded the thumbnail Windows makes of the file
+		if len(info.preview) > 0 || m.MediaPath != "" {
 			return kindImage
 		}
 		return kindCard
@@ -390,7 +388,11 @@ func (l *chatLayout) layout(m *store.Message, named bool, ms measurer) bubble {
 		}
 		media := walk.Rectangle{X: s(bubbleInset), Y: y}
 		if b.kind == kindImage {
-			media.Width, media.Height = fitBox(info.w, info.h, s(thumbSide), maxW-2*s(bubbleInset))
+			side := thumbSide
+			if m.Type == "sticker" {
+				side = stickerSide
+			}
+			media.Width, media.Height = fitBox(info.w, info.h, s(side), maxW-2*s(bubbleInset))
 			b.thumb = media
 		} else {
 			media.Width, media.Height = min(s(cardW), maxW-2*s(bubbleInset)), s(cardH)

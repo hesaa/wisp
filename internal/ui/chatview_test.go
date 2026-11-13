@@ -240,19 +240,21 @@ func TestMediaKinds(t *testing.T) {
 		typ  string
 		info mediaInfo
 		want bubbleKind
+		path string
 	}{
-		{"text", mediaInfo{}, kindText},
-		{"image", mediaInfo{}, kindImage},
-		{"video", mediaInfo{}, kindCard},
-		{"video", mediaInfo{preview: []byte{1}}, kindImage},
-		{"audio", mediaInfo{}, kindCard},
-		{"document", mediaInfo{}, kindCard},
-		{"sticker", mediaInfo{}, kindCard},
-		{"sticker", mediaInfo{preview: []byte{1}}, kindImage},
-		{"revoked", mediaInfo{}, kindText},
-		{"unsupported", mediaInfo{}, kindText},
+		{"text", mediaInfo{}, kindText, ""},
+		{"image", mediaInfo{}, kindImage, ""},
+		{"video", mediaInfo{}, kindCard, ""},
+		{"video", mediaInfo{}, kindImage, "c/v.mp4"}, // downloaded: Windows makes its thumbnail
+		{"video", mediaInfo{preview: []byte{1}}, kindImage, ""},
+		{"audio", mediaInfo{}, kindCard, ""},
+		{"document", mediaInfo{}, kindCard, ""},
+		{"sticker", mediaInfo{}, kindImage, ""}, // always a picture: its file is one
+		{"sticker", mediaInfo{preview: []byte{1}}, kindImage, ""},
+		{"revoked", mediaInfo{}, kindText, ""},
+		{"unsupported", mediaInfo{}, kindText, ""},
 	} {
-		if got := kindOf(&store.Message{Type: c.typ}, c.info); got != c.want {
+		if got := kindOf(&store.Message{Type: c.typ, MediaPath: c.path}, c.info); got != c.want {
 			t.Errorf("%s (preview %v): kind %v, want %v", c.typ, c.info.preview != nil, got, c.want)
 		}
 	}
@@ -907,5 +909,22 @@ func TestJumpToMessageLocatesIndex(t *testing.T) {
 	// the target ends up centred in the view
 	if off := centerOn(1000, 40, 600); off != 720 {
 		t.Fatalf("centerOn = %d, want 720", off)
+	}
+}
+
+func TestWhatIsFetchedAndThumbnailedOnSight(t *testing.T) {
+	for _, c := range []struct {
+		typ, path    string
+		fetch, thumb bool
+	}{
+		{"image", "", true, false}, {"image", "c/a.jpg", false, true},
+		{"sticker", "", true, false}, {"sticker", "c/s.webp", false, true},
+		{"video", "", false, false}, // too big to fetch unasked
+		{"video", "c/v.mp4", false, true},
+		{"document", "c/d.pdf", false, false}, {"audio", "", false, false}, {"text", "", false, false},
+	} {
+		if fetch, thumb := onSight(store.Message{Type: c.typ, MediaPath: c.path}); fetch != c.fetch || thumb != c.thumb {
+			t.Errorf("%s %q: fetch %v thumb %v, want %v %v", c.typ, c.path, fetch, thumb, c.fetch, c.thumb)
+		}
 	}
 }
