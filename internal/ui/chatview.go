@@ -77,19 +77,21 @@ type ChatView struct {
 	gen         int // bumped per chat: thumbnails finished for an older chat are dropped
 	lastClickID string
 	lastClickAt time.Time
-	clicks      int             // presses in a row on lastClickID, each within the double-click time
-	selA, selB  textMark        // anchor and caret of the text selection; selA.id is "" for none
-	dragging    bool            // the left button went down on text and is held: moves extend the selection
-	drag        walk.Point      // where the pointer is while dragging
-	ticking     bool            // an auto-scroll tick is pending
-	pickAnchor  string          // where a range of picks starts (Shift+click, Shift+Up/Down); "" for none
-	picked      map[string]bool // messages picked for copying (Ctrl+click, Shift+click, Shift+Up/Down)
-	notice      string          // shown in the header for a while instead of the number
-	noticeGen   int             // bumped per notice: only the latest one's timer clears it
-	glow        string          // message briefly highlighted after a jump to it
-	glowGen     int             // bumped per glow: only the latest one's timer clears it
-	jumping     string          // quoted message a jump is paging back to; "" for none
-	jumpPages   int             // older pages asked for on its behalf
+	clicks      int                   // presses in a row on lastClickID, each within the double-click time
+	selA, selB  textMark              // anchor and caret of the text selection; selA.id is "" for none
+	dragging    bool                  // the left button went down on text and is held: moves extend the selection
+	drag        walk.Point            // where the pointer is while dragging
+	ticking     bool                  // an auto-scroll tick is pending
+	pickAnchor  string                // where a range of picks starts (Shift+click, Shift+Up/Down); "" for none
+	picked      map[string]bool       // messages picked for copying (Ctrl+click, Shift+click, Shift+Up/Down)
+	notice      string                // shown in the header for a while instead of the number
+	noticeGen   int                   // bumped per notice: only the latest one's timer clears it
+	glow        string                // message briefly highlighted after a jump to it
+	glowGen     int                   // bumped per glow: only the latest one's timer clears it
+	jumping     string                // quoted message a jump is paging back to; "" for none
+	jumpPages   int                   // older pages asked for on its behalf
+	anims       map[string]*animation // stickers and GIFs playing now, by message ID (anim.go)
+	still       map[string]bool       // media that turned out not to animate, or failed to
 
 	onLoadPrevious func()
 	onNeedMedia    func(store.Message)
@@ -218,6 +220,7 @@ func NewChatView(parent walk.Container, p theme.Palette, cache *media.Cache, sen
 		return nil, err
 	}
 	v := &ChatView{Composite: comp, pal: p, cache: cache, cdpi: canvasDPI(), autoFetch: true,
+		anims: map[string]*animation{}, still: map[string]bool{},
 		picked: map[string]bool{}, requested: map[string]bool{}, thumbFiles: map[string]string{}, thumbBusy: map[string]bool{},
 		bitmaps: newLRU(thumbCacheSize, func(t thumbBitmap) {
 			if t.bmp != nil {
@@ -277,6 +280,7 @@ func (v *ChatView) build() error {
 		}
 	})
 	cw.Disposing().Attach(v.bitmaps.clear)
+	cw.Disposing().Attach(v.stopAnims)
 	if err := v.buildMenu(); err != nil {
 		return err
 	}
@@ -386,6 +390,7 @@ func (v *ChatView) SetChat(accountID, chatJID, name string, isGroup bool, firstP
 	v.lay.reset()
 	v.lay.group = isGroup
 	v.bitmaps.clear()
+	v.stopAnims()
 	clear(v.requested)
 	clear(v.thumbFiles)
 	clear(v.thumbBusy)
@@ -460,6 +465,8 @@ func (v *ChatView) SetMediaPath(id, path string) {
 	}
 	v.msgs[i].MediaPath = path
 	delete(v.thumbFiles, id)
+	v.stopAnim(id)
+	delete(v.still, id)
 	v.lay.forget(id)
 	v.stale = true
 	logErr("chat layout", v.relayout(false))
@@ -1372,7 +1379,11 @@ func (v *ChatView) paintBubble(c *walk.Canvas, m *store.Message, b bubble, dy in
 	}
 	if b.thumb.Width > 0 {
 		r := at(b.thumb)
-		if bmp := v.thumbFor(m, b.preview, r.Width, r.Height); bmp != nil {
+		playing := false
+		if a := v.animFor(m, b.gifBadge, r); a != nil && a.pix != nil { // a sticker or GIF in motion
+			errs = append(errs, blitFrame(c.HDC(), r, a.pix, a.w, a.h))
+			playing = true
+		} else if bmp := v.thumbFor(m, b.preview, r.Width, r.Height); bmp != nil {
 			errs = append(errs, c.DrawImageStretchedPixels(bmp, r))
 		} else {
 			errs = append(errs, icons.FillRounded(c, r, s(4), theme.Color(p.ChatBg)))
@@ -1380,7 +1391,7 @@ func (v *ChatView) paintBubble(c *walk.Canvas, m *store.Message, b bubble, dy in
 				errs = append(errs, icons.Draw(c, icons.IconDownload, square(r.X+r.Width/2, r.Y+r.Height/2, s(36)), secondary))
 			}
 		}
-		if b.play {
+		if b.play && !playing {
 			disc := square(r.X+r.Width/2, r.Y+r.Height/2, s(40))
 			errs = append(errs,
 				icons.FillARGB(c, disc, 0x99000000),
