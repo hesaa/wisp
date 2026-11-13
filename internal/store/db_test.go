@@ -13,7 +13,7 @@ func TestOpenRefusesANewerSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.sql.Exec(`PRAGMA user_version = 3`); err != nil {
+	if _, err := db.sql.Exec(`PRAGMA user_version = 4`); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()
@@ -112,8 +112,8 @@ PRAGMA user_version = 1;`
 	if err := db.sql.QueryRow(`PRAGMA user_version`).Scan(&userVersion); err != nil {
 		t.Fatal(err)
 	}
-	if userVersion != 2 {
-		t.Fatalf("user_version = %d, want 2", userVersion)
+	if userVersion != schemaVersion {
+		t.Fatalf("user_version = %d, want %d", userVersion, schemaVersion)
 	}
 
 	var peopleTableCount int
@@ -154,5 +154,43 @@ PRAGMA user_version = 1;`
 	}
 	if msgsC2[0].Mentions != "" {
 		t.Fatalf("migrated message Mentions = %q, want empty", msgsC2[0].Mentions)
+	}
+}
+
+func TestMigrateV2ToV3KeepsRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wa-v2.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(schemaV1 + schemaV2 + `
+		PRAGMA user_version = 2;
+		INSERT INTO messages (account_id, chat_jid, id, sender_jid, timestamp, body, mentions) VALUES
+			('a', 'c1', 'm1', 's1', 100, 'hello', 'x@lid'), ('a', 'c1', 'm2', 's1', 101, 'world', '');`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	raw.Close()
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open v2 db: %v", err)
+	}
+	defer db.Close()
+	var v int
+	if err := db.sql.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil || v != 3 {
+		t.Fatalf("user_version = %d (%v), want 3", v, err)
+	}
+	page, err := db.GetChatMessages("a", "c1", 0)
+	if err != nil || len(page) != 2 {
+		t.Fatalf("GetChatMessages: len=%d, err=%v", len(page), err)
+	}
+	if page[1].Body != "hello" || page[1].Mentions != "x@lid" {
+		t.Fatalf("migrated row changed: %+v", page[1])
+	}
+	for _, m := range page {
+		if m.QuotedID != "" || m.QuotedSender != "" || m.QuotedBody != "" || m.QuotedType != "" {
+			t.Fatalf("migrated row has quoted fields: %+v", m)
+		}
 	}
 }

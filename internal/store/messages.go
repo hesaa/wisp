@@ -40,6 +40,8 @@ type Message struct {
 	WireChatJID, WireSenderJID string
 	ExpiresAt                  int64  // unix seconds a disappearing message goes (PurgeExpired); 0: never
 	Mentions                   string // space-separated JIDs
+	// The message this one replies to; all empty when it is not a reply.
+	QuotedID, QuotedSender, QuotedBody, QuotedType string
 }
 
 // Chat is a sidebar row.
@@ -84,8 +86,8 @@ func (d *DB) insertChunk(msgs []Message) (int64, error) {
 	defer tx.Rollback()
 	ins, err := tx.Prepare(`INSERT OR IGNORE INTO messages
 		(account_id, chat_jid, id, sender_jid, timestamp, message_type, body, media_path, status, from_me, media_meta,
-		 wire_chat_jid, wire_sender_jid, expires_at, mentions)
-		VALUES (?,?,?,?,?,?,?,?,?,?,COALESCE(?, x''),?,?,?,?)`) // COALESCE: a nil []byte binds as NULL
+		 wire_chat_jid, wire_sender_jid, expires_at, mentions, quoted_id, quoted_sender, quoted_body, quoted_type)
+		VALUES (?,?,?,?,?,?,?,?,?,?,COALESCE(?, x''),?,?,?,?,?,?,?,?)`) // COALESCE: a nil []byte binds as NULL
 	if err != nil {
 		return 0, err
 	}
@@ -99,7 +101,7 @@ func (d *DB) insertChunk(msgs []Message) (int64, error) {
 	var inserted int64
 	for _, m := range msgs {
 		res, err := ins.Exec(m.AccountID, m.ChatJID, m.ID, m.SenderJID, m.Timestamp, m.Type, m.Body, m.MediaPath, m.Status, m.FromMe, m.MediaMeta,
-			m.WireChatJID, m.WireSenderJID, m.ExpiresAt, m.Mentions)
+			m.WireChatJID, m.WireSenderJID, m.ExpiresAt, m.Mentions, m.QuotedID, m.QuotedSender, m.QuotedBody, m.QuotedType)
 		if err != nil {
 			return 0, err
 		}
@@ -149,14 +151,14 @@ func (d *DB) GetMessage(accountID, chatJID, id string) (m Message, ok bool, err 
 }
 
 const messageCols = `id, chat_jid, account_id, sender_jid, timestamp, message_type, body, media_path, status, from_me, media_meta,
-		wire_chat_jid, wire_sender_jid, expires_at, mentions`
+		wire_chat_jid, wire_sender_jid, expires_at, mentions, quoted_id, quoted_sender, quoted_body, quoted_type`
 
 func scanMessages(rows *sql.Rows) ([]Message, error) {
 	out := []Message{}
 	for rows.Next() {
 		var m Message
 		if err := rows.Scan(&m.ID, &m.ChatJID, &m.AccountID, &m.SenderJID, &m.Timestamp, &m.Type, &m.Body, &m.MediaPath, &m.Status, &m.FromMe, &m.MediaMeta,
-			&m.WireChatJID, &m.WireSenderJID, &m.ExpiresAt, &m.Mentions); err != nil {
+			&m.WireChatJID, &m.WireSenderJID, &m.ExpiresAt, &m.Mentions, &m.QuotedID, &m.QuotedSender, &m.QuotedBody, &m.QuotedType); err != nil {
 			return nil, err
 		}
 		out = append(out, m)

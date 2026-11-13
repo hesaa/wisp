@@ -9,7 +9,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 // unread_count is deliberately not stored on chats: it is derived from messages,
 // so it cannot drift from the data.
@@ -61,6 +61,13 @@ CREATE TABLE people (
 );
 ALTER TABLE messages ADD COLUMN mentions TEXT NOT NULL DEFAULT '';`
 
+// Additive: rows from before v3 are not replies and keep empty strings.
+const schemaV3 = `
+ALTER TABLE messages ADD COLUMN quoted_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN quoted_sender TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN quoted_body TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN quoted_type TEXT NOT NULL DEFAULT '';`
+
 // DB wraps the SQLite handle.
 type DB struct{ sql *sql.DB }
 
@@ -109,6 +116,11 @@ func (d *DB) migrate() error {
 	}
 	if v < 2 {
 		if _, err := tx.Exec(schemaV2); err != nil {
+			return err
+		}
+	}
+	if v < 3 {
+		if _, err := tx.Exec(schemaV3); err != nil {
 			return err
 		}
 	}

@@ -521,3 +521,25 @@ func TestListChatsLastMessageFields(t *testing.T) {
 		t.Fatalf("emptyChat unexpected: %+v", emptyChat)
 	}
 }
+
+func TestQuotedMessageRoundTrip(t *testing.T) {
+	db := openTest(t)
+	m := Message{ID: "m1", ChatJID: "c1", AccountID: "a", Timestamp: 1000, Type: "text", Body: "reply",
+		QuotedID: "msg123", QuotedSender: "alice@s.whatsapp.net", QuotedBody: "hello", QuotedType: "text"}
+	if isNew, err := db.InsertMessage(m); err != nil || !isNew {
+		t.Fatalf("InsertMessage: new=%v, err=%v", isNew, err)
+	}
+	got, ok, err := db.GetMessage("a", "c1", "m1")
+	if err != nil || !ok {
+		t.Fatalf("GetMessage: ok=%v, err=%v", ok, err)
+	}
+	page, err := db.GetChatMessages("a", "c1", 0)
+	if err != nil || len(page) != 1 {
+		t.Fatalf("GetChatMessages: len=%d, err=%v", len(page), err)
+	}
+	for _, r := range []Message{got, page[0]} {
+		if r.QuotedID != m.QuotedID || r.QuotedSender != m.QuotedSender || r.QuotedBody != m.QuotedBody || r.QuotedType != m.QuotedType {
+			t.Fatalf("quoted fields = %+v, want %+v", r, m)
+		}
+	}
+}
