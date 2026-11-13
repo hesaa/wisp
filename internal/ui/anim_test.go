@@ -166,3 +166,44 @@ func TestBlitFrameCropsToTheBox(t *testing.T) {
 		t.Fatalf("left BGRA %v, right %v: want red and blue halves", out[left:left+4], out[right:right+4])
 	}
 }
+
+// testdata/odd.mp4: 250x140 (not a multiple of 16, so the decoder pads its rows), red with a green
+// box in the top left corner and a white one in the bottom right.
+func TestVideoFramesOfAnOddWidthAreNotSheared(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	src, err := newVideoFrames("testdata/odd.mp4")
+	if err != nil {
+		t.Fatalf("newVideoFrames: %v", err)
+	}
+	defer src.close()
+	pix, w, h, _, err := src.next()
+	if err != nil || w != 250 || h != 140 || len(pix) != 250*140*4 {
+		t.Fatalf("frame %dx%d, %d bytes, err %v", w, h, len(pix), err)
+	}
+	at := func(x, y int) []byte { return pix[(y*w+x)*4 : (y*w+x)*4+3] } // B, G, R
+	if p := at(10, 10); p[1] < 150 || p[2] > 100 {
+		t.Errorf("top left %v, want green", p)
+	}
+	if p := at(240, 130); p[0] < 180 || p[1] < 180 || p[2] < 180 {
+		t.Errorf("bottom right %v, want white", p)
+	}
+	for _, xy := range [][2]int{{125, 70}, {10, 130}, {240, 10}, {125, 135}} {
+		if p := at(xy[0], xy[1]); p[2] < 150 || p[1] > 100 || p[0] > 100 {
+			t.Errorf("pixel %v = %v, want red", xy, p)
+		}
+	}
+}
+
+func TestRowStepOfPaddedPictures(t *testing.T) {
+	for _, c := range [][4]int{
+		{64 * 48 * 4, 64, 48, 256},      // as it says
+		{250 * 140 * 4, 250, 140, 1000}, // cropped by the processor
+		{256 * 144 * 4, 250, 140, 1024}, // the decoder's padded picture
+		{100, 250, 140, 0},
+	} {
+		if got := rowStep(c[0], c[1], c[2]); got != c[3] {
+			t.Errorf("rowStep(%d, %d, %d) = %d, want %d", c[0], c[1], c[2], got, c[3])
+		}
+	}
+}
