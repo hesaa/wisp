@@ -88,6 +88,7 @@ type ChatView struct {
 	glow        string          // message briefly highlighted after a jump to it
 	glowGen     int             // bumped per glow: only the latest one's timer clears it
 	jumping     string          // quoted message a jump is paging back to; "" for none
+	jumpPages   int             // older pages asked for on its behalf
 
 	onLoadPrevious func()
 	onNeedMedia    func(store.Message)
@@ -146,13 +147,16 @@ func (m *chatModel) prepend(accountID, chatJID string, page []store.Message) int
 	return len(older)
 }
 
-// jumpStep says how a jump to message id goes on: i is its index once loaded (-1 before), more
-// whether older pages remain to look in.
-func (m *chatModel) jumpStep(id string) (i int, more bool) {
+// jumpMaxPages bounds the older pages a jump to a quoted message loads: they all stay in memory.
+const jumpMaxPages = 20
+
+// jumpStep says how a jump to message id goes on after pages older pages were loaded for it: i is
+// its index once loaded (-1 before), more whether to load another.
+func (m *chatModel) jumpStep(id string, pages int) (i int, more bool) {
 	if i = m.index(id); i >= 0 {
 		return i, false
 	}
-	return -1, !m.exhausted
+	return -1, !m.exhausted && pages < jumpMaxPages
 }
 
 // centerOn is the scroll offset that centres something h high at top in a view.
@@ -321,7 +325,7 @@ func (v *ChatView) jumpToMessage(id string) {
 		v.flash("Original message isn't available")
 		return
 	}
-	v.jumping = id
+	v.jumping, v.jumpPages = id, 0
 	v.chase()
 }
 
@@ -331,7 +335,7 @@ func (v *ChatView) chase() {
 	if v.jumping == "" {
 		return
 	}
-	i, more := v.jumpStep(v.jumping)
+	i, more := v.jumpStep(v.jumping, v.jumpPages)
 	switch {
 	case i >= 0:
 		v.jumping = ""
@@ -355,9 +359,14 @@ func (v *ChatView) chase() {
 		})
 	case !more || v.onLoadPrevious == nil:
 		v.jumping = ""
-		v.flash("Original message isn't available")
+		if v.exhausted {
+			v.flash("Original message isn't available")
+		} else {
+			v.flash("Original message is too far back")
+		}
 	case !v.loading:
 		v.loading = true
+		v.jumpPages++
 		v.onLoadPrevious()
 	}
 }
@@ -789,6 +798,7 @@ func (v *ChatView) senderOf(m store.Message) string {
 }
 
 func (v *ChatView) key(k walk.Key) bool {
+	v.jumping = "" // any key or click calls a jump still paging back off
 	mods := walk.ModifiersDown()
 	switch {
 	case k == walk.KeyC && mods == walk.ModControl:
@@ -830,6 +840,7 @@ func (v *ChatView) mouseDown(x, y int, b walk.MouseButton) {
 	if b != walk.LeftButton || v.scroll.press(x, y) {
 		return
 	}
+	v.jumping = ""
 	// resolve the message against the view the user saw, then take focus, then act on it
 	i, prev := v.hit(x, y), v.focusIndex()
 	if i >= 0 {

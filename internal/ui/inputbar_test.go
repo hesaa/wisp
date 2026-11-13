@@ -269,13 +269,16 @@ func names(ms []GroupMember) []string {
 
 func TestMentionAutocompleteFiltering(t *testing.T) {
 	for q, want := range map[string][]string{
-		"P":     {"all", "Puteri"},
-		"z":     {"all"},
+		"P":     {"Puteri"},
+		"z":     nil, // no row: the list stays closed and Enter sends
+		"5pm":   nil,
 		"":      {"all", "Budi Santoso", "Puteri", "62833"},
-		"SANT":  {"all", "Budi Santoso"},
-		"putri": {"all", "Puteri"},       // push name
-		"6281":  {"all", "Budi Santoso"}, // phone digits
-		"+6283": {"all", "62833"},
+		"A":     {"all", "Budi Santoso"}, // @all only while the word may still become it
+		"every": {"all"},
+		"SANT":  {"Budi Santoso"},
+		"putri": {"Puteri"},       // push name
+		"6281":  {"Budi Santoso"}, // phone digits
+		"+6283": {"62833"},
 	} {
 		if got := names(filterMentions(testMembers, q)); !slices.Equal(got, want) {
 			t.Errorf("filter %q = %v, want %v", q, got, want)
@@ -312,9 +315,16 @@ func TestMentionPickerKeysAndCompletion(t *testing.T) {
 	}
 	// typing a name selects its first match, not @all, so Enter completes what was typed
 	p.refresh("hi @Pu")
-	if p.sel != 1 {
-		t.Fatalf("sel = %d, want the first member match", p.sel)
+	if len(p.items) != 1 || p.sel != 0 {
+		t.Fatalf("items %v sel %d, want Puteri alone", names(p.items), p.sel)
 	}
+	if p.refresh("hi @Bu"); p.items[p.sel].Name != "Budi Santoso" {
+		t.Fatalf("typed name selects %q", p.items[p.sel].Name)
+	}
+	if p.refresh("hi @a"); p.items[p.sel].Name != "all" {
+		t.Fatalf("@a selects %q, want @all", p.items[p.sel].Name)
+	}
+	p.refresh("hi @Pu")
 	text, caret := p.complete("hi @Pu", " there")
 	if text != "hi @Puteri  there" || caret != len("hi @Puteri ") || len(p.items) != 0 {
 		t.Fatalf("complete = %q caret %d, list %v", text, caret, names(p.items))
@@ -324,21 +334,24 @@ func TestMentionPickerKeysAndCompletion(t *testing.T) {
 	if text, caret = p.complete("😀 @al", ""); text != "😀 @all " || caret != 8 {
 		t.Fatalf("complete = %q caret %d", text, caret)
 	}
-	p.refresh("@z")
+	if p.refresh("see you @5pm"); len(p.items) != 0 {
+		t.Fatalf("an @word nobody matches opened the list: %v", names(p.items))
+	}
+	p.refresh("@")
 	if p.close(); len(p.items) != 0 {
 		t.Fatal("close left the list open")
 	}
 }
 
 func TestWireMentionsReplaceNamesWithNumbers(t *testing.T) {
-	text, jids := wireMentions("@Budi Santoso and @Puteri, not mail@Puteri or @Puterium; @all @Puteri", testMembers)
+	text, jids := wireMentions("@Budi Santoso and @Puteri, not mail@Puteri or @Puterium; @all @Puteri", testMembers, nil)
 	if want := "@111 and @62822, not mail@Puteri or @Puterium; @all @62822"; text != want {
 		t.Fatalf("wire text = %q, want %q", text, want)
 	}
 	if !slices.Equal(jids, []string{"111@lid", "62822@s.whatsapp.net"}) {
 		t.Fatalf("mentioned = %v", jids)
 	}
-	if text, jids = wireMentions("plain @all", nil); text != "plain @all" || len(jids) != 0 {
+	if text, jids = wireMentions("plain @all", nil, nil); text != "plain @all" || len(jids) != 0 {
 		t.Fatalf("no members: %q %v", text, jids)
 	}
 }
@@ -351,5 +364,20 @@ func TestComposerResetDropsReplyAndMentions(t *testing.T) {
 	c.reset()
 	if _, ok := c.replyTarget(); ok || len(c.picker.items) != 0 || c.box.Text() != "" {
 		t.Fatalf("after reset: reply %v, list %v, text %q", ok, names(c.picker.items), c.box.Text())
+	}
+}
+
+func TestPickedMentionWinsOverANamesake(t *testing.T) {
+	twins := []GroupMember{{JID: "111@lid", Name: "Budi", Phone: "62811"}, {JID: "222@lid", Name: "Budi", Phone: "62822"}}
+	p := mentionPicker{members: twins}
+	p.refresh("@Bu")
+	p.move(1) // the second Budi
+	text, _ := p.complete("@Bu", "")
+	if wire, jids := wireMentions(text, twins, p.picked); wire != "@222 " || !slices.Equal(jids, []string{"222@lid"}) {
+		t.Fatalf("picked the second Budi, sent %q %v", wire, jids)
+	}
+	// hand-typed, nothing picked: the first, as before
+	if wire, _ := wireMentions("@Budi", twins, nil); wire != "@111" {
+		t.Fatalf("typed name sent %q", wire)
 	}
 }

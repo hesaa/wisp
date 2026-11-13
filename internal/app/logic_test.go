@@ -792,3 +792,15 @@ func TestMentionMembersNamesAndSkipsSelf(t *testing.T) {
 		t.Fatalf("mentionMembers = %+v, want %+v", got, want)
 	}
 }
+
+func TestReplyOnlyToTheShownChat(t *testing.T) {
+	open := chatRef{"a", "c1"}
+	m := store.Message{AccountID: "a", ChatJID: "c1"}
+	if !replyAllowed(m, open, true) {
+		t.Fatal("a message of the shown chat cannot be replied to")
+	}
+	// the view still shows the chat being left until the new one's first page arrives
+	if replyAllowed(m, chatRef{"a", "c2"}, false) || replyAllowed(m, chatRef{"a", "c2"}, true) || replyAllowed(m, open, false) {
+		t.Fatal("a reply to another chat's message was allowed")
+	}
+}

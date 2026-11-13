@@ -209,7 +209,8 @@ func (b *InputBar) SetGroupParticipants(members []GroupMember) {
 // WireMentions turns the @Name mentions of a sent text into WhatsApp's @<number> form and returns
 // it with the JIDs mentioned.
 func (b *InputBar) WireMentions(text string) (string, []string) {
-	return wireMentions(text, b.picker.members)
+	defer func() { b.picker.picked = nil }() // the draft they were picked for is sent
+	return wireMentions(text, b.picker.members, b.picker.picked)
 }
 
 // caretSplit is the box's text before and after the caret.

@@ -656,6 +656,9 @@ func (m *Manager) send(ctx context.Context, cli waClient, accountID string, chat
 		Timestamp:     resp.Timestamp,
 	}, msg)
 	if err == nil {
+		err = m.creditQuote(ctx, cli, &sm)
+	}
+	if err == nil {
 		sm.MediaPath = mediaPath
 		err = m.persist(sm)
 	}

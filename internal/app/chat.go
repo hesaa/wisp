@@ -353,7 +353,7 @@ func (a *App) takeReply() *store.Message {
 
 // reply starts a reply to m of the open chat in the input bar.
 func (a *App) reply(m store.Message) {
-	if a.locked {
+	if a.locked || !replyAllowed(m, a.v.open, a.v.loaded) {
 		return // nothing is shown, opened or sent behind the lock page
 	}
 	a.bar.SetReply(m, a.replyAuthor(m))

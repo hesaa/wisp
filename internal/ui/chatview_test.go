@@ -891,14 +891,17 @@ func TestHitTestQuotedBox(t *testing.T) {
 func TestJumpToMessageLocatesIndex(t *testing.T) {
 	var m chatModel
 	m.open("a", "c", page("c", "m", 1000, store.PageSize)) // a full page: older ones may exist
-	if i, more := m.jumpStep("m3"); i != m.index("m3") || i < 0 || more {
+	if i, more := m.jumpStep("m3", 0); i != m.index("m3") || i < 0 || more {
 		t.Fatalf("loaded message: index %d more %v", i, more)
 	}
-	if i, more := m.jumpStep("old"); i != -1 || !more {
+	if i, more := m.jumpStep("old", jumpMaxPages); i != -1 || more {
+		t.Fatalf("after %d pages: index %d more %v, want the jump given up", jumpMaxPages, i, more)
+	}
+	if i, more := m.jumpStep("old", 0); i != -1 || !more {
 		t.Fatalf("message above the loaded window: index %d more %v, want -1 and more to load", i, more)
 	}
 	m.noMore("a", "c")
-	if i, more := m.jumpStep("old"); i != -1 || more {
+	if i, more := m.jumpStep("old", 0); i != -1 || more {
 		t.Fatalf("history exhausted: index %d more %v", i, more)
 	}
 	// the target ends up centred in the view

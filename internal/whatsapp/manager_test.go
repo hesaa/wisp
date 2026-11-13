@@ -1501,3 +1501,47 @@ func TestOutboundMentionAllExpansion(t *testing.T) {
 		t.Fatalf("DM @all = %v", fa.sent[3])
 	}
 }
+
+func TestQuotedSenderIsStoredAsThePhoneNumber(t *testing.T) {
+	m, db := newTestManager(t)
+	group := types.NewJID("12345-67890", types.GroupServer)
+	lid := types.NewJID("123456789012345", types.HiddenUserServer)
+	fa := &fakeClient{pns: map[types.JID]types.JID{lid: alice}}
+	m.add(acctA, fa)
+	reply := func(id, quoted, participant string) *events.Message {
+		e := incoming(group, id, "")
+		e.Message = &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{Text: proto.String("re"),
+			ContextInfo: &waE2E.ContextInfo{StanzaID: proto.String(quoted), Participant: proto.String(participant),
+				QuotedMessage: &waE2E.Message{Conversation: proto.String("orig")}}}}
+		return e
+	}
+	mine, err := m.SendText(ctx, acctA, group.String(), "mine", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// someone quotes our message by an LID nobody can map: the stored original names its sender
+	for _, e := range []*events.Message{reply("r1", mine.ID, "999999999999999@lid"), reply("r2", "not-stored", lid.String())} {
+		if err := m.handleEvent(ctx, acctA, fa, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, _, _ := db.GetMessage(acctA, group.String(), "r1"); got.QuotedSender != acctA+"@s.whatsapp.net" {
+		t.Fatalf("quote of our message credited to %q", got.QuotedSender)
+	}
+	if got, _, _ := db.GetMessage(acctA, group.String(), "r2"); got.QuotedSender != alice.String() {
+		t.Fatalf("quote by LID credited to %q, want %s", got.QuotedSender, alice)
+	}
+
+	// replying to a message that arrived by LID addresses its sender the way it arrived
+	in := store.Message{ID: "g1", SenderJID: alice.String(), WireSenderJID: lid.String(), Type: TypeText, Body: "hi"}
+	sent, err := m.SendText(ctx, acctA, group.String(), "ok", &in, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := fa.sent[len(fa.sent)-1].GetExtendedTextMessage().GetContextInfo().GetParticipant(); p != lid.String() {
+		t.Fatalf("participant = %q, want the LID %s", p, lid)
+	}
+	if sent.QuotedSender != alice.String() {
+		t.Fatalf("own reply stored with quoted sender %q", sent.QuotedSender)
+	}
+}

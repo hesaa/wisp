@@ -37,11 +37,15 @@ func mentionQuery(before string) (query string, ok bool) {
 	return query, !strings.ContainsFunc(query, unicode.IsSpace)
 }
 
-// filterMentions lists @all, then the members whose name, push name or number contains query.
+// filterMentions lists @all while query may still become it (or @everyone), then the members whose
+// name, push name or number contains query. No row means no mention: "see you @5pm" is just text.
 func filterMentions(members []GroupMember, query string) []GroupMember {
 	q := strings.ToLower(query)
 	digits := strings.TrimPrefix(q, "+")
-	out := []GroupMember{mentionAll}
+	var out []GroupMember
+	if strings.HasPrefix("all", q) || strings.HasPrefix("everyone", q) {
+		out = append(out, mentionAll)
+	}
 	for _, m := range members {
 		if strings.Contains(strings.ToLower(m.Name), q) || strings.Contains(strings.ToLower(m.Push), q) ||
 			digits != "" && strings.Contains(m.Phone, digits) {
@@ -56,6 +60,7 @@ type mentionPicker struct {
 	members []GroupMember // the open group's, sorted by name; none outside groups
 	items   []GroupMember // the rows listed now; none: the list is closed
 	sel     int           // the highlighted row
+	picked  map[string]string // name to JID of the rows picked for this draft: namesakes are told apart
 }
 
 // refresh lists the matches of the mention being typed before the caret, or closes the list.
@@ -67,7 +72,7 @@ func (p *mentionPicker) refresh(before string) {
 	}
 	p.items = filterMentions(p.members, q)
 	// a typed name selects its first match, so Enter completes it; @all stays one Up away
-	if q != "" && len(p.items) > 1 && !strings.HasPrefix("all", strings.ToLower(q)) {
+	if q != "" && len(p.items) > 1 && p.items[0].JID == "" && !strings.HasPrefix("all", strings.ToLower(q)) {
 		p.sel = 1
 	}
 }
@@ -83,21 +88,28 @@ func (p *mentionPicker) complete(before, after string) (text string, caret int) 
 	if len(p.items) == 0 {
 		return before + after, len(utf16.Encode([]rune(before)))
 	}
-	before = before[:strings.LastIndex(before, "@")+1] + p.items[p.sel].Name + " "
+	it := p.items[p.sel]
+	if it.JID != "" {
+		if p.picked == nil {
+			p.picked = map[string]string{}
+		}
+		p.picked[it.Name] = it.JID
+	}
+	before = before[:strings.LastIndex(before, "@")+1] + it.Name + " "
 	p.close()
 	return before + after, len(utf16.Encode([]rune(before)))
 }
 
 // wireMentions turns the @Name tokens of text into WhatsApp's @<number> and returns it with the JIDs
-// mentioned, each once. @all stays as it is.
-// shortcut: of two members with the same name the first is mentioned; carry the picked JIDs with
-// the box's text if that shows.
-func wireMentions(text string, members []GroupMember) (string, []string) {
+// mentioned, each once. @all stays as it is. Of members with the same name, the one picked from the
+// list (picked: name to JID) is meant, else the first.
+func wireMentions(text string, members []GroupMember, picked map[string]string) (string, []string) {
 	byLen := slices.Clone(members) // longest first: "@Ann Lee" is not "@Ann"
 	slices.SortStableFunc(byLen, func(a, b GroupMember) int { return cmp.Compare(len(b.Name), len(a.Name)) })
 	var jids []string
 	for _, m := range byLen {
-		user, _, _ := strings.Cut(m.JID, "@")
+		jid := cmp.Or(picked[m.Name], m.JID)
+		user, _, _ := strings.Cut(jid, "@")
 		if m.Name == "" || user == "" {
 			continue
 		}
@@ -117,8 +129,8 @@ func wireMentions(text string, members []GroupMember) (string, []string) {
 			}
 			text = text[:i] + "@" + user + text[end:]
 			from = i + 1 + len(user)
-			if !slices.Contains(jids, m.JID) {
-				jids = append(jids, m.JID)
+			if !slices.Contains(jids, jid) {
+				jids = append(jids, jid)
 			}
 		}
 	}

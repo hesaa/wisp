@@ -156,6 +156,9 @@ func (m *Manager) handleEvent(ctx context.Context, id string, cli waClient, evt 
 		if err != nil || !ok {
 			return err
 		}
+		if err := m.creditQuote(ctx, cli, &msg); err != nil {
+			return err
+		}
 		// MarkRead must address receipts the way the message arrived, not by the normalised key.
 		msg.WireChatJID, msg.WireSenderJID = e.Info.Chat.String(), e.Info.Sender.ToNonAD().String()
 		if isDM(info.Chat) && !info.IsFromMe {
@@ -647,6 +650,26 @@ func toStoreMessage(id string, info types.MessageInfo, m *waE2E.Message) (msg st
 	return msg, true, nil
 }
 
+// creditQuote names the sender of the message msg quotes by the key senders are stored under: as the
+// stored original has it, else the quote's participant with an LID mapped to its phone number.
+func (m *Manager) creditQuote(ctx context.Context, cli waClient, msg *store.Message) error {
+	if msg.QuotedID == "" {
+		return nil
+	}
+	stored, err := m.store.MessageSender(msg.AccountID, msg.ChatJID, msg.QuotedID)
+	if err != nil || stored != "" {
+		msg.QuotedSender = cmp.Or(stored, msg.QuotedSender)
+		return err
+	}
+	jid, err := types.ParseJID(msg.QuotedSender)
+	if err != nil {
+		return nil // kept as received
+	}
+	pn, err := toPN(ctx, cli, jid, types.EmptyJID)
+	msg.QuotedSender = pn.ToNonAD().String()
+	return err
+}
+
 // content classifies a message: its stored type and body and the media sub-message to keep. skip is
 // true for what is not chat content: protocol messages, bare sender-key distribution, reactions,
 // poll votes, pins and keep-in-chat markers.
@@ -738,7 +761,8 @@ func quote(m *waE2E.Message, reply *store.Message) {
 		return
 	}
 	ci.StanzaID = proto.String(reply.ID)
-	ci.Participant = proto.String(reply.SenderJID)
+	// addressed the way the original arrived (an LID or a phone number), as read receipts are
+	ci.Participant = proto.String(cmp.Or(reply.WireSenderJID, reply.SenderJID))
 	ci.QuotedMessage = quotedMessage(reply)
 }
 

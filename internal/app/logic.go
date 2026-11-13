@@ -559,3 +559,10 @@ func mentionMembers(jids []string, self string, d *ui.Directory) []ui.GroupMembe
 	}
 	return out
 }
+
+// replyAllowed reports whether a reply to m may start: only to a message of the open chat once the
+// chat view shows it. Until a newly opened chat's first page arrives the view still shows the chat
+// being left, whose messages must not be quoted into the new one.
+func replyAllowed(m store.Message, open chatRef, loaded bool) bool {
+	return loaded && m.AccountID == open.acct && m.ChatJID == open.jid
+}
