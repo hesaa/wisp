@@ -203,7 +203,7 @@ func TestDisappearingMessagesCarryTheirExpiry(t *testing.T) {
 	}
 
 	// a reply in that chat disappears too, for everyone
-	sent, err := m.SendText(ctx, acctA, alice.String(), "ok")
+	sent, err := m.SendText(ctx, acctA, alice.String(), "ok", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +212,7 @@ func TestDisappearingMessagesCarryTheirExpiry(t *testing.T) {
 		t.Fatalf("sent %v stored %+v", fa.sent[0], sent)
 	}
 	// a chat without a timer gets a plain message
-	plain, err := m.SendText(ctx, acctA, bob.String(), "hi")
+	plain, err := m.SendText(ctx, acctA, bob.String(), "hi", nil, nil)
 	if err != nil || fa.sent[1].GetConversation() != "hi" || plain.ExpiresAt != 0 {
 		t.Fatalf("plain send %v stored %+v err %v", fa.sent[1], plain, err)
 	}

@@ -34,8 +34,8 @@ type Backend interface {
 	Start(ctx context.Context) error
 	Pair(ctx context.Context) (<-chan whatsmeow.QRChannelItem, error)
 	Contacts(ctx context.Context, accountID string) ([]whatsapp.Contact, error)
-	SendText(ctx context.Context, accountID, chatJID, text string) (store.Message, error)
-	SendMedia(ctx context.Context, accountID, chatJID, path, caption string) (store.Message, error)
+	SendText(ctx context.Context, accountID, chatJID, text string, reply *store.Message, mentions []string) (store.Message, error)
+	SendMedia(ctx context.Context, accountID, chatJID, path, caption string, reply *store.Message) (store.Message, error)
 	SendGIF(ctx context.Context, accountID, chatJID, mp4Path string, preview []byte, w, h int) (store.Message, error)
 	SetTyping(ctx context.Context, accountID, chatJID string, composing bool) error
 	SetPresenceAll(ctx context.Context, p types.Presence) error

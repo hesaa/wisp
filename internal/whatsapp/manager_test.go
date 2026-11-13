@@ -331,7 +331,7 @@ func TestReceiptsAdvanceStatusPerAccount(t *testing.T) {
 	m, db := newTestManager(t)
 	fa := &fakeClient{}
 	m.add(acctA, fa)
-	sent, err := m.SendText(ctx, acctA, alice.String(), "hello")
+	sent, err := m.SendText(ctx, acctA, alice.String(), "hello", nil, nil)
 	if err != nil || sent.Status != store.StatusSent || !sent.FromMe || sent.Body != "hello" ||
 		fa.sent[0].GetConversation() != "hello" {
 		t.Fatalf("sent %+v err %v", sent, err)
@@ -454,7 +454,7 @@ func TestUnknownAccountIsAnError(t *testing.T) {
 	m, _ := newTestManager(t)
 	m.add(acctA, &fakeClient{})
 	ops := map[string]func() error{
-		"SendText":  func() error { _, err := m.SendText(ctx, "nope", alice.String(), "x"); return err },
+		"SendText":  func() error { _, err := m.SendText(ctx, "nope", alice.String(), "x", nil, nil); return err },
 		"Logout":    func() error { return m.Logout(ctx, "nope") },
 		"SendGIF":   func() error { _, err := m.SendGIF(ctx, "nope", alice.String(), "x.mp4", nil, 0, 0); return err },
 		"SetTyping": func() error { return m.SetTyping(ctx, "nope", alice.String(), true) },
@@ -541,11 +541,11 @@ func TestSendMediaPicksImageOrDocument(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	img, err := m.SendMedia(ctx, acctA, alice.String(), png, "a photo")
+	img, err := m.SendMedia(ctx, acctA, alice.String(), png, "a photo", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	doc, err := m.SendMedia(ctx, acctA, alice.String(), txt, "")
+	doc, err := m.SendMedia(ctx, acctA, alice.String(), txt, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -562,7 +562,7 @@ func TestSendMediaPicksImageOrDocument(t *testing.T) {
 		t.Fatalf("cached copy %q: %q %v", doc.MediaPath, b, err)
 	}
 	// only JPEG and PNG are images WhatsApp shows; other image types go as documents
-	if anim, err := m.SendMedia(ctx, acctA, alice.String(), gif, ""); err != nil || anim.Type != TypeDocument ||
+	if anim, err := m.SendMedia(ctx, acctA, alice.String(), gif, "", nil); err != nil || anim.Type != TypeDocument ||
 		fa.sent[2].GetDocumentMessage().GetMimetype() != "image/gif" || fa.uploads[2] != whatsmeow.MediaDocument {
 		t.Fatalf("gif sent as %+v (%v), err %v", anim, fa.sent[2], err)
 	}
@@ -702,7 +702,7 @@ func TestLIDChatsStoredUnderPhoneNumber(t *testing.T) {
 	}
 	// a receipt addressed by LID alone is resolved through the account's LID map
 	fa.pns = map[types.JID]types.JID{lid: alice}
-	sent, err := m.SendText(ctx, acctA, alice.String(), "reply")
+	sent, err := m.SendText(ctx, acctA, alice.String(), "reply", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -775,7 +775,7 @@ func TestEditAndRevokeOnlyByTheAuthor(t *testing.T) {
 	fromCarol := incoming(group, "c1", "crol") // carol's LID has no phone number yet
 	fromCarol.Info.Sender = types.JID{User: carolLID.User, Server: types.HiddenUserServer, Device: 1}
 	handle(incoming(group, "t1", "tpyo"), img, fromCarol)
-	own, err := m.SendText(ctx, acctA, group.String(), "mine")
+	own, err := m.SendText(ctx, acctA, group.String(), "mine", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1384,5 +1384,120 @@ func TestContactsSyncOnConnect(t *testing.T) {
 	}
 	if len(peopleEvents) != 1 || peopleEvents[0].AccountID != acctA {
 		t.Errorf("PeopleEvent count = %d, want 1", len(peopleEvents))
+	}
+}
+
+func TestInboundQuotedMessageStored(t *testing.T) {
+	m, db := newTestManager(t)
+	fa := &fakeClient{}
+	m.add(acctA, fa)
+	group := types.NewJID("12345-67890", types.GroupServer)
+	quote := func(participant *string) *waE2E.Message {
+		return &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+			Text: proto.String("reply"),
+			ContextInfo: &waE2E.ContextInfo{StanzaID: proto.String("xyz"), Participant: participant,
+				QuotedMessage: &waE2E.Message{Conversation: proto.String("orig")}},
+		}}
+	}
+	inGroup := incoming(group, "g1", "")
+	inGroup.Message = quote(proto.String("6284444444444@s.whatsapp.net"))
+	inDM := incoming(alice, "d1", "")
+	inDM.Message = quote(nil) // a DM may leave the participant out
+	for _, evt := range []*events.Message{inGroup, inDM} {
+		if err := m.handleEvent(ctx, acctA, fa, evt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, ok, err := db.GetMessage(acctA, group.String(), "g1")
+	if err != nil || !ok {
+		t.Fatalf("GetMessage: ok=%v err=%v", ok, err)
+	}
+	if got.QuotedID != "xyz" || got.QuotedSender != "6284444444444@s.whatsapp.net" || got.QuotedBody != "orig" || got.QuotedType != TypeText {
+		t.Fatalf("group quote = %+v", got)
+	}
+	got, _, _ = db.GetMessage(acctA, alice.String(), "d1")
+	if got.QuotedID != "xyz" || got.QuotedSender != alice.String() {
+		t.Fatalf("DM quote = %+v, want sender %s", got, alice)
+	}
+}
+
+func TestOutboundReplyContextInfo(t *testing.T) {
+	m, _ := newTestManager(t)
+	fa := &fakeClient{}
+	m.add(acctA, fa)
+	// The chat has disappearing messages on: the timer and the quote must share one context info.
+	in := incoming(alice, "in1", "")
+	in.Message = &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{Text: proto.String("hi"),
+		ContextInfo: &waE2E.ContextInfo{Expiration: proto.Uint32(3600)}}}
+	if err := m.handleEvent(ctx, acctA, fa, in); err != nil {
+		t.Fatal(err)
+	}
+	reply := &store.Message{ID: "in1", SenderJID: alice.String(), Type: TypeText, Body: "hi"}
+	sent, err := m.SendText(ctx, acctA, alice.String(), "hello back", reply, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ci := fa.sent[0].GetExtendedTextMessage().GetContextInfo()
+	if ci.GetStanzaID() != "in1" || ci.GetParticipant() != alice.String() || ci.GetQuotedMessage().GetConversation() != "hi" {
+		t.Fatalf("context info = %v", ci)
+	}
+	if ci.GetExpiration() != 3600 {
+		t.Fatalf("expiration = %d, want 3600", ci.GetExpiration())
+	}
+	if sent.QuotedID != "in1" || sent.QuotedBody != "hi" || sent.QuotedSender != alice.String() {
+		t.Fatalf("stored reply = %+v", sent)
+	}
+
+	// A quoted image travels as an image, from its stored media sub-message.
+	meta, _ := proto.Marshal(&waE2E.ImageMessage{Caption: proto.String("cat")})
+	if _, err := m.SendText(ctx, acctA, alice.String(), "nice", &store.Message{ID: "in2", SenderJID: alice.String(), Type: TypeImage, MediaMeta: meta}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := fa.sent[1].GetExtendedTextMessage().GetContextInfo().GetQuotedMessage().GetImageMessage().GetCaption(); got != "cat" {
+		t.Fatalf("quoted image caption = %q", got)
+	}
+}
+
+func TestOutboundMentionAllExpansion(t *testing.T) {
+	m, _ := newTestManager(t)
+	group := types.NewJID("12345-67890", types.GroupServer)
+	m1 := types.NewJID("6281111111", types.DefaultUserServer)
+	m2 := types.NewJID("9988776655", types.HiddenUserServer)
+	fa := &fakeClient{groups: map[types.JID]*types.GroupInfo{group: {JID: group,
+		Participants: []types.GroupParticipant{{JID: m1}, {JID: m2}}}}}
+	m.add(acctA, fa)
+
+	mentioned := func(i int) []string { return fa.sent[i].GetExtendedTextMessage().GetContextInfo().GetMentionedJID() }
+	if _, err := m.SendText(ctx, acctA, group.String(), "hi @ALL and @6281111111", nil, []string{m1.String()}); err != nil {
+		t.Fatal(err)
+	}
+	if got := mentioned(0); !slices.Equal(got, []string{m1.String(), m2.String()}) {
+		t.Fatalf("mentioned = %v, want both members once", got)
+	}
+	if _, err := m.SendText(ctx, acctA, group.String(), "mail me@all.example or call@everyone", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := mentioned(1); len(got) != 0 {
+		t.Fatalf("mentioned = %v for text without an @all word", got)
+	}
+	if _, err := m.SendText(ctx, acctA, group.String(), "@everyone", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := mentioned(2); len(got) != 2 || fa.groupCalls() != 1 {
+		t.Fatalf("mentioned = %v after %d group lookups, want 2 after 1 (cached)", got, fa.groupCalls())
+	}
+	// A membership change drops the cached participants.
+	if err := m.handleEvent(ctx, acctA, fa, &events.GroupInfo{JID: group, Join: []types.JID{alice}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.GroupParticipants(ctx, acctA, group.String()); err != nil || fa.groupCalls() != 2 {
+		t.Fatalf("group lookups = %d (%v), want 2 after a join", fa.groupCalls(), err)
+	}
+	// @all in a direct chat is just text.
+	if _, err := m.SendText(ctx, acctA, alice.String(), "@all", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if fa.sent[3].GetConversation() != "@all" {
+		t.Fatalf("DM @all = %v", fa.sent[3])
 	}
 }

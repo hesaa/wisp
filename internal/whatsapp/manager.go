@@ -142,6 +142,7 @@ type Manager struct {
 
 	peopleMu sync.RWMutex
 	people   map[string]store.Person // key: accountID + " " + jid
+	members  map[string][]string     // group participants, key: accountID + " " + group jid; guarded by peopleMu
 }
 
 // New opens (creating if needed) the whatsmeow session database at sessionPath, which holds every
@@ -158,7 +159,7 @@ func New(ctx context.Context, sessionPath string, db *store.DB, cache *media.Cac
 	}
 	return &Manager{store: db, media: cache, container: container, accounts: map[string]waClient{},
 		connect: (*whatsmeow.Client).Connect, groupsAsked: map[string]bool{}, groupSlots: make(chan struct{}, 2),
-		people: map[string]store.Person{}}, nil
+		people: map[string]store.Person{}, members: map[string][]string{}}, nil
 }
 
 // Start registers a client for every saved device and returns: Accounts lists them at once, while
@@ -250,8 +251,13 @@ func (m *Manager) client(id string) (waClient, error) {
 	return cli, nil
 }
 
-// SendText sends text to chatJID from accountID and stores it as sent.
-func (m *Manager) SendText(ctx context.Context, accountID, chatJID, text string) (store.Message, error) {
+// mentionAll matches the @all / @everyone word that mentions every participant of a group.
+var mentionAll = regexp.MustCompile(`(?i)(?:^|\s)@(?:all|everyone)\b`)
+
+// SendText sends text to chatJID from accountID and stores it as sent. reply, when not nil, is the
+// stored message it answers. mentions are the JIDs text mentions (as @<user part>); in a group,
+// @all or @everyone adds every participant.
+func (m *Manager) SendText(ctx context.Context, accountID, chatJID, text string, reply *store.Message, mentions []string) (store.Message, error) {
 	cli, err := m.client(accountID)
 	if err != nil {
 		return store.Message{}, err
@@ -260,13 +266,52 @@ func (m *Manager) SendText(ctx context.Context, accountID, chatJID, text string)
 	if err != nil {
 		return store.Message{}, err
 	}
-	return m.send(ctx, cli, accountID, chat, &waE2E.Message{Conversation: proto.String(text)}, "")
+	if chat.Server == types.GroupServer && mentionAll.MatchString(text) {
+		all, err := m.GroupParticipants(ctx, accountID, chatJID)
+		if err != nil {
+			return store.Message{}, err
+		}
+		mentions = append(slices.Clone(mentions), all...)
+	}
+	msg := &waE2E.Message{Conversation: proto.String(text)}
+	if len(mentions) > 0 {
+		seen := map[string]bool{}
+		ci := contextOf(msg)
+		for _, j := range mentions {
+			if j != "" && !seen[j] {
+				seen[j] = true
+				ci.MentionedJID = append(ci.MentionedJID, j)
+			}
+		}
+	}
+	quote(msg, reply)
+	return m.send(ctx, cli, accountID, chat, msg, "")
+}
+
+// GroupParticipants returns the JIDs of the group's participants, from memory once the group was
+// looked up (GroupDetails) and until its membership changes.
+func (m *Manager) GroupParticipants(ctx context.Context, accountID, groupJID string) ([]string, error) {
+	m.peopleMu.RLock()
+	cached, ok := m.members[accountID+" "+groupJID]
+	m.peopleMu.RUnlock()
+	if ok {
+		return cached, nil
+	}
+	d, err := m.GroupDetails(ctx, accountID, groupJID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, len(d.Members))
+	for i, mem := range d.Members {
+		out[i] = mem.JID
+	}
+	return out, nil
 }
 
 // SendMedia sends the file at path to chatJID: as an image for JPEG and PNG (what WhatsApp shows
 // inline), otherwise as a document. The file is streamed into the media cache and uploaded from there, never read whole
-// into memory; the stored message points at the cached copy.
-func (m *Manager) SendMedia(ctx context.Context, accountID, chatJID, path, caption string) (store.Message, error) {
+// into memory; the stored message points at the cached copy. reply is as in SendText.
+func (m *Manager) SendMedia(ctx context.Context, accountID, chatJID, path, caption string, reply *store.Message) (store.Message, error) {
 	cli, err := m.client(accountID)
 	if err != nil {
 		return store.Message{}, err
@@ -303,6 +348,7 @@ func (m *Manager) SendMedia(ctx context.Context, accountID, chatJID, path, capti
 			FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: &up.FileLength,
 		}
 	}
+	quote(msg, reply)
 	return m.send(ctx, cli, accountID, chat, msg, cached)
 }
 
@@ -463,6 +509,13 @@ func (m *Manager) GroupDetails(ctx context.Context, accountID, jid string) (Grou
 			return GroupDetails{}, err
 		}
 	}
+	jids := make([]string, len(members))
+	for i, mem := range members {
+		jids[i] = mem.JID
+	}
+	m.peopleMu.Lock()
+	m.members[accountID+" "+group.String()] = jids
+	m.peopleMu.Unlock()
 	return GroupDetails{
 		Subject:     info.Name,
 		Description: info.Topic,

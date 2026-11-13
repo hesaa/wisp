@@ -325,7 +325,7 @@ func (a *App) send(text string) {
 	}
 	c := a.v.open
 	a.sendOff("Message not sent", func(ctx context.Context) error {
-		_, err := a.mgr.SendText(ctx, c.acct, c.jid, text)
+		_, err := a.mgr.SendText(ctx, c.acct, c.jid, text, nil, nil)
 		return err
 	}, netTimeout, func() {
 		if a.v.open == c {
@@ -341,7 +341,7 @@ func (a *App) attach(path string) {
 	}
 	c := a.v.open
 	a.sendOff("File not sent", func(ctx context.Context) error {
-		_, err := a.mgr.SendMedia(ctx, c.acct, c.jid, path, "")
+		_, err := a.mgr.SendMedia(ctx, c.acct, c.jid, path, "", nil)
 		return err
 	}, mediaTimeout, nil)
 }

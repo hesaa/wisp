@@ -200,6 +200,11 @@ func (m *Manager) handleEvent(ctx context.Context, id string, cli waClient, evt 
 	case *events.JoinedGroup:
 		return m.nameChat(id, e.JID, e.Name)
 	case *events.GroupInfo:
+		if len(e.Join)+len(e.Leave) > 0 {
+			m.peopleMu.Lock()
+			delete(m.members, id+" "+e.JID.String())
+			m.peopleMu.Unlock()
+		}
 		if e.Name != nil {
 			return m.nameChat(id, e.JID, e.Name.Name)
 		}
@@ -614,6 +619,15 @@ func toStoreMessage(id string, info types.MessageInfo, m *waE2E.Message) (msg st
 				msg.Mentions = strings.Join(valid, " ")
 			}
 		}
+		if quoted := ci.GetStanzaID(); quoted != "" {
+			msg.QuotedID = quoted
+			// shortcut: a DM quote without a participant is credited to the chat partner, wrong for a
+			// quote of our own message; look the quoted message up in the store if that ever shows.
+			msg.QuotedSender = cmp.Or(ci.GetParticipant(), info.Chat.String())
+			if qm := ci.GetQuotedMessage(); qm != nil {
+				msg.QuotedType, msg.QuotedBody, _, _ = content(qm)
+			}
+		}
 		if exp := ci.GetExpiration(); exp > 0 { // disappearing messages: honoured here too
 			msg.ExpiresAt = msg.Timestamp + int64(exp)
 		}
@@ -680,23 +694,79 @@ func contextInfo(m *waE2E.Message) *waE2E.ContextInfo {
 	return nil
 }
 
-// disappearing makes an outgoing message disappear exp seconds after it is sent, as the chat's
-// timer asks: the timer travels in the content's context info, so plain text becomes extended text.
-func disappearing(m *waE2E.Message, exp uint32) {
+// contextOf returns the context info of an outgoing message's content, creating it; plain text
+// becomes extended text to carry one. It is nil for content that has none.
+func contextOf(m *waE2E.Message) *waE2E.ContextInfo {
 	if m.Conversation != nil {
 		m.ExtendedTextMessage, m.Conversation = &waE2E.ExtendedTextMessage{Text: m.Conversation}, nil
 	}
-	ci := &waE2E.ContextInfo{Expiration: proto.Uint32(exp)}
+	var ci **waE2E.ContextInfo
 	switch {
 	case m.ExtendedTextMessage != nil:
-		m.ExtendedTextMessage.ContextInfo = ci
+		ci = &m.ExtendedTextMessage.ContextInfo
 	case m.ImageMessage != nil:
-		m.ImageMessage.ContextInfo = ci
+		ci = &m.ImageMessage.ContextInfo
 	case m.VideoMessage != nil:
-		m.VideoMessage.ContextInfo = ci
+		ci = &m.VideoMessage.ContextInfo
 	case m.DocumentMessage != nil:
-		m.DocumentMessage.ContextInfo = ci
+		ci = &m.DocumentMessage.ContextInfo
+	default:
+		return nil
 	}
+	if *ci == nil {
+		*ci = &waE2E.ContextInfo{}
+	}
+	return *ci
+}
+
+// disappearing makes an outgoing message disappear exp seconds after it is sent, as the chat's
+// timer asks.
+func disappearing(m *waE2E.Message, exp uint32) {
+	if ci := contextOf(m); ci != nil {
+		ci.Expiration = proto.Uint32(exp)
+	}
+}
+
+// quote makes the outgoing m a reply to the stored message reply; nil: not a reply.
+func quote(m *waE2E.Message, reply *store.Message) {
+	if reply == nil {
+		return
+	}
+	ci := contextOf(m)
+	if ci == nil {
+		return
+	}
+	ci.StanzaID = proto.String(reply.ID)
+	ci.Participant = proto.String(reply.SenderJID)
+	ci.QuotedMessage = quotedMessage(reply)
+}
+
+// quotedMessage rebuilds the content of a stored message for a quote: media from its stored
+// sub-message, anything else as its text.
+func quotedMessage(r *store.Message) *waE2E.Message {
+	q := &waE2E.Message{}
+	var media proto.Message
+	switch r.Type {
+	case TypeImage:
+		q.ImageMessage = &waE2E.ImageMessage{}
+		media = q.ImageMessage
+	case TypeVideo:
+		q.VideoMessage = &waE2E.VideoMessage{}
+		media = q.VideoMessage
+	case TypeAudio:
+		q.AudioMessage = &waE2E.AudioMessage{}
+		media = q.AudioMessage
+	case TypeDocument:
+		q.DocumentMessage = &waE2E.DocumentMessage{}
+		media = q.DocumentMessage
+	case TypeSticker:
+		q.StickerMessage = &waE2E.StickerMessage{}
+		media = q.StickerMessage
+	}
+	if media == nil || len(r.MediaMeta) == 0 || proto.Unmarshal(r.MediaMeta, media) != nil {
+		return &waE2E.Message{Conversation: proto.String(r.Body)}
+	}
+	return q
 }
 
 func receiptStatus(t types.ReceiptType) string {
