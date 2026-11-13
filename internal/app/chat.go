@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"image"
 	"log"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -408,17 +410,33 @@ func (a *App) loadMentions(c chatRef) {
 	}()
 }
 
-// attach sends a picked file to the open chat.
-func (a *App) attach(path string) {
-	if a.locked {
+// attach sends picked or pasted files to the open chat, one after another in their order, and calls
+// done (may be nil) when it is through. A pending reply goes with the first. The first failure
+// stops it: the files after it are not sent.
+func (a *App) attach(paths []string, done func()) {
+	c := a.v.open
+	if a.locked || c.jid == "" {
+		if done != nil {
+			done()
+		}
 		return // nothing is shown, opened or sent behind the lock page
 	}
-	c := a.v.open
 	reply := a.takeReply()
 	a.sendOff("File not sent", func(ctx context.Context) error {
-		_, err := a.mgr.SendMedia(ctx, c.acct, c.jid, path, "", reply)
-		return err
-	}, mediaTimeout, nil)
+		if done != nil {
+			defer done()
+		}
+		for i, path := range paths {
+			if _, err := a.mgr.SendMedia(ctx, c.acct, c.jid, path, "", reply); err != nil {
+				if rest := len(paths) - i - 1; rest > 0 {
+					return fmt.Errorf("%s: %w (%d more not sent)", filepath.Base(path), err, rest)
+				}
+				return fmt.Errorf("%s: %w", filepath.Base(path), err)
+			}
+			reply = nil
+		}
+		return nil
+	}, time.Duration(len(paths))*mediaTimeout, nil)
 }
 
 // sendGIF downloads a picked GIPHY MP4 (allowlist checked again, size capped) and sends it to the

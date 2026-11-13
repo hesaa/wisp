@@ -55,7 +55,7 @@ type InputBar struct {
 	popup                       *walk.Dialog                                       // the open popup, nil for none
 	after                       func(d time.Duration, f func()) (stop func() bool) // one-shot timer; f runs on the UI thread
 	onSendGIF                   func(mp4URL string)
-	onAttach                    func(path string)
+	onAttach                    func(paths []string, done func())
 }
 
 // NewInputBar creates the bar in parent. gifKey returns the user's GIPHY API key ("" when none is
@@ -131,7 +131,7 @@ func (b *InputBar) build() error {
 	}
 	b.box = b.edit
 	b.edit.SetFont(font(bodyPt, 0))
-	if err := errors.Join(noBorder(b.edit), fillRest(b.Composite, b.field), fillRest(b.field, b.edit), enterSendsIn(b.edit, b.sendNow, b.boxKey, b.overEmoji),
+	if err := errors.Join(noBorder(b.edit), fillRest(b.Composite, b.field), fillRest(b.field, b.edit), enterSendsIn(b.edit, b.sendNow, b.boxKey, b.overEmoji, b.pasteMedia),
 		b.edit.Accessibility().SetName("Type a message")); err != nil {
 		return err
 	}
@@ -152,8 +152,9 @@ func (b *InputBar) OnTyping(fn func(composing bool)) { b.typing.fire = fn }
 // OnSendGIF sets the handler of a GIF picked in the search popup: an https GIPHY MP4 URL.
 func (b *InputBar) OnSendGIF(fn func(mp4URL string)) { b.onSendGIF = fn }
 
-// OnAttach sets the handler of a file picked with the Attach button.
-func (b *InputBar) OnAttach(fn func(path string)) { b.onAttach = fn }
+// OnAttach sets the handler of files to send, in order: picked with the Attach button or pasted
+// into the box, and confirmed in the preview. It calls done once they are sent or given up on.
+func (b *InputBar) OnAttach(fn func(paths []string, done func())) { b.onAttach = fn }
 
 // Reset empties the box for another chat and drops its pending reply and mention list. Call it
 // before switching: it may fire OnTyping(false) for the chat being left.
@@ -492,19 +493,6 @@ func (b *InputBar) apiKey() string {
 	return strings.TrimSpace(b.gifKey())
 }
 
-// pickFile asks for a file to send.
-func (b *InputBar) pickFile() {
-	dlg := walk.FileDialog{Title: "Attach a file"}
-	ok, err := dlg.ShowOpen(b.Form())
-	if err != nil {
-		logErr("attach", err)
-		return
-	}
-	if ok && b.onAttach != nil {
-		b.onAttach(dlg.FilePath)
-	}
-}
-
 // enterSends reports whether key k sends the message: Enter does, Shift+Enter breaks the line.
 func enterSends(k walk.Key, shift bool) bool { return k == walk.KeyReturn && !shift }
 
@@ -625,10 +613,11 @@ func (t *typingSignal) stop() {
 
 // enterHook routes Enter in a message box to send, after key had its pick of the keys.
 type enterHook struct {
-	prev uintptr // the window procedure walk installed
-	send func()
-	key  func(k walk.Key, act bool) bool // takes a key before the box does; act false: only asks
-	over func()                          // paints over what the box just drew (colour emoji); may be nil
+	prev  uintptr // the window procedure walk installed
+	send  func()
+	key   func(k walk.Key, act bool) bool // takes a key before the box does; act false: only asks
+	over  func()                          // paints over what the box just drew (colour emoji); may be nil
+	paste func() bool                     // takes a paste before the box does (files, a picture); may be nil
 }
 
 var (
@@ -644,6 +633,10 @@ func enterHookProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 		// Cancel unless the box asks for them: it does only while key has a use for them
 		if (wParam == win.VK_TAB || wParam == win.VK_ESCAPE) && h.key(walk.Key(wParam), false) {
 			return win.CallWindowProc(h.prev, hwnd, msg, wParam, lParam) | win.DLGC_WANTMESSAGE
+		}
+	case win.WM_PASTE:
+		if h.paste != nil && h.paste() {
+			return 0
 		}
 	case win.WM_KEYDOWN:
 		if h.key(walk.Key(wParam), true) {
@@ -683,10 +676,10 @@ func enterHookProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 
 // enterSendsIn makes Enter in te call send instead of breaking the line; Shift+Enter still does.
 // key sees every key first and reports whether it took it (enterHook.key); over runs after the box
-// redrew its text (enterHook.over).
-func enterSendsIn(te *walk.TextEdit, send func(), key func(k walk.Key, act bool) bool, over func()) error {
+// redrew its text (enterHook.over); paste gets a paste first (enterHook.paste).
+func enterSendsIn(te *walk.TextEdit, send func(), key func(k walk.Key, act bool) bool, over func(), paste func() bool) error {
 	h := te.Handle()
-	enterHooks[h] = &enterHook{prev: win.GetWindowLongPtr(h, win.GWLP_WNDPROC), send: send, key: key, over: over}
+	enterHooks[h] = &enterHook{prev: win.GetWindowLongPtr(h, win.GWLP_WNDPROC), send: send, key: key, over: over, paste: paste}
 	if win.SetWindowLongPtr(h, win.GWLP_WNDPROC, enterHookPtr) == 0 {
 		delete(enterHooks, h)
 		return errors.New("ui: subclassing the message box failed")
