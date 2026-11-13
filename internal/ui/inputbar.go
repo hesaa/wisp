@@ -47,9 +47,9 @@ type InputBar struct {
 	field                       *walk.Composite // the box's background
 	edit                        *walk.TextEdit
 	banner, list                *walk.CustomWidget // inside field over the box: pending reply, mention list
-	height                      int  // the bar's height, 1/96 inch
-	listH                       int  // the mention list's height, 1/96 inch; 0: hidden
-	canSend                     bool // the box holds more than whitespace
+	height                      int                // the bar's height, 1/96 inch
+	listH                       int                // the mention list's height, 1/96 inch; 0: hidden
+	canSend                     bool               // the box holds more than whitespace
 	gifs                        *giphy
 	gifKey                      func() string
 	popup                       *walk.Dialog                                       // the open popup, nil for none
@@ -158,9 +158,14 @@ func (b *InputBar) OnAttach(fn func(path string)) { b.onAttach = fn }
 // Reset empties the box for another chat and drops its pending reply and mention list. Call it
 // before switching: it may fire OnTyping(false) for the chat being left.
 func (b *InputBar) Reset() {
-	b.typing.stop()
-	logErr("clear input", b.edit.SetText(""))
-	b.ClearReply()
+	b.composer.reset()
+	b.banner.SetVisible(false)
+	b.showMentions()
+	b.fit()
+}
+
+// DismissMentions closes the mention list, if open.
+func (b *InputBar) DismissMentions() {
 	b.picker.close()
 	b.showMentions()
 }
@@ -194,6 +199,9 @@ func (b *InputBar) SetGroupParticipants(members []GroupMember) {
 	slices.SortStableFunc(members, func(x, y GroupMember) int {
 		return cmp.Compare(strings.ToLower(x.Name), strings.ToLower(y.Name))
 	})
+	if slices.Equal(members, b.picker.members) {
+		return // an open list keeps its highlight
+	}
 	b.picker.members = members
 	b.refreshMentions()
 }
@@ -519,6 +527,14 @@ type composer struct {
 	reply       *store.Message // the message the next one replies to; nil for none
 	replyAuthor string         // its sender's display name
 	picker      mentionPicker
+}
+
+// reset empties the box and drops the pending reply and the group's members, for another chat.
+func (c *composer) reset() {
+	c.typing.stop()
+	logErr("clear input", c.box.SetText(""))
+	c.clearReply()
+	c.picker = mentionPicker{}
 }
 
 func (c *composer) setReply(m store.Message, author string) { c.reply, c.replyAuthor = &m, author }

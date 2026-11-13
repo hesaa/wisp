@@ -1,8 +1,10 @@
 package app
 
 import (
+	"cmp"
 	"context"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -535,4 +537,25 @@ func logoutAll(ctx context.Context, accounts []string, logout func(context.Conte
 		}
 	}
 	return failed
+}
+
+// mentionMembers are group participants jids as the input bar offers them for a mention: named by
+// their full name, else push name, else number. self, the account's own number, is left out.
+func mentionMembers(jids []string, self string, d *ui.Directory) []ui.GroupMember {
+	out := make([]ui.GroupMember, 0, len(jids))
+	for _, jid := range jids {
+		user, server, _ := strings.Cut(jid, "@")
+		if user == self && server == "s.whatsapp.net" {
+			continue
+		}
+		p, _ := d.Person(jid)
+		phone, _ := strings.CutSuffix(p.PNJID, "@s.whatsapp.net")
+		if server == "s.whatsapp.net" {
+			phone = user
+		} else if !strings.HasSuffix(p.PNJID, "@s.whatsapp.net") {
+			phone = ""
+		}
+		out = append(out, ui.GroupMember{JID: jid, Name: cmp.Or(p.FullName, p.PushName, phone, user), Push: p.PushName, Phone: phone})
+	}
+	return out
 }

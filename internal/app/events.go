@@ -294,6 +294,7 @@ func (a *App) loadPeople(acct string) {
 			if acct == a.v.active {
 				a.side.SetDirectory(d)
 				a.chat.SetDirectory(d)
+				a.loadMentions(a.v.open) // their names, or the members themselves, may have changed
 			}
 		})
 	}()

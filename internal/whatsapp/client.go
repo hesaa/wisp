@@ -204,6 +204,7 @@ func (m *Manager) handleEvent(ctx context.Context, id string, cli waClient, evt 
 			m.peopleMu.Lock()
 			delete(m.members, id+" "+e.JID.String())
 			m.peopleMu.Unlock()
+			m.emit(PeopleEvent{AccountID: id}) // who can be mentioned changed
 		}
 		if e.Name != nil {
 			return m.nameChat(id, e.JID, e.Name.Name)

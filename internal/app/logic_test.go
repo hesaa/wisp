@@ -776,3 +776,19 @@ func TestLogoutAllReportsFailuresAndTriesEvery(t *testing.T) {
 		t.Errorf("failed %v, called %v", failed, called)
 	}
 }
+
+func TestMentionMembersNamesAndSkipsSelf(t *testing.T) {
+	d := ui.NewDirectory([]store.Person{
+		{JID: "111@lid", PNJID: "62811@s.whatsapp.net", FullName: "Budi", PushName: "budi99"},
+		{JID: "222@lid", PushName: "putri"},
+	})
+	got := mentionMembers([]string{"111@lid", "222@lid", "62833@s.whatsapp.net", "62800@s.whatsapp.net"}, "62800", d)
+	want := []ui.GroupMember{
+		{JID: "111@lid", Name: "Budi", Push: "budi99", Phone: "62811"},
+		{JID: "222@lid", Name: "putri", Push: "putri"},
+		{JID: "62833@s.whatsapp.net", Name: "62833", Phone: "62833"},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("mentionMembers = %+v, want %+v", got, want)
+	}
+}

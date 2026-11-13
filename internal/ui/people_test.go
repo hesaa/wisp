@@ -474,3 +474,21 @@ func TestDirectorySetAvatar(t *testing.T) {
 	var nilDir *Directory
 	nilDir.SetAvatar("111@s.whatsapp.net", "pic", 100)
 }
+
+func TestRewriteMentionsHighlightsAtAll(t *testing.T) {
+	for body, want := range map[string][][2]int{
+		"hi @all!":            {{3, 7}},
+		"@Everyone meet @ALL": {{0, 9}, {15, 19}},
+		"mail@all.com @allan": nil,
+	} {
+		if text, spans := rewriteMentions(body, "", nil); text != body || !slices.Equal(spans, want) {
+			t.Errorf("rewriteMentions(%q) = %q %v, want spans %v", body, text, spans, want)
+		}
+	}
+	// beside a member's mention, in order
+	d := NewDirectory([]store.Person{{JID: "111@lid", FullName: "Budi"}})
+	text, spans := rewriteMentions("@all and @111", "111@lid 222@lid", d)
+	if text != "@all and @Budi" || !slices.Equal(spans, [][2]int{{0, 4}, {9, 14}}) {
+		t.Errorf("with mentions: %q %v", text, spans)
+	}
+}

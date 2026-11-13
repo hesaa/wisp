@@ -264,6 +264,7 @@ type mentionCandidate struct {
 // For each JID in mentions, every @<user part> in body becomes @<Mention>.
 // With mentions == "", an @ followed by 5–20 digits (not preceded by a letter or digit,
 // not followed by one) is rewritten only when d.Person knows <digits>@lid or <digits>@s.whatsapp.net.
+// @all and @everyone, which mention every participant, are kept as typed and get a span too.
 // spans are the UTF-16 start/end offsets of each rewritten mention in text, in order.
 func rewriteMentions(body, mentions string, d *Directory) (string, [][2]int) {
 	if body == "" {
@@ -312,6 +313,13 @@ func rewriteMentions(body, mentions string, d *Directory) (string, [][2]int) {
 				i++
 				continue
 			}
+			if n := allMention(runes, i); n > 0 {
+				spans = append(spans, [2]int{u16Offset, u16Offset + n})
+				sb.WriteString(string(runes[i : i+n]))
+				u16Offset += n
+				i += n
+				continue
+			}
 
 			matched := false
 			for _, cand := range cands {
@@ -356,6 +364,13 @@ func rewriteMentions(body, mentions string, d *Directory) (string, [][2]int) {
 			i++
 			continue
 		}
+		if n := allMention(runes, i); n > 0 {
+			spans = append(spans, [2]int{u16Offset, u16Offset + n})
+			sb.WriteString(string(runes[i : i+n]))
+			u16Offset += n
+			i += n
+			continue
+		}
 
 		j := i + 1
 		for j < len(runes) && runes[j] >= '0' && runes[j] <= '9' {
@@ -392,6 +407,19 @@ func rewriteMentions(body, mentions string, d *Directory) (string, [][2]int) {
 	}
 
 	return sb.String(), spans
+}
+
+// allMention is the length in runes of the @all or @everyone starting at runes[i] (its @), 0 for
+// none.
+func allMention(runes []rune, i int) int {
+	for _, w := range []string{"all", "everyone"} {
+		end := i + 1 + len(w)
+		if end <= len(runes) && strings.EqualFold(string(runes[i+1:end]), w) &&
+			(end == len(runes) || !unicode.IsLetter(runes[end]) && !unicode.IsDigit(runes[end])) {
+			return end - i
+		}
+	}
+	return 0
 }
 
 func matchRunes(a, b []rune) bool {

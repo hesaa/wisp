@@ -45,6 +45,7 @@ type Backend interface {
 	FetchPicture(ctx context.Context, rawURL string) ([]byte, error)
 	About(ctx context.Context, accountID, jid string) (string, error)
 	GroupDetails(ctx context.Context, accountID, jid string) (whatsapp.GroupDetails, error)
+	GroupParticipants(ctx context.Context, accountID, groupJID string) ([]string, error)
 	SetProxy(addr string) error
 	Close() error
 }
@@ -316,6 +317,8 @@ func (a *App) build() error {
 		a.openChat(a.v.active, jid, "")
 	})
 	a.chat.OnOpenInfo(a.openInfo)
+	a.chat.OnReply(a.reply)
+	a.chat.OnHasMessage(a.hasMessage)
 	a.bar.OnSend(a.send)
 	a.bar.OnTyping(a.typing)
 	a.bar.OnAttach(a.attach)
@@ -647,6 +650,8 @@ func (a *App) lockNow() {
 	a.mw.Synchronize(a.focusPage) // once they are gone
 	a.closeMedia()
 	a.closeInfo()
+	a.bar.ClearReply() // the banner quotes a message
+	a.bar.DismissMentions()
 	a.lockPage.Clear()
 	a.showPage()
 	a.presence.appLock(true)

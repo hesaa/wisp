@@ -873,7 +873,7 @@ func (v *ChatView) mouseDown(x, y int, b walk.MouseButton) {
 	}
 	v.setSel(textMark{}, textMark{})
 	if n == 2 {
-		v.lastClickID = "" // a third click starts over
+		v.lastClickID = ""        // a third click starts over
 		if bub.kind == kindText { // on its text the double-click picks a word, on media it opens
 			v.triggerReply(m)
 			return

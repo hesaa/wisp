@@ -273,8 +273,8 @@ func TestMentionAutocompleteFiltering(t *testing.T) {
 		"z":     {"all"},
 		"":      {"all", "Budi Santoso", "Puteri", "62833"},
 		"SANT":  {"all", "Budi Santoso"},
-		"putri": {"all", "Puteri"},                // push name
-		"6281":  {"all", "Budi Santoso"},          // phone digits
+		"putri": {"all", "Puteri"},       // push name
+		"6281":  {"all", "Budi Santoso"}, // phone digits
 		"+6283": {"all", "62833"},
 	} {
 		if got := names(filterMentions(testMembers, q)); !slices.Equal(got, want) {
@@ -340,5 +340,16 @@ func TestWireMentionsReplaceNamesWithNumbers(t *testing.T) {
 	}
 	if text, jids = wireMentions("plain @all", nil); text != "plain @all" || len(jids) != 0 {
 		t.Fatalf("no members: %q %v", text, jids)
+	}
+}
+
+func TestComposerResetDropsReplyAndMentions(t *testing.T) {
+	c := &composer{box: &fakeBox{text: "draft @Pu"}}
+	c.setReply(store.Message{ID: "m1"}, "Alice")
+	c.picker.members = testMembers
+	c.picker.refresh("draft @Pu")
+	c.reset()
+	if _, ok := c.replyTarget(); ok || len(c.picker.items) != 0 || c.box.Text() != "" {
+		t.Fatalf("after reset: reply %v, list %v, text %q", ok, names(c.picker.items), c.box.Text())
 	}
 }

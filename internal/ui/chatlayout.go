@@ -33,9 +33,9 @@ const (
 	metaH        = 15 // time and ticks
 	metaGap      = 10 // between a text's last line and its time
 	tickW        = 16
-	runGap       = 2 // between messages of one sender in a row
-	newRunGap    = 8 // between runs
-	listPad      = 8 // above the first message and below the last
+	runGap       = 2  // between messages of one sender in a row
+	newRunGap    = 8  // between runs
+	listPad      = 8  // above the first message and below the last
 	quoteH       = 38 // quoted-message card of a reply: author over one line of the original
 	quoteGap     = 4  // under the card
 	quotePadL    = 10 // card text from the card's left edge, past the 3 px accent bar

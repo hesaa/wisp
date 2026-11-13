@@ -57,6 +57,7 @@ func (a *App) openChat(acct, jid, name string) {
 		name = a.chatName(acct, jid)
 	}
 	a.bar.Reset() // before the switch: it may still tell the chat being left that typing stopped
+	a.loadMentions(c)
 	a.loadChat(c, name)
 	a.showChatPane(true)
 	a.bar.Focus()
@@ -324,14 +325,87 @@ func (a *App) send(text string) {
 		return // nothing is shown, opened or sent behind the lock page
 	}
 	c := a.v.open
+	reply := a.takeReply()
+	wire, mentions := a.bar.WireMentions(text) // @Name as typed becomes @<number> on the wire
 	a.sendOff("Message not sent", func(ctx context.Context) error {
-		_, err := a.mgr.SendText(ctx, c.acct, c.jid, text, nil, nil)
+		_, err := a.mgr.SendText(ctx, c.acct, c.jid, wire, reply, mentions)
 		return err
 	}, netTimeout, func() {
-		if a.v.open == c {
-			a.bar.Restore(text)
+		if a.v.open != c {
+			return
+		}
+		a.bar.Restore(text)
+		if _, replying := a.bar.ReplyTarget(); reply != nil && !replying {
+			a.bar.SetReply(*reply, a.replyAuthor(*reply))
 		}
 	})
+}
+
+// takeReply is the message the input bar's next one replies to (nil for none), no longer pending.
+func (a *App) takeReply() *store.Message {
+	m, ok := a.bar.ReplyTarget()
+	if !ok {
+		return nil
+	}
+	a.bar.ClearReply()
+	return &m
+}
+
+// reply starts a reply to m of the open chat in the input bar.
+func (a *App) reply(m store.Message) {
+	if a.locked {
+		return // nothing is shown, opened or sent behind the lock page
+	}
+	a.bar.SetReply(m, a.replyAuthor(m))
+	a.bar.Focus()
+}
+
+// replyAuthor names m's sender for the reply banner.
+func (a *App) replyAuthor(m store.Message) string {
+	if m.FromMe {
+		return "yourself"
+	}
+	stored := ""
+	if !isGroup(m.ChatJID) {
+		stored = a.chatName(m.AccountID, m.ChatJID)
+	}
+	return a.dir(m.AccountID).Name(m.SenderJID, stored)
+}
+
+// hasMessage reports whether the open chat has message id stored, for a jump to a reply's original.
+// shortcut: one primary-key lookup on the UI thread per click on a quote; move it off the thread if
+// it ever stalls.
+func (a *App) hasMessage(id string) bool {
+	_, ok, err := a.db.GetMessage(a.v.open.acct, a.v.open.jid, id)
+	logErr("quoted message", err)
+	return ok
+}
+
+// loadMentions gives the input bar the members of group c to offer for a mention, named by the
+// directory. The manager keeps a looked-up group's participants in memory, so this asks the network
+// once per group; it runs again when the people directory changes (names, joins, leaves).
+func (a *App) loadMentions(c chatRef) {
+	if !isGroup(c.jid) || a.mgr == nil {
+		return
+	}
+	bg := a.bg
+	if bg == nil {
+		bg = context.Background()
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(bg, netTimeout)
+		defer cancel()
+		jids, err := a.mgr.GroupParticipants(ctx, c.acct, c.jid)
+		a.mw.Synchronize(func() {
+			if err != nil {
+				logErr("group members", err)
+				return
+			}
+			if a.v.open == c && !a.locked {
+				a.bar.SetGroupParticipants(mentionMembers(jids, c.acct, a.dir(c.acct)))
+			}
+		})
+	}()
 }
 
 // attach sends a picked file to the open chat.
@@ -340,8 +414,9 @@ func (a *App) attach(path string) {
 		return // nothing is shown, opened or sent behind the lock page
 	}
 	c := a.v.open
+	reply := a.takeReply()
 	a.sendOff("File not sent", func(ctx context.Context) error {
-		_, err := a.mgr.SendMedia(ctx, c.acct, c.jid, path, "", nil)
+		_, err := a.mgr.SendMedia(ctx, c.acct, c.jid, path, "", reply)
 		return err
 	}, mediaTimeout, nil)
 }
