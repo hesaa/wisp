@@ -157,10 +157,33 @@ func saveBitmapPNG(bmp win.HBITMAP, dir string) (string, error) {
 func (b *InputBar) pasteMedia() bool {
 	items := clipboardItems(b.edit.Handle())
 	if len(items) == 0 {
-		return false
+		return pasteText(b.edit)
 	}
 	b.offer(items)
 	return true
+}
+
+// pasteText pastes the clipboard's text into te with its line breaks made "\r\n", the only ones an
+// edit control breaks lines at (text copied from a browser or a terminal often has bare "\n"), and
+// reports whether it did; false leaves the paste to te.
+func pasteText(te *walk.TextEdit) bool {
+	text, err := walk.Clipboard().Text()
+	if err != nil || !strings.Contains(text, "\n") {
+		return false
+	}
+	p, err := syscall.UTF16PtrFromString(crlf(text))
+	if err != nil { // a NUL in the text: let the box paste what it can
+		return false
+	}
+	te.SendMessage(win.EM_REPLACESEL, 1, uintptr(unsafe.Pointer(p))) // 1: the paste can be undone
+	return true
+}
+
+// crlf makes every line break of s, "\n", "\r\n" or a lone "\r", a "\r\n".
+func crlf(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	return strings.ReplaceAll(s, "\n", "\r\n")
 }
 
 // offer shows items in the preview and, confirmed, hands the sendable ones to OnAttach.

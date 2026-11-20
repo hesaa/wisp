@@ -57,9 +57,10 @@ type measurer interface {
 type bubbleKind int
 
 const (
-	kindText  bubbleKind = iota // text, deleted and unsupported messages
-	kindImage                   // a thumbnail box, caption below
-	kindCard                    // video, audio, document, sticker without preview: icon, name, size
+	kindText   bubbleKind = iota // text, deleted and unsupported messages
+	kindImage                    // a thumbnail box, caption below
+	kindCard                     // video, audio, document, sticker without preview: icon, name, size
+	kindSystem                   // centered system notices (e.g. member removed)
 )
 
 // mediaInfo is what a bubble shows of a message's MediaMeta.
@@ -104,6 +105,8 @@ func parseMedia(m *store.Message) (mediaInfo, error) {
 
 func kindOf(m *store.Message, info mediaInfo) bubbleKind {
 	switch m.Type {
+	case "system":
+		return kindSystem
 	case "image":
 		return kindImage
 	case "sticker": // its file is a picture: shown once downloaded, its embedded preview until then
@@ -126,6 +129,8 @@ func bubbleText(m *store.Message, info mediaInfo, d ...*Directory) (string, [][2
 		dir = d[0]
 	}
 	switch m.Type {
+	case "system":
+		return m.Body, nil, false
 	case "revoked":
 		return "This message was deleted", nil, true
 	case "unsupported":
@@ -238,15 +243,23 @@ type bubble struct {
 	gifBadge bool      // GIF preview
 	info     mediaInfo // without preview bytes
 	box      walk.Rectangle
-	name     walk.Rectangle // sender name, incoming group messages starting a run
-	text     walk.Rectangle // body, caption or notice: widest line by lines × line height
-	units    []uint16       // the text, UTF-16
-	mentions [][2]int       // UTF-16 spans of rewritten mentions
-	lines    []textLine     // the text's lines, top to bottom
-	thumb    walk.Rectangle // image box
-	card     walk.Rectangle // media card
-	time     walk.Rectangle
-	ticks    walk.Rectangle // outgoing only
+	name     walk.Rectangle   // sender name, incoming group messages starting a run
+	text     walk.Rectangle   // body, caption or notice: widest line by lines × line height
+	units    []uint16         // the text, UTF-16
+	mentions [][2]int         // UTF-16 spans of rewritten mentions
+	styles   []walk.FontStyle // each unit's formatting (formatText), nil for none
+	indents  []int            // each line's indent in pixels (wrapBlocks), nil for none
+	// an album (album.go): how many photos it shows, from this message on, whether each has an
+	// embedded preview, and their total size; hidden for the photos after the first
+	album        int
+	albumPreview []bool
+	albumBytes   uint64
+	hidden       bool
+	lines        []textLine     // the text's lines, top to bottom
+	thumb        walk.Rectangle // image box
+	card         walk.Rectangle // media card
+	time         walk.Rectangle
+	ticks        walk.Rectangle // outgoing only
 	// a reply's card of the message it answers, above everything but the sender's name
 	quotedBox                   walk.Rectangle
 	quotedSender, quotedSnippet string
@@ -298,7 +311,8 @@ func (l *chatLayout) quoteLabels(m *store.Message) (sender, snippet string) {
 	if user, _, _ := strings.Cut(m.QuotedSender, "@"); m.AccountID == "" || user != m.AccountID {
 		sender = l.sender(m.QuotedSender)
 	}
-	snippet = strings.Join(strings.Fields(m.QuotedBody), " ")
+	snippet, _, _ = formatText(m.QuotedBody, nil) // *bold* and the like show without their markers
+	snippet = strings.Join(strings.Fields(snippet), " ")
 	if r := []rune(snippet); len(r) > quoteMaxLen {
 		snippet = string(r[:quoteMaxLen]) + "…"
 	}
@@ -313,17 +327,30 @@ func (l *chatLayout) update(msgs []store.Message, width, dpi int, ms measurer) {
 	}
 	s := scaler(dpi)
 	l.tops = l.tops[:0]
-	y := s(listPad)
+	y, rest := s(listPad), 0 // rest: hidden photos still to come of the album above
 	for i := range msgs {
 		m := &msgs[i]
 		run := i > 0 && msgs[i-1].FromMe == m.FromMe && msgs[i-1].SenderJID == m.SenderJID
 		named := l.group && !m.FromMe && !run
+		hidden, n := rest > 0, 0
+		if hidden {
+			rest--
+		} else if n = albumLen(msgs, i); n > 0 {
+			rest = n - 1
+		}
 		b, ok := l.cache[m.ID]
-		if !ok || b.named != named {
-			b = l.layout(m, named, ms)
+		if !ok || b.hidden != hidden || (!hidden && (b.named != named || b.album != n)) {
+			if hidden {
+				b = bubble{hidden: true}
+			} else {
+				b = l.layout(m, named, ms, msgs[i:i+n])
+			}
 			l.cache[m.ID] = b
 		}
 		switch {
+		case hidden:
+			l.tops = append(l.tops, y)
+			continue
 		case i == 0:
 		case run:
 			y += s(runGap)
@@ -337,11 +364,28 @@ func (l *chatLayout) update(msgs []store.Message, width, dpi int, ms measurer) {
 }
 
 // layout lays one message out; its bubble's x is final, its y relative to the bubble's top.
-func (l *chatLayout) layout(m *store.Message, named bool, ms measurer) bubble {
+// album holds the album's photos when m leads one, m first.
+func (l *chatLayout) layout(m *store.Message, named bool, ms measurer, album []store.Message) bubble {
 	s := scaler(l.dpi)
 	info, err := parseMedia(m)
 	logErr("media details of message "+m.ID, err)
 	b := bubble{kind: kindOf(m, info), out: m.FromMe, named: named, avatar: l.group && !m.FromMe && named, preview: len(info.preview) > 0}
+	if b.kind == kindSystem {
+		b.out = false
+		b.named = false
+		b.avatar = false
+		text := m.Body
+		maxW := l.width * bubbleMaxPct / 100
+		tw, th := ms.measure(text, 9, 0, maxW-2*s(12))
+		boxW := tw + 2*s(12)
+		boxH := th + 2*s(6)
+		boxX := max(0, (l.width-boxW)/2)
+		b.box = walk.Rectangle{X: boxX, Width: boxW, Height: boxH}
+		b.text = walk.Rectangle{X: boxX + s(12), Y: s(6), Width: tw, Height: th}
+		b.units = utf16.Encode([]rune(text))
+		b.lines = []textLine{{end: len(b.units)}}
+		return b
+	}
 	if b.kind == kindImage && m.Type == "video" {
 		b.play = true
 		b.gifBadge = info.gif
@@ -354,6 +398,9 @@ func (l *chatLayout) layout(m *store.Message, named bool, ms measurer) bubble {
 	maxW := l.width * bubbleMaxPct / 100
 	padX := s(bubblePadX)
 	text, spans, muted := bubbleText(m, info, l.dir)
+	if !muted {
+		text, spans, b.styles = formatText(text, spans)
+	}
 	b.mentions = spans
 	style := walk.FontStyle(0)
 	if muted {
@@ -393,6 +440,18 @@ func (l *chatLayout) layout(m *store.Message, named bool, ms measurer) bubble {
 				side = stickerSide
 			}
 			media.Width, media.Height = fitBox(info.w, info.h, s(side), maxW-2*s(bubbleInset))
+			if len(album) > 0 {
+				media.Width = min(s(thumbSide), maxW-2*s(bubbleInset))
+				media.Height = media.Width
+				b.album = len(album)
+				for k := range album {
+					ai, _ := parseMedia(&album[k])
+					b.albumBytes += ai.size
+					if k < 4 {
+						b.albumPreview = append(b.albumPreview, len(ai.preview) > 0)
+					}
+				}
+			}
 			b.thumb = media
 		} else {
 			media.Width, media.Height = min(s(cardW), maxW-2*s(bubbleInset)), s(cardH)
@@ -409,8 +468,12 @@ func (l *chatLayout) layout(m *store.Message, named bool, ms measurer) bubble {
 	if text != "" {
 		var x []int
 		b.units = utf16.Encode([]rune(text))
-		b.lines = wrapText(b.units, maxW-2*padX, func(u []uint16) []int { x = ms.advances(u, bodyPt, style); return x })
-		tw, th := textWidth(b.units, x, b.lines, maxW-2*padX), len(b.lines)*l.lineH
+		b.lines, b.indents, x = wrapBlocks(b.units, maxW-2*padX, b.styles, s, func(u []uint16) []int { return styledAdv(ms, u, b.styles, style) })
+		tw, th := 0, len(b.lines)*l.lineH
+		for li, ln := range b.lines {
+			ind := lineIndent(b.indents, li)
+			tw = max(tw, ind+textWidth(b.units, x, []textLine{ln}, maxW-2*padX-ind))
+		}
 		b.text = walk.Rectangle{X: padX, Y: y, Width: tw, Height: th}
 		inline := len(b.lines) == 1 && tw+s(metaGap)+metaW <= maxW-2*padX
 		if inline {

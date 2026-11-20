@@ -209,6 +209,46 @@ func (m *Manager) handleEvent(ctx context.Context, id string, cli waClient, evt 
 			m.peopleMu.Unlock()
 			m.emit(PeopleEvent{AccountID: id}) // who can be mentioned changed
 		}
+		if len(e.Leave) > 0 {
+			userRemoved := false
+			for _, j := range e.Leave {
+				if j.User == id {
+					userRemoved = true
+					break
+				}
+			}
+			if userRemoved {
+				body := "You're no longer a member of this group"
+				if e.Sender != nil && e.Sender.User != id && e.Sender.User != "" {
+					removerName := e.Sender.User
+					m.peopleMu.RLock()
+					if p, ok := m.people[id+" "+e.Sender.String()]; ok {
+						if p.PushName != "" {
+							removerName = p.PushName
+						} else if p.FullName != "" {
+							removerName = p.FullName
+						}
+					}
+					m.peopleMu.RUnlock()
+					body = fmt.Sprintf("~ %s removed you", removerName)
+				}
+				ts := e.Timestamp.Unix()
+				if ts <= 0 {
+					ts = time.Now().Unix()
+				}
+				msg := store.Message{
+					AccountID: id,
+					ChatJID:   e.JID.String(),
+					ID:        fmt.Sprintf("sys_%d", e.Timestamp.UnixNano()),
+					Type:      "system",
+					Body:      body,
+					Timestamp: ts,
+					Status:    store.StatusRead,
+				}
+				_, _ = m.store.InsertMessage(msg)
+				m.emit(MessageEvent{AccountID: id, Message: msg})
+			}
+		}
 		if e.Name != nil {
 			return m.nameChat(id, e.JID, e.Name.Name)
 		}

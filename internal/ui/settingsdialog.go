@@ -195,7 +195,7 @@ func (d *settingsDialog) build() error {
 	// focus cues follow the user's setting and last input (hidden after a click until a key is used)
 	d.SendMessage(win.WM_CHANGEUISTATE, win.UIS_INITIALIZE, 0)
 	// cosmetic: Windows builds without dark title bars keep a light one
-	logErr("settings title bar", theme.ApplyTitleBar(uintptr(d.Handle()), isDark(d.pal)))
+	logErr("settings title bar", titleBar(d, isDark(d.pal)))
 	return nil
 }
 
@@ -678,7 +678,7 @@ func (d *settingsDialog) themeChanged(m theme.ThemeMode) {
 		return
 	}
 	logErr("settings theme", d.setPalette(theme.GetPalette(m)))
-	logErr("settings title bar", theme.ApplyTitleBar(uintptr(d.Handle()), isDark(d.pal)))
+	logErr("settings title bar", titleBar(d, isDark(d.pal)))
 	// DWM recolours a shown caption when it next paints it: repaint it now
 	active := uintptr(win.BoolToBOOL(win.GetActiveWindow() == d.Handle()))
 	d.SendMessage(win.WM_NCACTIVATE, 1-active, 0)
@@ -904,7 +904,7 @@ func Confirm(owner walk.Form, p theme.Palette, question, text, action string) (b
 	}
 	dlg.Starting().Attach(func() { focusOn(cancel) })
 	dlg.SendMessage(win.WM_CHANGEUISTATE, win.UIS_INITIALIZE, 0)
-	logErr("confirm title bar", theme.ApplyTitleBar(uintptr(dlg.Handle()), isDark(p)))
+	logErr("confirm title bar", titleBar(dlg, isDark(p)))
 	return dlg.Run() == walk.DlgCmdOK, nil
 }
 

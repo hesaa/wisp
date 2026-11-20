@@ -788,17 +788,46 @@ func (v *MediaView) saveAs() {
 		return
 	}
 	src := m.MediaPath
-	dlg := walk.FileDialog{Title: "Save as", Flags: win.OFN_OVERWRITEPROMPT, FilePath: "Wisp " + time.Unix(m.Timestamp, 0).Format("2006-01-02 15.04.05") + filepath.Ext(src)}
+	ext := filepath.Ext(src)
+	dlg := walk.FileDialog{Title: "Save as", Flags: win.OFN_OVERWRITEPROMPT, FilePath: "Wisp " + time.Unix(m.Timestamp, 0).Format("2006-01-02 15.04.05") + ext}
+	if ext != "" {
+		dlg.Filter, dlg.FilterIndex = saveFilter(ext), 1
+	}
 	ok, err := dlg.ShowSave(v.Form())
-	if err != nil || !ok || v.list == nil || strings.EqualFold(filepath.Clean(dlg.FilePath), filepath.Clean(src)) {
+	if err != nil || !ok || v.list == nil {
 		logErr("save as", err)
-		return // cancelled, closed by the lock, or the cached file itself
+		return // cancelled or closed by the lock
+	}
+	// walk sets no default extension: a name typed without one gets the file's, if its type is chosen
+	if ext != "" && dlg.FilterIndex == 1 && filepath.Ext(dlg.FilePath) == "" {
+		dlg.FilePath += ext
+		if _, err := os.Stat(dlg.FilePath); err == nil && walk.MsgBox(v.Form(), "Save as",
+			filepath.Base(dlg.FilePath)+" already exists.\nDo you want to replace it?", walk.MsgBoxIconWarning|walk.MsgBoxYesNo) != walk.DlgCmdYes {
+			return
+		}
+	}
+	if strings.EqualFold(filepath.Clean(dlg.FilePath), filepath.Clean(src)) {
+		return // the cached file itself
 	}
 	if err := copyFile(src, dlg.FilePath); err != nil {
 		logErr("save as", err)
 		walk.MsgBox(v.Form(), "Wisp", "This file was not saved: "+err.Error(), walk.MsgBoxIconWarning|walk.MsgBoxOK)
 	}
 }
+
+// saveFilter is Save as's type list for a file ending ext (".jpg"): that type, then all files.
+func saveFilter(ext string) string {
+	name := strings.ToUpper(strings.TrimPrefix(ext, "."))
+	if kind := saveKinds[strings.ToLower(ext)]; kind != "" {
+		name = kind
+	} else {
+		name += " file"
+	}
+	return name + " (*" + ext + ")|*" + ext + "|All files (*.*)|*.*"
+}
+
+var saveKinds = map[string]string{".jpg": "JPEG image", ".jpeg": "JPEG image", ".png": "PNG image", ".webp": "WebP image",
+	".gif": "GIF image", ".mp4": "MP4 video", ".ogg": "Ogg audio", ".opus": "Opus audio", ".mp3": "MP3 audio", ".pdf": "PDF document"}
 
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)

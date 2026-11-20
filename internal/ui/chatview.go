@@ -2,6 +2,7 @@ package ui
 
 import (
 	"bytes"
+	"cmp"
 	"errors"
 	"fmt"
 	"image"
@@ -515,7 +516,7 @@ func (v *ChatView) SetDirectory(d *Directory) {
 	logErr("chat header repaint", v.header.Invalidate())
 }
 
-// Invalidate repaints the chat view: header, message canvas, and composite.
+// Invalidate repaints the chat view: header and message canvas.
 func (v *ChatView) Invalidate() error {
 	if v == nil {
 		return nil
@@ -526,9 +527,6 @@ func (v *ChatView) Invalidate() error {
 	}
 	if v.canvas != nil {
 		errs = append(errs, v.canvas.Invalidate())
-	}
-	if v.Composite != nil {
-		errs = append(errs, v.Composite.Invalidate())
 	}
 	return errors.Join(errs...)
 }
@@ -792,12 +790,18 @@ func (v *ChatView) focusOn(i int) {
 func (v *ChatView) describe(i int) string {
 	m, b := &v.msgs[i], v.lay.cache[v.msgs[i].ID]
 	who := v.senderOf(*m)
-	text, _, _ := bubbleText(m, b.info, v.dir)
+	text, spans, muted := bubbleText(m, b.info, v.dir)
+	if !muted {
+		text, _, _ = formatText(text, spans) // read the words, not *bold*'s stars
+	}
 	switch b.kind {
 	case kindImage:
 		what := "Photo"
 		if m.Type == "sticker" {
 			what = "Sticker"
+		}
+		if b.album > 0 {
+			what = plural(b.album, "photo", "photos")
 		}
 		text = strings.TrimSpace(what + " " + text)
 	case kindCard:
@@ -858,6 +862,11 @@ func (v *ChatView) key(k walk.Key) bool {
 	}
 	first, last := v.visible()
 	next, ok := navigate(i, len(v.lay.tops), max(1, last-first-1), k, false)
+	for d := cmp.Compare(next, i); ok && d != 0 && next >= 0 && next < len(v.msgs) && v.lay.cache[v.msgs[next].ID].hidden; {
+		if next += d; next < 0 || next >= len(v.msgs) { // an album last: stay
+			next = i
+		}
+	}
 	if ok && next >= 0 {
 		v.focusOn(next)
 	}
@@ -916,6 +925,21 @@ func (v *ChatView) mouseDown(x, y int, b walk.MouseButton) {
 		if bub.kind == kindText { // on its text the double-click picks a word, on media it opens
 			v.triggerReply(m)
 			return
+		}
+	}
+	if bub.album > 0 {
+		album := slices.Clone(v.msgs[i : i+bub.album])
+		k, all, ok := albumHit(bub, x, y-v.screenY(i), v.canvas.DPI(), albumMissing(album))
+		switch {
+		case all:
+			for _, am := range album {
+				if needsDownload(am) && v.onNeedMedia != nil {
+					v.onNeedMedia(am)
+				}
+			}
+			return
+		case ok:
+			m = album[k]
 		}
 	}
 	v.activate(m, clickOpens(m.Type, v.lay.cache[m.ID], x, y-v.screenY(i), n, mods, v.dragging))
@@ -1010,11 +1034,12 @@ func (v *ChatView) posAt(x, y int, under bool) textPos {
 	case y >= top+len(b.lines)*v.lay.lineH:
 		return textPos{i, len(b.units)}
 	}
-	ln := b.lines[(y-top)/v.lay.lineH]
+	li := (y - top) / v.lay.lineH
+	ln := b.lines[li]
 	ms := &gdiMeasurer{dpi: v.canvas.DPI(), cdpi: v.cdpi}
-	adv := lineAdv(ms, b.units[ln.start:ln.end], 0) // notices, in italics, are not selectable
+	adv := lineAdv(ms, b.units[ln.start:ln.end], lineStyles(b, ln), 0) // notices, in italics, are not selectable
 	logErr("chat hit test", ms.close())
-	x -= b.text.X
+	x -= b.text.X + lineIndent(b.indents, li)
 	if under { // the unit whose right edge is past x; past the line's end, its last
 		return textPos{i, ln.start + min(sort.Search(len(adv), func(j int) bool { return adv[j] > x }), max(0, len(adv)-1))}
 	}
@@ -1301,7 +1326,7 @@ func (v *ChatView) paint(c *walk.Canvas, ub walk.Rectangle) error {
 	first, last := v.visible()
 	for i := first; i < last; i++ {
 		m, b, dy := &v.msgs[i], v.lay.cache[v.msgs[i].ID], v.screenY(i)
-		if dy+b.box.Height+s(3) <= ub.Y || dy-s(3) >= ub.Y+ub.Height {
+		if b.hidden || dy+b.box.Height+s(3) <= ub.Y || dy-s(3) >= ub.Y+ub.Height {
 			continue
 		}
 		if v.picked[m.ID] || m.ID == v.glow {
@@ -1311,7 +1336,7 @@ func (v *ChatView) paint(c *walk.Canvas, ub walk.Rectangle) error {
 		}
 		var sel textLine
 		sel.start, sel.end = selSpan(from, to, i, selectableUnits(m, b))
-		if err := v.paintBubble(c, m, b, dy, sel); err != nil {
+		if err := v.paintBubble(c, m, b, dy, sel, v.msgs[i:i+b.album]); err != nil {
 			return err
 		}
 		if focused && m.ID == v.focus {
@@ -1347,12 +1372,18 @@ func (v *ChatView) paintPick(c *walk.Canvas, b bubble, dy int) error {
 var cardIcons = map[string]icons.Icon{"document": icons.IconDocument, "video": icons.IconVideo, "audio": icons.IconAudio, "sticker": icons.IconEmoji}
 
 // paintBubble paints message m's bubble b with its top at canvas y dy, the units sel of its text
-// highlighted as selected.
-func (v *ChatView) paintBubble(c *walk.Canvas, m *store.Message, b bubble, dy int, sel textLine) error {
+// highlighted as selected; album holds an album's photos, m first.
+func (v *ChatView) paintBubble(c *walk.Canvas, m *store.Message, b bubble, dy int, sel textLine, album []store.Message) error {
 	dpi, p := v.canvas.DPI(), v.pal
 	s := scaler(dpi)
 	at := func(r walk.Rectangle) walk.Rectangle { r.Y += dy; return r }
 	secondary := theme.Color(p.TextSecondary)
+	if b.kind == kindSystem {
+		if err := icons.FillRounded(c, at(b.box), s(bubbleRadius), theme.Color(p.Header)); err != nil {
+			return err
+		}
+		return drawText(c, dpi, m.Body, 9, 0, secondary, at(b.box), centerText)
+	}
 	if err := icons.FillRounded(c, at(b.box), s(bubbleRadius), theme.Color(bubbleColor(p, b.out))); err != nil {
 		return err
 	}
@@ -1377,7 +1408,9 @@ func (v *ChatView) paintBubble(c *walk.Canvas, m *store.Message, b bubble, dy in
 		line.Y += s(16)
 		errs = append(errs, drawText(c, dpi, b.quotedSnippet, namePt, 0, secondary, line, leftText))
 	}
-	if b.thumb.Width > 0 {
+	if len(album) > 0 {
+		errs = append(errs, v.paintAlbum(c, at(b.thumb), b, album))
+	} else if b.thumb.Width > 0 {
 		r := at(b.thumb)
 		playing := false
 		if a := v.animFor(m, b.gifBadge, r); a != nil && a.pix != nil { // a sticker or GIF in motion
@@ -1432,14 +1465,34 @@ func (v *ChatView) paintBubble(c *walk.Canvas, m *store.Message, b bubble, dy in
 		r := at(b.text)
 		r.Height = v.lay.lineH
 		ms := &gdiMeasurer{dpi: dpi, cdpi: v.cdpi} // measures only lines with a selection or mentions
-		for _, ln := range b.lines {
+		left, s := r.X, scaler(dpi)
+		for li, ln := range b.lines {
 			lineUnits := b.units[ln.start:ln.end]
+			r.X = left + lineIndent(b.indents, li)
+			if ln.start < len(b.styles) && b.styles[ln.start]&fontQuote != 0 {
+				errs = append(errs, fillBack(c, walk.Rectangle{X: left, Y: r.Y, Width: s(quoteBarW), Height: r.Height}, secondary))
+			}
 			var adv []int
 			getAdv := func() []int {
 				if adv == nil {
-					adv = lineAdv(ms, lineUnits, style)
+					adv = lineAdv(ms, lineUnits, lineStyles(b, ln), style)
 				}
 				return adv
+			}
+			if styles := lineStyles(b, ln); slices.ContainsFunc(styles, func(st walk.FontStyle) bool { return st&fontCode != 0 }) {
+				x := getAdv()
+				for lo := 0; lo < len(styles); lo++ { // inline code's shaded boxes, under any selection
+					if styles[lo]&fontCode == 0 {
+						continue
+					}
+					hi := lo + 1
+					for hi < len(styles) && styles[hi]&fontCode != 0 {
+						hi++
+					}
+					box := walk.Rectangle{X: r.X + widthOf(x, 0, lo) - s(2), Y: r.Y + s(1), Width: widthOf(x, lo, hi) + s(4), Height: r.Height - s(2)}
+					errs = append(errs, icons.FillRounded(c, box, s(3), theme.Color(p.ChatBg)))
+					lo = hi
+				}
 			}
 			if lo, hi := max(sel.start, ln.start)-ln.start, min(sel.end, ln.end)-ln.start; lo < hi {
 				x := getAdv()
@@ -1449,36 +1502,35 @@ func (v *ChatView) paintBubble(c *walk.Canvas, m *store.Message, b bubble, dy in
 				}
 				errs = append(errs, err)
 			}
-			var lineMentions [][2]int
-			if len(b.mentions) > 0 && !muted {
-				for _, sp := range b.mentions {
-					mLo := max(sp[0], ln.start) - ln.start
-					mHi := min(sp[1], ln.end) - ln.start
-					if mLo < mHi {
-						lineMentions = append(lineMentions, [2]int{mLo, mHi})
-					}
-				}
-			}
-			if len(lineMentions) > 0 {
-				x := getAdv()
-				accentColor := theme.Color(p.Accent)
-				lastU := 0
-				for _, mSpan := range lineMentions {
-					mLo, mHi := mSpan[0], mSpan[1]
-					if mLo > lastU {
-						segRect := walk.Rectangle{X: r.X + widthOf(x, 0, lastU), Y: r.Y, Width: widthOf(x, lastU, mLo), Height: r.Height}
-						errs = append(errs, drawText(c, dpi, string(utf16.Decode(lineUnits[lastU:mLo])), bodyPt, style, color, segRect, walk.TextSingleLine|walk.TextNoPrefix))
-					}
-					segRect := walk.Rectangle{X: r.X + widthOf(x, 0, mLo), Y: r.Y, Width: widthOf(x, mLo, mHi), Height: r.Height}
-					errs = append(errs, drawText(c, dpi, string(utf16.Decode(lineUnits[mLo:mHi])), bodyPt, style, accentColor, segRect, walk.TextSingleLine|walk.TextNoPrefix))
-					lastU = mHi
-				}
-				if lastU < len(lineUnits) {
-					segRect := walk.Rectangle{X: r.X + widthOf(x, 0, lastU), Y: r.Y, Width: widthOf(x, lastU, len(lineUnits)), Height: r.Height}
-					errs = append(errs, drawText(c, dpi, string(utf16.Decode(lineUnits[lastU:])), bodyPt, style, color, segRect, walk.TextSingleLine|walk.TextNoPrefix))
-				}
-			} else {
+			if len(b.mentions) == 0 && b.styles == nil {
 				errs = append(errs, drawText(c, dpi, string(utf16.Decode(lineUnits)), bodyPt, style, color, r, walk.TextSingleLine|walk.TextNoPrefix))
+			} else { // runs of one colour (mentions in the accent) and one style
+				styles, x := lineStyles(b, ln), getAdv()
+				look := func(u int) (walk.Color, walk.FontStyle) {
+					col, st := color, style
+					if styles != nil {
+						st |= styles[u]
+					}
+					for _, sp := range b.mentions {
+						if ln.start+u >= sp[0] && ln.start+u < sp[1] {
+							col = theme.Color(p.Accent)
+						}
+					}
+					return col, st
+				}
+				for lo := 0; lo < len(lineUnits); {
+					col, st := look(lo)
+					hi := lo + 1
+					for hi < len(lineUnits) {
+						if c2, s2 := look(hi); c2 != col || s2 != st {
+							break
+						}
+						hi++
+					}
+					seg := walk.Rectangle{X: r.X + widthOf(x, 0, lo), Y: r.Y, Width: widthOf(x, lo, hi), Height: r.Height}
+					errs = append(errs, drawText(c, dpi, string(utf16.Decode(lineUnits[lo:hi])), bodyPt, st, col, seg, walk.TextSingleLine|walk.TextNoPrefix))
+					lo = hi
+				}
 			}
 			r.Y += r.Height
 		}

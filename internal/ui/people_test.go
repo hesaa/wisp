@@ -322,6 +322,11 @@ func TestSnippetLine(t *testing.T) {
 			want: "hello",
 		},
 		{
+			name: "formatted text shows without its markers",
+			chat: store.Chat{LastType: "text", Snippet: "*Note:* _soon_ ~old~ `x` my_var"},
+			want: "Note: soon old x my_var",
+		},
+		{
 			name: "photo without caption",
 			chat: store.Chat{LastType: "image"},
 			want: "Photo",
@@ -408,6 +413,9 @@ func TestSnippetLine(t *testing.T) {
 	}
 	if got := snippetLine(store.Chat{JID: "12345-67890@g.us", LastType: "text", Snippet: "hello", LastSender: "6281234567890@s.whatsapp.net"}, nilDir); got != "+6281234567890: hello" {
 		t.Fatalf("nil dir snippetLine group: got %q, want '+6281234567890: hello'", got)
+	}
+	if got := snippetLine(store.Chat{JID: "12345-67890@g.us", LastType: "system", Snippet: "~ Jun - HollaTeam removed you", LastSender: "6281234567890@s.whatsapp.net"}, nilDir); got != "~ Jun - HollaTeam removed you" {
+		t.Fatalf("system snippet in group should not have sender prefix: got %q", got)
 	}
 }
 

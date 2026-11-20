@@ -453,7 +453,10 @@ func snippetLine(c store.Chat, d *Directory) string {
 	default:
 		msg := store.Message{Type: c.LastType, Body: c.Snippet, MediaMeta: c.LastMeta}
 		info, _ := parseMedia(&msg)
-		text, _, muted := bubbleText(&msg, info, d)
+		text, spans, muted := bubbleText(&msg, info, d)
+		if !muted {
+			text, _, _ = formatText(text, spans) // *bold* and the like show without their markers
+		}
 		if muted {
 			content = text
 		} else if text != "" {
@@ -472,7 +475,9 @@ func snippetLine(c store.Chat, d *Directory) string {
 	}
 
 	var prefix string
-	if c.LastFromMe {
+	if c.LastType == "system" {
+		prefix = ""
+	} else if c.LastFromMe {
 		prefix = "You: "
 	} else if strings.HasSuffix(c.JID, "@g.us") {
 		prefix = d.Name(c.LastSender, "") + ": "

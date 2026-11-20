@@ -137,6 +137,9 @@ func buildAttachPreview(owner walk.Form, p theme.Palette, items []attachItem) (v
 		if key == walk.KeyReturn {
 			v.send()
 		}
+		if key == walk.KeyV && walk.ControlDown() {
+			v.paste()
+		}
 	})
 	if _, err := walk.NewHSpacerFixed(row, 72); err != nil {
 		return nil, err
@@ -159,6 +162,8 @@ func buildAttachPreview(owner walk.Form, p theme.Palette, items []attachItem) (v
 			v.add()
 		case walk.KeyReturn:
 			v.send()
+		case walk.KeyV:
+			return walk.ControlDown() && v.paste()
 		default:
 			return false
 		}
@@ -201,7 +206,7 @@ func buildAttachPreview(owner walk.Form, p theme.Palette, items []attachItem) (v
 	})
 	dlg.Starting().Attach(func() { focusOn(v.caption) }) // type a caption, Enter sends
 	dlg.SendMessage(win.WM_CHANGEUISTATE, win.UIS_INITIALIZE, 0)
-	logErr("attachment preview title bar", theme.ApplyTitleBar(uintptr(dlg.Handle()), isDark(p)))
+	logErr("attachment preview title bar", titleBar(dlg, isDark(p)))
 	return v, nil
 }
 
@@ -237,7 +242,7 @@ func (v *attachPreview) name() {
 		}
 	}
 	text := plural(len(sendable(v.items)), "file", "files") + " to send: " + strings.Join(names, ", ") +
-		". Left and Right choose, Delete removes, Insert adds, Enter sends."
+		". Left and Right choose, Delete removes, Insert adds, Ctrl+V pastes, Enter sends."
 	logErr("attachment strip name", v.strip.Accessibility().SetName(text))
 }
 
@@ -285,10 +290,28 @@ func (v *attachPreview) add() {
 		logErr("attach", err)
 		return
 	}
-	first := len(v.items)
-	for _, p := range fd.FilePaths {
-		v.items = append(v.items, newAttachItem(p, false))
+	items := make([]attachItem, len(fd.FilePaths))
+	for i, p := range fd.FilePaths {
+		items[i] = newAttachItem(p, false)
 	}
+	v.addItems(items)
+}
+
+// paste adds the clipboard's files or picture, and reports whether it held any (false: a text
+// paste the caption takes).
+func (v *attachPreview) paste() bool {
+	items := clipboardItems(v.dlg.Handle())
+	if len(items) == 0 {
+		return false
+	}
+	v.addItems(items)
+	return true
+}
+
+// addItems appends items and shows the first of them.
+func (v *attachPreview) addItems(items []attachItem) {
+	first := len(v.items)
+	v.items = append(v.items, items...)
 	v.name()
 	v.choose(first)
 }

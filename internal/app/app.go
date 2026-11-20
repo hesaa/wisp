@@ -112,12 +112,13 @@ type App struct {
 	viewing     bool // the media view replaces the chat and the input bar
 	showingInfo bool // the details view replaces the chat and the input bar
 	infoGen     int
+	sideVisible bool // whether the chats sidebar is shown
 }
 
 // New builds the main window, themed by the settings in db; nothing connects until Attach.
 // builtinGIFKey is the GIPHY key used when Settings has none.
 func New(db *store.DB, cache *media.Cache, builtinGIFKey string) (*App, error) {
-	a := &App{db: db, cache: cache, builtin: builtinGIFKey, cfg: map[string]string{},
+	a := &App{db: db, cache: cache, builtin: builtinGIFKey, cfg: map[string]string{}, sideVisible: true,
 		v: view{unread: map[string]int{}, names: map[string]map[string]string{}, dirs: map[string]*ui.Directory{}}, inflight: inflight{}}
 	a.presence = presenceCtl{
 		window:        func() (bool, bool) { return a.mw.Visible(), win.IsIconic(a.mw.Handle()) },
@@ -181,6 +182,9 @@ func New(db *store.DB, cache *media.Cache, builtinGIFKey string) (*App, error) {
 		}
 		if d := a.dir(account); d != nil {
 			d.SetAvatar(jid, id, ts)
+		}
+		if !avatarNeedsRepaint(p.AvatarID, id, save) {
+			return
 		}
 		if a.avatars != nil {
 			a.avatars.Invalidate(jid)
@@ -323,6 +327,32 @@ func (a *App) build() error {
 	a.bar.OnTyping(a.typing)
 	a.bar.OnAttach(a.attach)
 	a.bar.OnSendGIF(a.sendGIF)
+	a.bar.OnDraft(func(text string) {
+		if a.v.open.jid == "" {
+			return
+		}
+		a.v.setDraft(a.v.open, text)
+		a.side.Model().SetDraft(a.v.open.jid, text)
+	})
+
+	toggleSide := walk.NewAction()
+	if err := toggleSide.SetShortcut(walk.Shortcut{Modifiers: walk.ModControl, Key: walk.KeyB}); err != nil {
+		return err
+	}
+	toggleSide.Triggered().Attach(a.toggleSidebar)
+	if err := mw.ShortcutActions().Add(toggleSide); err != nil {
+		return err
+	}
+
+	closeChat := walk.NewAction()
+	if err := closeChat.SetShortcut(walk.Shortcut{Modifiers: walk.ModControl, Key: walk.KeyW}); err != nil {
+		return err
+	}
+	closeChat.Triggered().Attach(a.closeActiveChat)
+	if err := mw.ShortcutActions().Add(closeChat); err != nil {
+		return err
+	}
+
 	mw.Closing().Attach(a.closing)
 	mw.Activating().Attach(a.activated)
 	mw.SizeChanged().Attach(a.sizeChanged)
@@ -548,7 +578,7 @@ func (a *App) nav(n ui.Nav) {
 	}
 	switch n {
 	case ui.NavChats:
-		a.side.FocusSearch()
+		a.toggleSidebar()
 	case ui.NavStatus:
 		if len(a.stories) > 0 {
 			a.openStory(a.stories[0].SenderJID)
@@ -556,6 +586,24 @@ func (a *App) nav(n ui.Nav) {
 	case ui.NavSettings:
 		logErr("settings", ui.RunSettings(a.mw, a.pal, ui.SettingsDeps{Store: a.db, Manager: a.mgr, Media: a.cache, Account: a.v.active,
 			OnThemeChanged: a.applyTheme, OnSettingsChanged: a.settingChanged, OnAddAccount: a.pair, OnCacheCleared: a.cacheCleared}))
+	}
+}
+
+// toggleSidebar toggles the chats sidebar between shown and hidden.
+func (a *App) toggleSidebar() {
+	if a.locked || a.page != pageChats {
+		return
+	}
+	a.sideVisible = !a.sideVisible
+	a.side.SetVisible(a.sideVisible)
+	if a.sideVisible {
+		a.rail.SetNav(ui.NavChats)
+		a.side.FocusSearch()
+	} else {
+		a.rail.SetNav(ui.NavNone)
+		if a.v.open.jid != "" {
+			a.bar.Focus()
+		}
 	}
 }
 
@@ -610,8 +658,15 @@ func (a *App) showPage() {
 	}
 	chats := pg == pageChats
 	a.rail.SetVisible(chats)
-	a.side.SetVisible(chats)
+	a.side.SetVisible(chats && a.sideVisible)
 	a.right.SetVisible(chats)
+	if chats {
+		if a.sideVisible {
+			a.rail.SetNav(ui.NavChats)
+		} else {
+			a.rail.SetNav(ui.NavNone)
+		}
+	}
 	if pairingRuns(pg, a.mw.Visible(), win.IsIconic(a.mw.Handle())) {
 		a.link.Show(linkCancellable(a.adding, n))
 	} else {
@@ -631,7 +686,11 @@ func (a *App) focusPage() {
 	}
 	switch a.page {
 	case pageChats:
-		a.side.FocusSearch()
+		if a.sideVisible {
+			a.side.FocusSearch()
+		} else if a.v.open.jid != "" {
+			a.bar.Focus()
+		}
 	case pageLock:
 		a.lockPage.Focus()
 	}

@@ -28,12 +28,13 @@ const (
 // RailModel is the rail's state: accounts in display order, the active one, per-account unread
 // totals and connection state. UI-thread only.
 type RailModel struct {
-	accounts  []string
-	active    string
-	unread    map[string]int
-	connected map[string]bool
-	listeners []func(accountID string)
-	redraw    func() // set by the Rail widget
+	accounts    []string
+	active      string
+	unread      map[string]int
+	chatsUnread int
+	connected   map[string]bool
+	listeners   []func(accountID string)
+	redraw      func() // set by the Rail widget
 }
 
 func NewRailModel() *RailModel {
@@ -103,6 +104,17 @@ func (m *RailModel) SetUnread(id string, n int) {
 	}
 }
 
+// ChatsUnread returns the unread count shown on the Chats rail icon.
+func (m *RailModel) ChatsUnread() int { return m.chatsUnread }
+
+// SetChatsUnread sets the unread badge count shown on the Chats rail icon.
+func (m *RailModel) SetChatsUnread(n int) {
+	if m.chatsUnread != n {
+		m.chatsUnread = n
+		m.changed()
+	}
+}
+
 // SetConnected sets whether id's status dot is green (connected) or grey.
 func (m *RailModel) SetConnected(id string, ok bool) {
 	if m.connected[id] != ok {
@@ -115,6 +127,7 @@ func (m *RailModel) SetConnected(id string, ok bool) {
 type Nav int
 
 const (
+	NavNone Nav = -1
 	NavChats Nav = iota
 	NavStatus
 	NavSettings
@@ -183,6 +196,9 @@ func itemName(it railItem) string {
 func (r *Rail) describe(it railItem) string {
 	name := itemName(it)
 	if it.kind != railAccount {
+		if it.kind == railNav && it.nav == NavChats && r.model.chatsUnread > 0 {
+			name += ", " + strconv.Itoa(r.model.chatsUnread) + " unread"
+		}
 		return name
 	}
 	if it.account == r.model.active {
@@ -200,6 +216,17 @@ func (r *Rail) describe(it railItem) string {
 }
 
 func (r *Rail) Model() *RailModel { return r.model }
+
+// Nav returns the currently highlighted navigation button.
+func (r *Rail) Nav() Nav { return r.nav }
+
+// SetNav updates the currently highlighted navigation button and repaints.
+func (r *Rail) SetNav(n Nav) {
+	if r.nav != n {
+		r.nav = n
+		logErr("rail repaint", r.Invalidate())
+	}
+}
 
 // OnAddAccount sets the handler of the + button (start QR pairing).
 func (r *Rail) OnAddAccount(fn func()) { r.onAdd = fn }
@@ -370,6 +397,14 @@ func (r *Rail) paint(c *walk.Canvas, _ walk.Rectangle) error {
 			if err == nil {
 				err = icons.Draw(c, navIcons[it.nav], square(cx, cy, s(24)), fg)
 			}
+			if err == nil && it.nav == NavChats && r.model.chatsUnread > 0 {
+				n := r.model.chatsUnread
+				label := strconv.Itoa(n)
+				if n > 9 {
+					label = "9+"
+				}
+				err = drawBadge(c, dpi, cx+s(18), cy-s(10), s(18), label, theme.Color(r.pal.Accent), theme.Color(r.pal.Sidebar), 7)
+			}
 		}
 		if err != nil {
 			return err
@@ -440,7 +475,12 @@ func square(cx, cy, d int) walk.Rectangle {
 
 // font returns the Segoe UI font of pt points; walk caches fonts, so this is a map lookup.
 func font(pt int, style walk.FontStyle) *walk.Font {
-	f, err := walk.NewFont("Segoe UI", pt, style)
+	family := "Segoe UI"
+	if style&fontMono != 0 {
+		family = "Consolas"
+	}
+	style &= walk.FontBold | walk.FontItalic | walk.FontUnderline | walk.FontStrikeOut
+	f, err := walk.NewFont(family, pt, style)
 	if err != nil {
 		panic(err) // NewFont fails only for an invalid style constant
 	}
@@ -542,7 +582,7 @@ func drawText(c *walk.Canvas, dpi int, text string, pt int, style walk.FontStyle
 	if text == "" || r.Width <= 0 || r.Height <= 0 {
 		return nil
 	}
-	if hasEmoji(text) { // GDI draws emoji as outlines: DirectWrite draws them in colour
+	if hasEmoji(text) && style&fontMono == 0 { // GDI draws emoji as outlines: DirectWrite draws them in colour (in Segoe UI only)
 		cdpi := c.DPI()
 		err := drawColorText(c.HDC(), text, float32(max(1, (pt*dpi+cdpi/2)/cdpi)*cdpi)/72, style, color, r, format)
 		if err == nil {

@@ -106,6 +106,26 @@ func TestSendClearsTheBoxAndFiresOnce(t *testing.T) {
 	}
 }
 
+func TestComposerSetDraftDoesNotFireTyping(t *testing.T) {
+	ft := &fakeTimers{}
+	var typing []bool
+	box := &fakeBox{}
+	c := &composer{
+		box: box,
+		typing: typingSignal{
+			after: ft.after,
+			fire:  func(on bool) { typing = append(typing, on) },
+		},
+	}
+	c.setDraft("draft message")
+	if box.text != "draft message" {
+		t.Fatalf("box text = %q, want 'draft message'", box.text)
+	}
+	if len(typing) > 0 {
+		t.Errorf("setDraft should not fire typing, got %v", typing)
+	}
+}
+
 func TestTypingSignalComposingThenPausedWhenIdle(t *testing.T) {
 	ft := &fakeTimers{}
 	var got []bool

@@ -158,11 +158,12 @@ func orderPos(a, b textPos) (from, to textPos) {
 	return a, b
 }
 
-// lineAdv is the x after each unit of a line of text in the body font, with the boundaries inside
+// lineAdv is the x after each unit of a line of text in the body font (styles: formatText's, of
+// the line, or nil), with the boundaries inside
 // a character (a surrogate pair, an emoji sequence) moved to its start, so hits and highlight edges
 // land on whole characters.
-func lineAdv(ms measurer, units []uint16, style walk.FontStyle) []int {
-	x := ms.advances(units, bodyPt, style)
+func lineAdv(ms measurer, units []uint16, styles []walk.FontStyle, style walk.FontStyle) []int {
+	x := styledAdv(ms, units, styles, style)
 	for i := 0; i < len(units); {
 		_, n := cluster(units, i)
 		for j := i; j < i+n-1; j++ {

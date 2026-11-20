@@ -374,6 +374,27 @@ func TestOlderPagesBelongToOneOpening(t *testing.T) {
 	}
 }
 
+func TestCloseActiveChatView(t *testing.T) {
+	v := view{active: acctA}
+	g1 := v.openChat(chatRef{acctA, alice})
+	v.firstPageShown(g1)
+	if v.open.jid != alice {
+		t.Fatalf("v.open.jid = %q, want %q", v.open.jid, alice)
+	}
+
+	// Close chat
+	g2 := v.openChat(chatRef{})
+	if v.open.jid != "" {
+		t.Fatalf("after closing, v.open.jid = %q, want empty", v.open.jid)
+	}
+	if v.current(g1) {
+		t.Fatal("closing chat did not bump generation to invalidate earlier chat")
+	}
+	if !v.current(g2) {
+		t.Fatal("v.current(g2) = false, want true")
+	}
+}
+
 func TestStateOf(t *testing.T) {
 	for _, c := range []struct {
 		visible, iconic, locked, active, grace bool
@@ -804,3 +825,113 @@ func TestReplyOnlyToTheShownChat(t *testing.T) {
 		t.Fatal("a reply to another chat's message was allowed")
 	}
 }
+
+func TestViewDrafts(t *testing.T) {
+	var v view
+	c1 := chatRef{acctA, alice}
+	c2 := chatRef{acctA, bob}
+
+	if got := v.draft(c1); got != "" {
+		t.Errorf("initial draft = %q, want empty", got)
+	}
+
+	// Set draft for c1
+	v.setDraft(c1, "hello alice")
+	if got := v.draft(c1); got != "hello alice" {
+		t.Errorf("v.draft(c1) = %q, want %q", got, "hello alice")
+	}
+	if got := v.draft(c2); got != "" {
+		t.Errorf("v.draft(c2) = %q, want empty", got)
+	}
+
+	// Set draft for c2
+	v.setDraft(c2, "hey bob")
+	if got := v.draft(c2); got != "hey bob" {
+		t.Errorf("v.draft(c2) = %q, want %q", got, "hey bob")
+	}
+
+	// Whitespace only clears draft
+	v.setDraft(c1, "   \n  ")
+	if got := v.draft(c1); got != "" {
+		t.Errorf("after whitespace setDraft: v.draft(c1) = %q, want empty", got)
+	}
+
+	// clearDraft clears draft
+	v.clearDraft(c2)
+	if got := v.draft(c2); got != "" {
+		t.Errorf("after clearDraft: v.draft(c2) = %q, want empty", got)
+	}
+}
+
+func TestChatSwitchAndClosePreservesDrafts(t *testing.T) {
+	var v view
+	v.active = acctA
+	c1 := chatRef{acctA, alice}
+	c2 := chatRef{acctA, bob}
+
+	// Open chat 1
+	v.openChat(c1)
+	// User types draft in c1
+	v.setDraft(c1, "draft for alice")
+
+	// Close chat 1 (Ctrl+W)
+	v.openChat(chatRef{})
+	if v.draft(c1) != "draft for alice" {
+		t.Fatalf("closing chat lost c1 draft: %q", v.draft(c1))
+	}
+
+	// Open chat 2
+	v.openChat(c2)
+	// Check c2 has no draft
+	if v.draft(c2) != "" {
+		t.Fatalf("c2 unexpectedly has draft: %q", v.draft(c2))
+	}
+	// User types draft in c2
+	v.setDraft(c2, "draft for bob")
+
+	// Switch back to chat 1
+	v.openChat(c1)
+	// Verify c1 draft is still there
+	if v.draft(c1) != "draft for alice" {
+		t.Fatalf("reopening c1 lost draft: %q", v.draft(c1))
+	}
+	// Verify c2 draft is still preserved
+	if v.draft(c2) != "draft for bob" {
+		t.Fatalf("c2 draft not preserved after switching to c1: %q", v.draft(c2))
+	}
+
+	// Message is sent in c1 -> clears draft for c1
+	v.clearDraft(c1)
+	if v.draft(c1) != "" {
+		t.Fatalf("c1 draft not cleared after send: %q", v.draft(c1))
+	}
+
+	// c2 draft still preserved
+	if v.draft(c2) != "draft for bob" {
+		t.Fatalf("c2 draft lost after c1 send: %q", v.draft(c2))
+	}
+}
+
+func TestViewNotMember(t *testing.T) {
+	var v view
+	c1 := chatRef{acct: "acct1", jid: "group1@g.us"}
+	c2 := chatRef{acct: "acct1", jid: "group2@g.us"}
+
+	if v.isNotMember(c1) {
+		t.Fatal("initially isNotMember should be false")
+	}
+
+	v.setNotMember(c1, true)
+	if !v.isNotMember(c1) {
+		t.Fatal("expected c1 to be notMember")
+	}
+	if v.isNotMember(c2) {
+		t.Fatal("c2 should not be notMember")
+	}
+
+	v.setNotMember(c1, false)
+	if v.isNotMember(c1) {
+		t.Fatal("expected c1 to no longer be notMember")
+	}
+}
+

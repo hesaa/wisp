@@ -379,3 +379,75 @@ func TestSidebarUsesNameRuleAndPreviewLine(t *testing.T) {
 		t.Errorf("filter 'photo' didn't match: %v", m.Rows())
 	}
 }
+
+func TestSidebarModelUnreadChats(t *testing.T) {
+	m := NewSidebarModel()
+	m.SetChats(acctA, sampleChats())
+	// sampleChats has 1 chat with Unread > 0 (bob has Unread: 2)
+	if got := m.UnreadChats(); got != 1 {
+		t.Fatalf("UnreadChats() = %d, want 1", got)
+	}
+
+	// Incoming unread message to Alice makes it 2 unread chats
+	m.ApplyMessage(store.Message{AccountID: acctA, ChatJID: alice, Timestamp: 500, Body: "hey", Status: store.StatusReceived})
+	if got := m.UnreadChats(); got != 2 {
+		t.Fatalf("after alice incoming: UnreadChats() = %d, want 2", got)
+	}
+
+	// Mark Bob read -> back to 1
+	m.MarkRead(bob)
+	if got := m.UnreadChats(); got != 1 {
+		t.Fatalf("after bob markRead: UnreadChats() = %d, want 1", got)
+	}
+
+	// Mark Alice read -> 0
+	m.MarkRead(alice)
+	if got := m.UnreadChats(); got != 0 {
+		t.Fatalf("after alice markRead: UnreadChats() = %d, want 0", got)
+	}
+}
+
+func TestSidebarModelDrafts(t *testing.T) {
+	m := NewSidebarModel()
+	m.SetChats(acctA, sampleChats())
+	// Initial order: alice (ts: 300), bob (ts: 200), group (ts: 100)
+	if got := jids(m.Rows()); !slices.Equal(got, []string{alice, bob, group}) {
+		t.Fatalf("initial order = %v", got)
+	}
+
+	// Setting a draft for group moves it to the top
+	m.SetDraft(group, "meeting draft")
+	if d, ok := m.Draft(group); !ok || d != "meeting draft" {
+		t.Fatalf("m.Draft(group) = %q, %v, want 'meeting draft', true", d, ok)
+	}
+	if got := jids(m.Rows()); !slices.Equal(got, []string{group, alice, bob}) {
+		t.Fatalf("after draft order = %v, want group first", got)
+	}
+	if eff := m.EffectiveTS(m.Rows()[0]); eff < 300 {
+		t.Fatalf("effective timestamp for draft = %d, want >= 300", eff)
+	}
+
+	// Filter matches draft text
+	m.SetFilter("meeting")
+	if got := jids(m.Rows()); !slices.Equal(got, []string{group}) {
+		t.Fatalf("filter by draft text = %v, want [%s]", got, group)
+	}
+	m.SetFilter("")
+
+	// Incoming message to bob with higher timestamp moves above group
+	m.ApplyMessage(store.Message{AccountID: acctA, ChatJID: bob, Timestamp: time.Now().Unix() + 10, Body: "urgent", Status: store.StatusReceived})
+	if got := jids(m.Rows()); got[0] != bob {
+		t.Fatalf("after newer message to bob, top = %s, want bob", got[0])
+	}
+
+	// Clearing draft returns group to its normal position based on LastMessageTS
+	m.SetDraft(group, "")
+	if _, ok := m.Draft(group); ok {
+		t.Fatalf("draft not cleared")
+	}
+	// bob (new ts), alice (300), group (100)
+	if got := jids(m.Rows()); !slices.Equal(got, []string{bob, alice, group}) {
+		t.Fatalf("after clearing draft order = %v, want [bob, alice, group]", got)
+	}
+}
+

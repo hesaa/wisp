@@ -66,6 +66,41 @@ func TestAvatarStep(t *testing.T) {
 	}
 }
 
+func TestAvatarNeedsRepaint(t *testing.T) {
+	// 1. New picture saved -> repaint
+	if !avatarNeedsRepaint("old", "new", true) {
+		t.Error("new picture should need repaint")
+	}
+	if !avatarNeedsRepaint("", "new", true) {
+		t.Error("first picture should need repaint")
+	}
+
+	// 2. Picture removed -> repaint
+	if !avatarNeedsRepaint("old", "-", false) {
+		t.Error("removed picture should need repaint")
+	}
+
+	// 3. Unchanged -> no repaint
+	if avatarNeedsRepaint("old", "old", false) {
+		t.Error("unchanged picture should not need repaint")
+	}
+
+	// 4. Contact had no picture and still has none -> no repaint
+	if avatarNeedsRepaint("", "-", false) {
+		t.Error("no picture result for contact without picture should not need repaint")
+	}
+
+	// 5. Error for contact with no picture -> no repaint
+	if avatarNeedsRepaint("", "", false) {
+		t.Error("error for contact without picture should not need repaint")
+	}
+
+	// 6. Error for contact with picture (kept old) -> no repaint
+	if avatarNeedsRepaint("old", "old", false) {
+		t.Error("error keeping old picture should not need repaint")
+	}
+}
+
 func TestAvatarQueueOneAtATimeNoLoop(t *testing.T) {
 	q := newAvatarQueue()
 

@@ -84,3 +84,16 @@ func TestPastedBitmapIsSavedAsAPNG(t *testing.T) {
 		t.Fatalf("other pixel = r %d b %d, want red", r>>8, b>>8)
 	}
 }
+
+func TestCRLF(t *testing.T) {
+	for in, want := range map[string]string{
+		"a\nb":        "a\r\nb",
+		"a\r\nb\n\nc": "a\r\nb\r\n\r\nc",
+		"a\rb":        "a\r\nb",
+		"none":        "none",
+	} {
+		if got := crlf(in); got != want {
+			t.Errorf("crlf(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

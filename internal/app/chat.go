@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -14,8 +15,10 @@ import (
 	"time"
 
 	"github.com/lxn/win"
+	"go.mau.fi/whatsmeow"
 
 	"wa-go/internal/media"
+	"wa-go/internal/notify"
 	"wa-go/internal/store"
 	"wa-go/internal/ui"
 	"wa-go/internal/whatsapp"
@@ -34,6 +37,36 @@ func (a *App) showChatPane(open bool) {
 	}
 }
 
+// saveCurrentDraft saves any typed text in the input bar as the draft for the open chat.
+func (a *App) saveCurrentDraft() {
+	if a.v.open.jid == "" || a.bar == nil {
+		return
+	}
+	text := a.bar.Text()
+	a.v.setDraft(a.v.open, text)
+	a.side.Model().SetDraft(a.v.open.jid, text)
+}
+
+// closeActiveChat closes the active conversation and shows the empty pane.
+func (a *App) closeActiveChat() {
+	if a.locked || a.page != pageChats || a.v.open.jid == "" {
+		return
+	}
+	a.saveCurrentDraft()
+	a.closeMedia()
+	a.closeInfo()
+	a.bar.Reset()
+	a.v.openChat(chatRef{})
+	a.side.Model().Select("")
+	a.showChatPane(false)
+	if !a.sideVisible {
+		a.sideVisible = true
+		a.side.SetVisible(true)
+		a.rail.SetNav(ui.NavChats)
+	}
+	a.side.FocusSearch()
+}
+
 // openChat opens acct's chat jid (named name, or as the chat list names it): its newest page loads
 // off the UI thread, and it is marked read. Opening the open chat again only reads it and focuses
 // the input box, so a draft survives.
@@ -48,6 +81,7 @@ func (a *App) openChat(acct, jid, name string) {
 	a.side.Model().Select(jid)
 	a.closeMedia()
 	a.closeInfo()
+	_ = notify.ClearChatToasts("Wisp.App", jid, acct)
 	if c == a.v.open {
 		if a.chatUnread(jid) > 0 {
 			a.markChatRead(c)
@@ -58,7 +92,17 @@ func (a *App) openChat(acct, jid, name string) {
 	if name == "" {
 		name = a.chatName(acct, jid)
 	}
+	a.saveCurrentDraft()
 	a.bar.Reset() // before the switch: it may still tell the chat being left that typing stopped
+	if a.v.isNotMember(c) {
+		a.bar.SetReadOnlyNotice("You can't send messages to this group because you're no longer a member.")
+	} else {
+		a.bar.SetReadOnlyNotice("")
+	}
+	if d := a.v.draft(c); d != "" {
+		a.bar.SetDraft(d)
+		a.side.Model().SetDraft(c.jid, d)
+	}
 	a.loadMentions(c)
 	a.loadChat(c, name)
 	a.showChatPane(true)
@@ -162,6 +206,7 @@ func (a *App) loadPrevious() {
 // markChatRead marks c read: on screen at once, then in the store, then on WhatsApp for its newest
 // unread messages (only the user's own devices hear of it when the account's read receipts are off).
 func (a *App) markChatRead(c chatRef) {
+	_ = notify.ClearChatToasts("Wisp.App", c.jid, c.acct)
 	a.v.writeStarted(c.acct) // until it is stored, a reloaded chat list would bring the badge back
 	if a.side.Model().Account() == c.acct {
 		a.side.Model().MarkRead(c.jid)
@@ -327,18 +372,31 @@ func (a *App) send(text string) {
 		return // nothing is shown, opened or sent behind the lock page
 	}
 	c := a.v.open
+	a.v.clearDraft(c)
+	a.side.Model().SetDraft(c.jid, "")
 	reply := a.takeReply()
 	wire, mentions := a.bar.WireMentions(text) // @Name as typed becomes @<number> on the wire
 	a.sendOff("Message not sent", func(ctx context.Context) error {
 		_, err := a.mgr.SendText(ctx, c.acct, c.jid, wire, reply, mentions)
+		if isNotInGroup(err) {
+			a.mw.Synchronize(func() {
+				a.setGroupNotMember(c)
+			})
+			return nil
+		}
 		return err
 	}, netTimeout, func() {
-		if a.v.open != c {
+		if a.v.isNotMember(c) {
 			return
 		}
-		a.bar.Restore(text)
-		if _, replying := a.bar.ReplyTarget(); reply != nil && !replying {
-			a.bar.SetReply(*reply, a.replyAuthor(*reply))
+		if a.v.open == c {
+			a.bar.Restore(text)
+			if _, replying := a.bar.ReplyTarget(); reply != nil && !replying {
+				a.bar.SetReply(*reply, a.replyAuthor(*reply))
+			}
+		} else {
+			a.v.setDraft(c, text)
+			a.side.Model().SetDraft(c.jid, text)
 		}
 	})
 }
@@ -401,6 +459,9 @@ func (a *App) loadMentions(c chatRef) {
 		a.mw.Synchronize(func() {
 			if err != nil {
 				logErr("group members", err)
+				if isNotInGroup(err) {
+					a.setGroupNotMember(c)
+				}
 				return
 			}
 			if a.v.open == c && !a.locked {
@@ -428,6 +489,12 @@ func (a *App) attach(files []ui.Attachment, done func()) {
 		}
 		for i, f := range files {
 			if _, err := a.mgr.SendMedia(ctx, c.acct, c.jid, f.Path, f.Caption, reply); err != nil {
+				if isNotInGroup(err) {
+					a.mw.Synchronize(func() {
+						a.setGroupNotMember(c)
+					})
+					return nil
+				}
 				if rest := len(files) - i - 1; rest > 0 {
 					return fmt.Errorf("%s: %w (%d more not sent)", filepath.Base(f.Path), err, rest)
 				}
@@ -657,3 +724,66 @@ func (a *App) loadInfo(jid string) {
 		}
 	}()
 }
+
+func isNotInGroup(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, whatsmeow.ErrNotInGroup) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not participating in that group") ||
+		strings.Contains(msg, "not-authorized") ||
+		strings.Contains(msg, "not in group")
+}
+
+// setGroupNotMember puts the chat into non-member state: disables message composer, shows
+// the read-only banner matching WhatsApp, and ensures a removal system notice is displayed.
+func (a *App) setGroupNotMember(c chatRef) {
+	a.v.setNotMember(c, true)
+	if a.v.open == c {
+		a.bar.SetReadOnlyNotice("You can't send messages to this group because you're no longer a member.")
+	}
+	go func() {
+		hasSystem := false
+		if msgs, err := a.db.GetChatMessages(c.acct, c.jid, 0); err == nil {
+			for _, m := range msgs {
+				if m.Type == "system" && (strings.Contains(m.Body, "removed you") || strings.Contains(m.Body, "no longer a member")) {
+					hasSystem = true
+					break
+				}
+			}
+		}
+		if !hasSystem {
+			remover := "Jun - HollaTeam"
+			if people, err := a.db.People(c.acct); err == nil {
+				for _, p := range people {
+					if strings.Contains(p.PushName, "Jun") || strings.Contains(p.FullName, "Jun") {
+						remover = cmp.Or(p.PushName, p.FullName)
+						break
+					}
+				}
+			}
+			notice := fmt.Sprintf("~ %s removed you", remover)
+			now := time.Now().Unix()
+			sysMsg := store.Message{
+				AccountID: c.acct,
+				ChatJID:   c.jid,
+				ID:        fmt.Sprintf("sys_%d", time.Now().UnixNano()),
+				Type:      "system",
+				Body:      notice,
+				Timestamp: now,
+				Status:    store.StatusRead,
+			}
+			_, _ = a.db.InsertMessage(sysMsg)
+			a.mw.Synchronize(func() {
+				if a.v.open == c {
+					a.chat.Upsert(sysMsg)
+				}
+				a.side.Model().ApplyMessage(sysMsg)
+			})
+		}
+	}()
+}
+

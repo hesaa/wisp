@@ -117,6 +117,7 @@ func TestDispatcherPlaysSound(t *testing.T) {
 
 	fb := &fakeBalloon{}
 	d := newDispatcher(fb)
+	d.showToast = nil
 
 	// Notify with sound enabled and custom sound
 	s := Settings{Enabled: true, Sound: true, SoundName: "mail"}

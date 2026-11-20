@@ -2,6 +2,7 @@ package app
 
 import (
 	"log"
+	"os"
 	"slices"
 	"strings"
 	"time"
@@ -187,6 +188,7 @@ func (a *App) accountChanged(acct string) {
 	if a.avatars != nil {
 		a.avatars.SetAccount(acct)
 	}
+	a.saveCurrentDraft()
 	a.closeMedia()
 	a.bar.Reset() // before the switch: it may still tell the chat being left that typing stopped
 	a.v.switchAccount(acct)
@@ -194,6 +196,7 @@ func (a *App) accountChanged(acct string) {
 	a.side.Model().SetChats(acct, nil)
 	a.stories = nil
 	a.side.SetStories(nil)
+	a.showUnread()
 	if acct != "" {
 		a.loadChats(acct)
 	}
@@ -320,18 +323,56 @@ func (a *App) showUnread() {
 	for _, id := range ids {
 		a.rail.Model().SetUnread(id, a.v.unread[id])
 	}
+	if a.side != nil && a.side.Model() != nil {
+		a.rail.Model().SetChatsUnread(a.side.Model().UnreadChats())
+	}
 	if a.tray != nil {
 		logErr("tray badge", a.tray.SetUnread(totalUnread(a.v.unread, ids)))
 	}
 }
 
+func (a *App) findAvatarPath(accountID, chatJID, senderJID string) string {
+	if a.cache == nil {
+		return ""
+	}
+	candidates := []string{senderJID, chatJID}
+	if !isGroup(chatJID) {
+		candidates = []string{chatJID, senderJID}
+	}
+	for _, jid := range candidates {
+		if jid == "" {
+			continue
+		}
+		p := a.cache.AvatarPath(accountID, jid)
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() && fi.Size() > 0 {
+			return p
+		}
+	}
+	return ""
+}
+
 // toast alerts the user to m through the tray, honouring the notification settings.
 func (a *App) toast(m store.Message) {
-	in := notify.Input{AccountID: m.AccountID, AccountLabel: "+" + m.AccountID, ChatJID: m.ChatJID,
-		SenderName: a.label(m.AccountID, m.SenderJID), ChatName: a.label(m.AccountID, m.ChatJID), IsGroup: isGroup(m.ChatJID),
-		Type: m.Type, Body: m.Body, FromMe: m.FromMe}
+	in := notify.Input{
+		AccountID:    m.AccountID,
+		AccountLabel: "+" + m.AccountID,
+		ChatJID:      m.ChatJID,
+		SenderName:   a.label(m.AccountID, m.SenderJID),
+		ChatName:     a.label(m.AccountID, m.ChatJID),
+		IsGroup:      isGroup(m.ChatJID),
+		Type:         m.Type,
+		Body:         m.Body,
+		FromMe:       m.FromMe,
+		AvatarPath:   a.findAvatarPath(m.AccountID, m.ChatJID, m.SenderJID),
+		UnreadCount:  a.chatUnread(m.ChatJID),
+	}
 	if m.Type == whatsapp.TypeDocument {
 		in.FileName = m.Body // a document's body is its caption, else its file name
+	}
+	if m.Type == whatsapp.TypeImage && m.MediaPath != "" {
+		if fi, err := os.Stat(m.MediaPath); err == nil && !fi.IsDir() && fi.Size() > 0 {
+			in.ImagePath = m.MediaPath
+		}
 	}
 	s := toastSettings(a.cfg, a.locked, len(a.rail.Model().Accounts()))
 	if a.tray != nil {

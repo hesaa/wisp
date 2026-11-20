@@ -592,7 +592,7 @@ func (d *statusDialog) build() error {
 	// focus cues follow the user's setting and last input (hidden after a click until a key is used)
 	dlg.SendMessage(win.WM_CHANGEUISTATE, win.UIS_INITIALIZE, 0)
 	// cosmetic: Windows builds without dark title bars keep a light one
-	logErr("status title bar", theme.ApplyTitleBar(uintptr(dlg.Handle()), isDark(p)))
+	logErr("status title bar", titleBar(dlg, isDark(p)))
 	return nil
 }
 

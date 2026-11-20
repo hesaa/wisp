@@ -129,6 +129,7 @@ func TestTruncateUTF16(t *testing.T) {
 func TestDispatcher(t *testing.T) {
 	fb := &fakeBalloon{}
 	d := newDispatcher(fb)
+	d.showToast = nil // test balloon fallback path
 	if _, _, ok := d.Last(); ok {
 		t.Fatal("no last yet")
 	}

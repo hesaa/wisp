@@ -61,6 +61,18 @@ func avatarStep(p store.Person, now time.Time, res pictureResult) (id string, ts
 	return p.AvatarID, now.Unix(), false
 }
 
+// avatarNeedsRepaint reports whether an avatar update changes the visible bitmap on screen,
+// requiring UI widget repainting.
+func avatarNeedsRepaint(oldID, newID string, save bool) bool {
+	if save {
+		return true
+	}
+	if oldID != "" && newID == "-" {
+		return true
+	}
+	return false
+}
+
 type avatarQueue struct {
 	mu       sync.Mutex
 	pending  map[string][]string

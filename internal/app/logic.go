@@ -350,7 +350,56 @@ type view struct {
 	unread   map[string]int
 	names    map[string]map[string]string // per account: chat JID to name, from its last applied list
 	dirs     map[string]*ui.Directory     // per account: people directory
-	lists    map[string]*listState        // per account; see reloadArrived
+	lists     map[string]*listState        // per account; see reloadArrived
+	drafts    map[chatRef]string           // unsent draft text per chat
+	notMember map[chatRef]bool             // chats where user is no longer a member
+}
+
+// setNotMember records whether the user is no longer a participating member of c.
+func (v *view) setNotMember(c chatRef, notMember bool) {
+	if v.notMember == nil {
+		v.notMember = make(map[chatRef]bool)
+	}
+	if notMember {
+		v.notMember[c] = true
+	} else {
+		delete(v.notMember, c)
+	}
+}
+
+// isNotMember reports whether the user is no longer a participating member of c.
+func (v *view) isNotMember(c chatRef) bool {
+	if v.notMember == nil {
+		return false
+	}
+	return v.notMember[c]
+}
+
+// setDraft records draft text for c (cleared if empty or whitespace only).
+func (v *view) setDraft(c chatRef, text string) {
+	if v.drafts == nil {
+		v.drafts = make(map[chatRef]string)
+	}
+	if strings.TrimSpace(text) == "" {
+		delete(v.drafts, c)
+	} else {
+		v.drafts[c] = text
+	}
+}
+
+// draft returns any draft text stored for c.
+func (v *view) draft(c chatRef) string {
+	if v.drafts == nil {
+		return ""
+	}
+	return v.drafts[c]
+}
+
+// clearDraft removes any draft text stored for c.
+func (v *view) clearDraft(c chatRef) {
+	if v.drafts != nil {
+		delete(v.drafts, c)
+	}
 }
 
 // switchAccount makes acct active; the chat pane empties. It returns the new opening (of no chat).

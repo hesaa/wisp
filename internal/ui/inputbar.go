@@ -46,6 +46,10 @@ type InputBar struct {
 	emoji, gif, attach, sendBtn *walk.CustomWidget
 	field                       *walk.Composite // the box's background
 	edit                        *walk.TextEdit
+	marginPx                    int  // the box's right margin, for its scroll thumb (boxscroll.go)
+	dragging                    bool // the box's thumb is being dragged, from dragY with dragFirst the top line
+	dragY, dragFirst            int
+	wheelRem                    int                // wheel delta (x3) not yet a whole line: touchpads send less than a notch
 	banner, list                *walk.CustomWidget // inside field over the box: pending reply, mention list
 	height                      int                // the bar's height, 1/96 inch
 	listH                       int                // the mention list's height, 1/96 inch; 0: hidden
@@ -56,6 +60,10 @@ type InputBar struct {
 	after                       func(d time.Duration, f func()) (stop func() bool) // one-shot timer; f runs on the UI thread
 	onSendGIF                   func(mp4URL string)
 	onAttach                    func(files []Attachment, done func())
+	onDraft                     func(text string)
+	suppressDraft               bool
+	notice                      *walk.CustomWidget
+	noticeText                  string
 }
 
 // NewInputBar creates the bar in parent. gifKey returns the user's GIPHY API key ("" when none is
@@ -131,10 +139,15 @@ func (b *InputBar) build() error {
 	}
 	b.box = b.edit
 	b.edit.SetFont(font(bodyPt, 0))
-	if err := errors.Join(noBorder(b.edit), fillRest(b.Composite, b.field), fillRest(b.field, b.edit), enterSendsIn(b.edit, b.sendNow, b.boxKey, b.overEmoji, b.pasteMedia),
+	if b.notice, err = newCanvas(b.Composite, b.paintNotice); err != nil {
+		return err
+	}
+	b.notice.SetVisible(false)
+	if err := errors.Join(noBorder(b.edit), fillRest(b.Composite, b.field), fillRest(b.Composite, b.notice), fillRest(b.field, b.edit), enterSendsIn(b.edit, b.sendNow, b.boxKey, b.overPaint, b.pasteMedia),
 		b.edit.Accessibility().SetName("Type a message")); err != nil {
 		return err
 	}
+	enterHooks[b.edit.Handle()].mouse = b.boxMouse
 	b.sendBtn.SetEnabled(false)
 	b.edit.TextChanged().Attach(b.edited)
 	b.edit.SizeChanged().Attach(b.fit) // rewrapped, or a new DPI
@@ -156,13 +169,65 @@ func (b *InputBar) OnSendGIF(fn func(mp4URL string)) { b.onSendGIF = fn }
 // into the box, and confirmed in the preview. It calls done once they are sent or given up on.
 func (b *InputBar) OnAttach(fn func(files []Attachment, done func())) { b.onAttach = fn }
 
+// OnDraft sets the handler for draft text changes when the user edits text in the box.
+func (b *InputBar) OnDraft(fn func(text string)) { b.onDraft = fn }
+
 // Reset empties the box for another chat and drops its pending reply and mention list. Call it
 // before switching: it may fire OnTyping(false) for the chat being left.
 func (b *InputBar) Reset() {
+	b.suppressDraft = true
+	defer func() { b.suppressDraft = false }()
 	b.composer.reset()
 	b.banner.SetVisible(false)
 	b.showMentions()
 	b.fit()
+}
+
+// SetReadOnlyNotice shows a full-width read-only notice banner in place of the normal composer controls
+// (e.g. when the user is no longer a participating member of the group). Passing "" restores the normal composer.
+func (b *InputBar) SetReadOnlyNotice(notice string) {
+	if b == nil || b.Composite == nil {
+		return
+	}
+	b.noticeText = notice
+	isReadOnly := notice != ""
+	if b.notice != nil {
+		b.notice.SetVisible(isReadOnly)
+		if isReadOnly {
+			logErr("notice repaint", b.notice.Invalidate())
+		}
+	}
+	b.emoji.SetVisible(!isReadOnly)
+	b.gif.SetVisible(!isReadOnly)
+	b.attach.SetVisible(!isReadOnly)
+	b.field.SetVisible(!isReadOnly)
+	b.sendBtn.SetVisible(!isReadOnly)
+	if isReadOnly {
+		b.banner.SetVisible(false)
+		b.list.SetVisible(false)
+	}
+	b.fit()
+}
+
+// ReadOnlyNotice returns the currently active read-only notice, if any.
+func (b *InputBar) ReadOnlyNotice() string {
+	return b.noticeText
+}
+
+func (b *InputBar) paintNotice(c *walk.Canvas, ub walk.Rectangle) error {
+	p := b.pal
+	bg, err := brushFor(p.Header)
+	if err != nil {
+		return err
+	}
+	r := b.notice.ClientBoundsPixels()
+	if err := c.FillRectanglePixels(bg, ub); err != nil {
+		return err
+	}
+	if b.noticeText == "" {
+		return nil
+	}
+	return drawText(c, b.notice.DPI(), b.noticeText, 10, 0, theme.Color(p.TextSecondary), r, centerText)
 }
 
 // DismissMentions closes the mention list, if open.
@@ -346,7 +411,8 @@ func (b *InputBar) paintBanner(c *walk.Canvas, _ walk.Rectangle) error {
 	if err := c.FillRectanglePixels(bg, r); err != nil || b.reply == nil {
 		return err
 	}
-	snippet := cmp.Or(strings.Join(strings.Fields(b.reply.Body), " "), quotedKinds[b.reply.Type], "Message")
+	body, _, _ := formatText(b.reply.Body, nil) // without *bold*'s stars and the like
+	snippet := cmp.Or(strings.Join(strings.Fields(body), " "), quotedKinds[b.reply.Type], "Message")
 	line := walk.Rectangle{X: s(quotePadL), Width: r.Width - s(quotePadL) - s(replyCloseW), Height: s(18)}
 	second := line
 	second.Y = s(18)
@@ -361,6 +427,28 @@ func (b *InputBar) paintBanner(c *walk.Canvas, _ walk.Rectangle) error {
 // fires.
 func (b *InputBar) Restore(text string) { b.composer.restore(text) }
 
+// Text returns the text currently in the message box.
+func (b *InputBar) Text() string {
+	if b == nil || b.edit == nil {
+		return ""
+	}
+	return b.edit.Text()
+}
+
+// SetDraft fills the box with draft text without firing typing events, and places
+// the cursor at the end of the text.
+func (b *InputBar) SetDraft(text string) {
+	if b == nil || b.edit == nil {
+		return
+	}
+	b.suppressDraft = true
+	defer func() { b.suppressDraft = false }()
+	b.composer.setDraft(text)
+	u := len(utf16.Encode([]rune(text)))
+	b.edit.SetTextSelection(u, u)
+	b.fit()
+}
+
 // Focus puts the keyboard focus in the message box.
 func (b *InputBar) Focus() { focusOn(b.edit) }
 
@@ -374,8 +462,14 @@ func (b *InputBar) SetEnabled(enabled bool) {
 func (b *InputBar) SetPalette(p theme.Palette) error {
 	b.pal = p
 	b.edit.SetTextColor(theme.Color(p.Text))
-	return errors.Join(setBg(b.Composite, p.Header), setBg(b.field, p.Sidebar), setBg(b.edit, p.Sidebar),
-		b.banner.Invalidate(), b.list.Invalidate(), b.emoji.Invalidate(), b.gif.Invalidate(), b.attach.Invalidate(), b.sendBtn.Invalidate())
+	errs := []error{
+		setBg(b.Composite, p.Header), setBg(b.field, p.Sidebar), setBg(b.edit, p.Sidebar),
+		b.banner.Invalidate(), b.list.Invalidate(), b.emoji.Invalidate(), b.gif.Invalidate(), b.attach.Invalidate(), b.sendBtn.Invalidate(),
+	}
+	if b.notice != nil {
+		errs = append(errs, b.notice.Invalidate())
+	}
+	return errors.Join(errs...)
 }
 
 // newButton adds a round button painted with icon; a click, Enter or Space runs act.
@@ -439,6 +533,9 @@ func (b *InputBar) edited() {
 		logErr("send repaint", b.sendBtn.Invalidate())
 	}
 	b.fit()
+	if !b.suppressDraft && b.onDraft != nil {
+		b.onDraft(b.Text())
+	}
 }
 
 // sendNow sends the box's text (Enter or the Send button) and leaves the focus in the box.
@@ -447,9 +544,24 @@ func (b *InputBar) sendNow() {
 	focusOn(b.edit)
 }
 
+// overPaint paints over what the box just drew: colour emoji, and its scroll thumb.
+func (b *InputBar) overPaint() {
+	b.overEmoji()
+	b.paintBar()
+}
+
 // fit sizes the bar for the box's display lines, one to inputMaxLines. While every line fits, the
 // box shows them from the first: the edit control scrolled when its text outgrew its old height.
 func (b *InputBar) fit() {
+	if b.noticeText != "" {
+		h := barButton + 2*barPadY
+		if h != b.height {
+			b.height = h
+			logErr("input bar height", b.SetMinMaxSize(walk.Size{Height: h}, walk.Size{Height: h}))
+		}
+		return
+	}
+	b.setBoxMargin()
 	n := int(b.edit.SendMessage(win.EM_GETLINECOUNT, 0, 0))
 	lh := 18
 	if px := lineHeight(b.edit.Handle()); px > 0 {
@@ -566,6 +678,17 @@ func (c *composer) restore(text string) bool {
 	return true
 }
 
+// setDraft puts draft text into the box without a typing signal.
+func (c *composer) setDraft(text string) {
+	fire := c.typing.fire
+	c.typing.fire = nil
+	defer func() {
+		c.typing.stop()
+		c.typing.fire = fire
+	}()
+	logErr("set draft", c.box.SetText(text))
+}
+
 // edited follows a change of the box's text: typing goes on, or stops once the box is blank.
 func (c *composer) edited() {
 	if _, ok := outgoingText(c.box.Text()); ok {
@@ -615,9 +738,10 @@ func (t *typingSignal) stop() {
 type enterHook struct {
 	prev  uintptr // the window procedure walk installed
 	send  func()
-	key   func(k walk.Key, act bool) bool // takes a key before the box does; act false: only asks
-	over  func()                          // paints over what the box just drew (colour emoji); may be nil
-	paste func() bool                     // takes a paste before the box does (files, a picture); may be nil
+	key   func(k walk.Key, act bool) bool               // takes a key before the box does; act false: only asks
+	over  func()                                        // paints over what the box just drew (colour emoji); may be nil
+	paste func() bool                                   // takes a paste before the box does (files, a picture); may be nil
+	mouse func(msg uint32, wParam, lParam uintptr) bool // takes mouse messages before the box does; may be nil
 }
 
 var (
@@ -628,6 +752,13 @@ var (
 func enterHookProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 	h := enterHooks[hwnd]
 	switch msg {
+	case win.WM_MOUSEWHEEL, win.WM_LBUTTONDOWN, win.WM_MOUSEMOVE, win.WM_LBUTTONUP, win.WM_CAPTURECHANGED:
+		if h.mouse != nil && h.mouse(msg, wParam, lParam) {
+			if h.over != nil {
+				h.over()
+			}
+			return 0
+		}
 	case win.WM_GETDLGCODE:
 		// walk's message loop runs IsDialogMessage, which spends Tab on moving the focus and Esc on
 		// Cancel unless the box asks for them: it does only while key has a use for them

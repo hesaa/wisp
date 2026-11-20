@@ -135,6 +135,42 @@ func TestGroupNamesFromGroupEvents(t *testing.T) {
 	}
 }
 
+func TestGroupInfoUserRemovedCreatesSystemMessage(t *testing.T) {
+	m, db := newTestManager(t)
+	var got []any
+	m.AddListener(func(e any) { got = append(got, e) })
+	ctx := context.Background()
+	fa := &fakeClient{}
+	group := types.NewJID("120363000000000001", types.GroupServer)
+	admin := types.NewJID("6289999999999", types.DefaultUserServer)
+	me := types.NewJID(acctA, types.DefaultUserServer)
+
+	// Save admin in people cache
+	m.peopleMu.Lock()
+	m.people[acctA+" "+admin.String()] = store.Person{PushName: "Jun - HollaTeam"}
+	m.peopleMu.Unlock()
+
+	leaveEvt := &events.GroupInfo{
+		JID:       group,
+		Sender:    &admin,
+		Leave:     []types.JID{me},
+		Timestamp: time.Unix(1000, 0),
+	}
+	if err := m.handleEvent(ctx, acctA, fa, leaveEvt); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, err := db.GetChatMessages(acctA, group.String(), 0)
+	if err != nil || len(msgs) == 0 {
+		t.Fatalf("expected stored system message, got %v, err=%v", msgs, err)
+	}
+	sys := msgs[len(msgs)-1]
+	if sys.Type != "system" || sys.Body != "~ Jun - HollaTeam removed you" {
+		t.Fatalf("unexpected system message: %+v", sys)
+	}
+}
+
+
 func TestUnnamedGroupNamedOnceFromWhatsApp(t *testing.T) {
 	m, db := newTestManager(t)
 	group := types.NewJID("120363000000000002", types.GroupServer)

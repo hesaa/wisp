@@ -1,23 +1,35 @@
 package app
 
 import (
+	"context"
 	"fmt"
+	"net/url"
+	"strings"
 	"syscall"
 	"unsafe"
 
 	"github.com/lxn/win"
 	"golang.org/x/sys/windows"
+
+	"wa-go/internal/notify"
 )
 
 // The main window's messages walk does not publish, both for presence: WM_ACTIVATEAPP (the user
 // switched to Wisp, any of its windows, or away to another program) and session lock notifications.
 
 const (
+	wmCopyData           = 0x004A
 	wmWTSSessionChange   = 0x02B1
 	wtsSessionLock       = 0x7
 	wtsSessionUnlock     = 0x8
 	notifyForThisSession = 0
 )
+
+type copyDataStruct struct {
+	dwData uintptr
+	cbData uint32
+	lpData uintptr
+}
 
 var (
 	wtsapi32      = windows.NewLazySystemDLL("wtsapi32.dll")
@@ -31,6 +43,14 @@ var (
 
 func mainWndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
+	case wmCopyData:
+		cds := (*copyDataStruct)(unsafe.Pointer(lParam))
+		if cds != nil && cds.cbData > 0 {
+			buf := make([]byte, cds.cbData)
+			copy(buf, unsafe.Slice((*byte)(unsafe.Pointer(cds.lpData)), cds.cbData))
+			hooked.handleProtocolRaw(string(buf))
+			return 1
+		}
 	case win.WM_ACTIVATEAPP:
 		hooked.presence.activated(wParam != 0)
 	case win.WM_SYSCOMMAND:
@@ -122,3 +142,84 @@ func (a *App) watchActivation() error {
 	}
 	return nil
 }
+
+type protocolAction struct {
+	kind      string // "open" or "reply"
+	accountID string
+	chatJID   string
+	text      string
+}
+
+func parseProtocolAction(raw string) (protocolAction, bool) {
+	if raw == "" {
+		return protocolAction{}, false
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "wisp" {
+		return protocolAction{}, false
+	}
+	kind := u.Host
+	if kind == "" {
+		kind = strings.TrimPrefix(u.Path, "/")
+	}
+	kind = strings.ToLower(strings.Trim(kind, "/"))
+	if kind != "open" && kind != "reply" && kind != "markread" {
+		return protocolAction{}, false
+	}
+	q := u.Query()
+	action := protocolAction{
+		kind:      kind,
+		accountID: q.Get("acct"),
+		chatJID:   q.Get("jid"),
+	}
+	if kind == "reply" {
+		text := q.Get("replyText")
+		if text == "" {
+			text = q.Get("text")
+		}
+		if text == "" {
+			text = q.Get("msg")
+		}
+		action.text = text
+	}
+	return action, true
+}
+
+func (a *App) handleProtocolRaw(raw string) {
+	action, ok := parseProtocolAction(raw)
+	if !ok {
+		return
+	}
+	switch action.kind {
+	case "open":
+		a.toastClicked(action.accountID, action.chatJID)
+	case "reply":
+		if action.text != "" {
+			a.sendQuickReply(action.accountID, action.chatJID, action.text)
+		}
+	case "markread":
+		if !a.locked && action.accountID != "" && action.chatJID != "" {
+			a.mw.Synchronize(func() {
+				a.markChatRead(chatRef{action.accountID, action.chatJID})
+			})
+			_ = notify.ClearChatToasts("Wisp.App", action.chatJID, action.accountID)
+		}
+	}
+}
+
+func (a *App) sendQuickReply(acct, jid, text string) {
+	if a.locked {
+		return // locked with PIN, ignore quick replies
+	}
+	if acct == "" || jid == "" || text == "" {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), netTimeout)
+		defer cancel()
+		if _, err := a.mgr.SendText(ctx, acct, jid, text, nil, nil); err != nil {
+			logErr("quick reply", err)
+		}
+	}()
+}
+

@@ -15,6 +15,9 @@ type Input struct {
 	Body         string // text, or media caption
 	FileName     string // document file name, if known
 	FromMe       bool
+	AvatarPath   string // local file path to cached avatar (optional)
+	ImagePath    string // local file path to cached media image/photo (optional)
+	UnreadCount  int    // unread messages in chat (optional)
 }
 
 // Settings are the user preferences that shape an alert.
@@ -31,6 +34,12 @@ type Notification struct {
 	Title, Body string
 	Silent      bool
 	Sound       string
+	AvatarPath  string
+	ImagePath   string
+	UnreadCount int
+	AccountID   string
+	ChatJID     string
+	CanReply    bool
 }
 
 var mediaWord = map[string]string{
@@ -44,7 +53,10 @@ func Format(in Input, s Settings) (Notification, bool) {
 		in.Type == "revoked" || in.Type == "unsupported" {
 		return Notification{}, false
 	}
-	n := Notification{}
+	n := Notification{
+		AccountID: in.AccountID,
+		ChatJID:   in.ChatJID,
+	}
 	if !s.Sound {
 		n.Silent = true
 		n.Sound = ""
@@ -60,7 +72,12 @@ func Format(in Input, s Settings) (Notification, bool) {
 	}
 	if s.PrivateMode {
 		n.Title, n.Body = "WhatsApp", "New message"
+		n.CanReply = false
 	} else {
+		n.CanReply = true
+		n.AvatarPath = in.AvatarPath
+		n.ImagePath = in.ImagePath
+		n.UnreadCount = in.UnreadCount
 		n.Title = in.ChatName
 		if in.IsGroup {
 			n.Title = in.SenderName + " @ " + in.ChatName
@@ -109,9 +126,17 @@ type Dispatcher struct {
 	b             balloon
 	account, chat string
 	has           bool
+	appID         string
+	showToast     func(xml, appID, tag, group string) error
 }
 
-func newDispatcher(b balloon) *Dispatcher { return &Dispatcher{b: b} }
+func newDispatcher(b balloon) *Dispatcher {
+	return &Dispatcher{
+		b:         b,
+		appID:     "Wisp.App",
+		showToast: ShowWinRTToast,
+	}
+}
 
 // Notify shows an alert if Format allows it.
 func (d *Dispatcher) Notify(in Input, s Settings) error {
@@ -119,8 +144,20 @@ func (d *Dispatcher) Notify(in Input, s Settings) error {
 	if !ok {
 		return nil
 	}
-	if err := d.b.show(n.Title, n.Body, n.Silent); err != nil {
-		return err
+	shown := false
+	if d.showToast != nil {
+		appID := d.appID
+		if appID == "" {
+			appID = "Wisp.App"
+		}
+		if err := d.showToast(BuildToastXML(n), appID, n.ChatJID, n.AccountID); err == nil {
+			shown = true
+		}
+	}
+	if !shown && d.b != nil {
+		if err := d.b.show(n.Title, n.Body, n.Silent); err != nil {
+			return err
+		}
 	}
 	if n.Sound != "" {
 		_ = playSound(n.Sound)

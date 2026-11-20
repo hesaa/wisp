@@ -127,7 +127,13 @@ func (t *Tray) Dispose() error {
 // show implements balloon. Mirrors walk's showMessage but can set NIIF_NOSOUND,
 // which walk's public API cannot.
 func (t *Tray) show(title, body string, silent bool) error {
-	nid := win.NOTIFYICONDATA{HWnd: t.hwnd, UFlags: win.NIF_INFO, DwInfoFlags: win.NIIF_NONE}
+	// Clear any previous notification first so Windows triggers repeated alerts
+	// with identical text (e.g. in private mode where every notification is "WhatsApp: New message").
+	reset := win.NOTIFYICONDATA{HWnd: t.hwnd, UFlags: win.NIF_INFO}
+	reset.CbSize = uint32(unsafe.Sizeof(reset) - unsafe.Sizeof(win.HICON(0)))
+	_ = win.Shell_NotifyIcon(win.NIM_MODIFY, &reset)
+
+	nid := win.NOTIFYICONDATA{HWnd: t.hwnd, UFlags: win.NIF_INFO, DwInfoFlags: win.NIIF_INFO | win.NIIF_LARGE_ICON}
 	nid.CbSize = uint32(unsafe.Sizeof(nid) - unsafe.Sizeof(win.HICON(0)))
 	if silent {
 		nid.DwInfoFlags |= win.NIIF_NOSOUND

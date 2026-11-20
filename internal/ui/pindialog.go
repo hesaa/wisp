@@ -65,7 +65,7 @@ func askPIN(owner walk.Form, p theme.Palette, title string, labels ...string) ([
 	}
 	dlg.Starting().Attach(func() { focusOn(edits[0]) })
 	dlg.SendMessage(win.WM_CHANGEUISTATE, win.UIS_INITIALIZE, 0)
-	logErr("PIN dialog title bar", theme.ApplyTitleBar(uintptr(dlg.Handle()), isDark(p)))
+	logErr("PIN dialog title bar", titleBar(dlg, isDark(p)))
 	if dlg.Run() != walk.DlgCmdOK {
 		return nil, false, nil
 	}

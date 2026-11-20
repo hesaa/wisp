@@ -3,6 +3,7 @@ package ui
 import (
 	"errors"
 	"strings"
+	"sync"
 
 	"github.com/lxn/walk"
 	"github.com/lxn/win"
@@ -73,7 +74,7 @@ func RunNewChat(owner walk.Form, p theme.Palette, chats []store.Chat, contacts [
 	// focus cues follow the user's setting and last input (hidden after a click until a key is used)
 	dlg.SendMessage(win.WM_CHANGEUISTATE, win.UIS_INITIALIZE, 0)
 	// cosmetic: Windows builds without dark title bars keep a light one
-	logErr("new chat title bar", theme.ApplyTitleBar(uintptr(dlg.Handle()), isDark(p)))
+	logErr("new chat title bar", titleBar(dlg, isDark(p)))
 
 	if dlg.Run() == walk.DlgCmdOK && picked != "" {
 		onPick(picked)
@@ -168,4 +169,17 @@ func phoneJID(s string) (string, bool) {
 		return "", false
 	}
 	return d + "@s.whatsapp.net", true
+}
+
+// appIcon is the app's logo from the resources, the stock application icon without them (tests).
+var appIcon = sync.OnceValue(func() walk.Image {
+	if ic, err := walk.NewIconFromResource("APP"); err == nil {
+		return ic
+	}
+	return walk.IconApplication()
+})
+
+// titleBar gives a dialog the app's logo and a title bar matching the theme.
+func titleBar(f walk.Form, dark bool) error {
+	return errors.Join(f.SetIcon(appIcon()), theme.ApplyTitleBar(uintptr(f.Handle()), dark))
 }

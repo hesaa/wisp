@@ -130,7 +130,7 @@ func TestHitOffsetLandsOnWholeCharacters(t *testing.T) {
 		_, n := cluster(u, i)
 		i += n
 	}
-	adv := lineAdv(&monoMeasurer{}, u, 0)
+	adv := lineAdv(&monoMeasurer{}, u, nil, 0)
 	for x := -5; x < 80; x++ {
 		if off := hitOffset(adv, x); !starts[off] {
 			t.Errorf("x=%d hits offset %d, inside a character", x, off)

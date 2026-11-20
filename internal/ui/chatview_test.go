@@ -859,7 +859,7 @@ func TestBubbleLayoutWithQuote(t *testing.T) {
 	plain := store.Message{ID: "p", Type: "text", Body: "ok", SenderJID: alice}
 	reply := plain
 	reply.ID, reply.AccountID = "r", "628999"
-	reply.QuotedID, reply.QuotedSender, reply.QuotedBody, reply.QuotedType = "q1", bob, "a rather long original message\nsecond line", "text"
+	reply.QuotedID, reply.QuotedSender, reply.QuotedBody, reply.QuotedType = "q1", bob, "a *rather* long _original_ message\nsecond line", "text"
 	l := layOut(t, false, plain, reply)
 	p, r := l.cache["p"], l.cache["r"]
 	if p.quotedBox.Width != 0 || p.quotedSender != "" {

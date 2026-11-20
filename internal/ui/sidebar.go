@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"slices"
@@ -31,6 +32,8 @@ type SidebarModel struct {
 	selected string
 	redraw   func(top bool) // set by the Sidebar; top: scroll back to the first row
 	dir      *Directory
+	drafts   map[string]string // jid -> draft text
+	draftTS  map[string]int64  // jid -> draft timestamp
 }
 
 func NewSidebarModel() *SidebarModel { return &SidebarModel{} }
@@ -61,8 +64,11 @@ func (m *SidebarModel) SetChats(accountID string, chats []store.Chat) {
 	m.account = accountID
 	if switched {
 		m.selected = ""
+		m.drafts = nil
+		m.draftTS = nil
 	}
 	m.chats = slices.DeleteFunc(chats, func(c store.Chat) bool { return c.JID == statusBroadcast })
+	m.sortChats()
 	m.changed(switched)
 }
 
@@ -75,6 +81,61 @@ func (m *SidebarModel) Chats() []store.Chat { return m.chats }
 func (m *SidebarModel) Rows() []store.Chat { return m.rows }
 
 func (m *SidebarModel) Selected() string { return m.selected }
+
+// EffectiveTS returns the chat's sort and display timestamp: the draft's timestamp when an unsent
+// draft exists and is newer than LastMessageTS, else LastMessageTS.
+func (m *SidebarModel) EffectiveTS(c store.Chat) int64 {
+	if m.draftTS != nil {
+		if ts, ok := m.draftTS[c.JID]; ok && ts > c.LastMessageTS {
+			return ts
+		}
+	}
+	return c.LastMessageTS
+}
+
+// Draft returns any unsent draft text for jid.
+func (m *SidebarModel) Draft(jid string) (string, bool) {
+	if m.drafts == nil {
+		return "", false
+	}
+	d, ok := m.drafts[jid]
+	return d, ok && strings.TrimSpace(d) != ""
+}
+
+// SetDraft records draft text for jid. Non-empty text moves the chat to its draft position (usually top)
+// and displays "Draft: <text>" on the chat list with its timestamp updated. Empty or whitespace-only
+// text removes the draft and restores the chat's normal position and snippet.
+func (m *SidebarModel) SetDraft(jid, text string) {
+	if strings.TrimSpace(text) == "" {
+		if m.drafts == nil {
+			return
+		}
+		if _, ok := m.drafts[jid]; !ok {
+			return
+		}
+		delete(m.drafts, jid)
+		delete(m.draftTS, jid)
+		m.sortChats()
+		m.changed(false)
+		return
+	}
+	if m.drafts == nil {
+		m.drafts = make(map[string]string)
+		m.draftTS = make(map[string]int64)
+	}
+	m.drafts[jid] = text
+	if m.draftTS[jid] == 0 {
+		m.draftTS[jid] = time.Now().Unix()
+	}
+	m.sortChats()
+	m.changed(false)
+}
+
+func (m *SidebarModel) sortChats() {
+	slices.SortStableFunc(m.chats, func(a, b store.Chat) int {
+		return cmp.Compare(m.EffectiveTS(b), m.EffectiveTS(a))
+	})
+}
 
 // SetFilter keeps only chats whose name (or number, for unnamed chats) or last message contains q,
 // ignoring case.
@@ -102,7 +163,7 @@ func (m *SidebarModel) ApplyMessage(msg store.Message) bool {
 	if !msg.FromMe && msg.Status != store.StatusRead {
 		c.Unread++
 	}
-	at := slices.IndexFunc(m.chats, func(o store.Chat) bool { return o.LastMessageTS <= c.LastMessageTS })
+	at := slices.IndexFunc(m.chats, func(o store.Chat) bool { return m.EffectiveTS(o) <= m.EffectiveTS(c) })
 	if at < 0 {
 		at = len(m.chats)
 	}
@@ -136,12 +197,25 @@ func (m *SidebarModel) Unread() int {
 	return n
 }
 
+// UnreadChats is the number of chats with at least one unread message.
+func (m *SidebarModel) UnreadChats() int {
+	n := 0
+	for _, c := range m.chats {
+		if c.Unread > 0 {
+			n++
+		}
+	}
+	return n
+}
+
 func (m *SidebarModel) changed(top bool) {
 	m.rows = m.chats
 	if m.query != "" {
 		m.rows = nil
 		for _, c := range m.chats {
-			if strings.Contains(strings.ToLower(m.displayName(c)), m.query) || strings.Contains(strings.ToLower(snippetLine(c, m.dir)), m.query) {
+			matchDraft := m.drafts != nil && strings.Contains(strings.ToLower(m.drafts[c.JID]), m.query)
+			if strings.Contains(strings.ToLower(m.displayName(c)), m.query) ||
+				strings.Contains(strings.ToLower(snippetLine(c, m.dir)), m.query) || matchDraft {
 				m.rows = append(m.rows, c)
 			}
 		}
@@ -237,6 +311,7 @@ func (s *Sidebar) build() error {
 	}
 	s.model.redraw = func(top bool) {
 		s.list.dir = s.model.dir
+		s.list.model = s.model
 		s.list.setRows(s.model.Rows(), s.model.Selected(), top)
 	}
 	return s.SetPalette(s.pal)
@@ -273,9 +348,6 @@ func (s *Sidebar) Invalidate() error {
 	}
 	if s.list != nil {
 		errs = append(errs, s.list.Invalidate())
-	}
-	if s.Composite != nil {
-		errs = append(errs, s.Composite.Invalidate())
 	}
 	return errors.Join(errs...)
 }
@@ -592,6 +664,7 @@ type chatList struct {
 	vscroll
 	pal      *theme.Palette
 	dir      *Directory
+	model    *SidebarModel
 	name     string // accessible name
 	rows     []store.Chat
 	selected string
@@ -766,7 +839,15 @@ func (l *chatList) paintRow(c *walk.Canvas, row store.Chat, r walk.Rectangle, no
 	}
 	av := walk.Rectangle{X: r.X + s(12), Y: r.Y + (r.Height-s(48))/2, Width: s(48), Height: s(48)}
 	x, right := av.X+av.Width+s(13), r.X+r.Width-s(14)
-	ts := relTime(row.LastMessageTS, now)
+	draft, hasDraft := "", false
+	if l.model != nil {
+		draft, hasDraft = l.model.Draft(row.JID)
+	}
+	effTS := row.LastMessageTS
+	if l.model != nil {
+		effTS = l.model.EffectiveTS(row)
+	}
+	ts := relTime(effTS, now)
 	tw := len(ts) * s(7) // width estimate: measuring text on walk's buffered canvas leaks a metafile
 	timeColor, snipRight := theme.Color(p.TextSecondary), right
 	if row.Unread > 0 {
@@ -780,11 +861,26 @@ func (l *chatList) paintRow(c *walk.Canvas, row store.Chat, r walk.Rectangle, no
 		}
 		snipRight -= badgeWidth(s(20), label) + s(6)
 	}
+	var snipDraw func() error
+	if hasDraft {
+		const prefix = "Draft: "
+		pw := s(36)
+		snipDraw = func() error {
+			return errors.Join(
+				drawText(c, dpi, prefix, 10, 0, theme.Color(p.Accent), walk.Rectangle{X: x, Y: r.Y + s(38), Width: pw, Height: s(22)}, leftText),
+				drawText(c, dpi, oneLine(draft), 10, 0, theme.Color(p.TextSecondary), walk.Rectangle{X: x + pw, Y: r.Y + s(38), Width: max(0, snipRight-(x+pw)), Height: s(22)}, leftText),
+			)
+		}
+	} else {
+		snipDraw = func() error {
+			return drawText(c, dpi, oneLine(snippetLine(row, l.dir)), 10, 0, theme.Color(p.TextSecondary), walk.Rectangle{X: x, Y: r.Y + s(38), Width: snipRight - x, Height: s(22)}, leftText)
+		}
+	}
 	return errors.Join(
 		drawAvatar(c, dpi, av, row.Name, row.JID, 13),
 		drawText(c, dpi, ts, 9, 0, timeColor, walk.Rectangle{X: right - tw, Y: r.Y + s(13), Width: tw, Height: s(24)}, rightText),
 		drawText(c, dpi, l.dir.Name(row.JID, row.Name), 12, 0, theme.Color(p.Text), walk.Rectangle{X: x, Y: r.Y + s(13), Width: right - tw - s(6) - x, Height: s(24)}, leftText),
-		drawText(c, dpi, oneLine(snippetLine(row, l.dir)), 10, 0, theme.Color(p.TextSecondary), walk.Rectangle{X: x, Y: r.Y + s(38), Width: snipRight - x, Height: s(22)}, leftText),
+		snipDraw(),
 		c.FillRectanglePixels(line, walk.Rectangle{X: x, Y: r.Y + r.Height - max(1, s(1)), Width: r.Width - x, Height: max(1, s(1))}),
 	)
 }
