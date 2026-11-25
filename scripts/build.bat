@@ -9,5 +9,11 @@ if not defined KEY if exist giphy.key set /p KEY=<giphy.key
 if not defined KEY echo build.bat: no GIPHY key found, building without one (a key can be set in Settings).
 go build -trimpath -ldflags="-H windowsgui -s -w -X main.giphyKey=%KEY%" -o wisp.exe ./cmd/wisp
 set ERR=%ERRORLEVEL%
+if %ERR% neq 0 (
+	popd
+	exit /b %ERR%
+)
+go build -trimpath -ldflags="-s -w" -o wisp-mcp.exe ./cmd/wisp-mcp
+set ERR=%ERRORLEVEL%
 popd
 exit /b %ERR%
