@@ -13,6 +13,8 @@ import (
 
 	"github.com/lxn/walk"
 	"github.com/lxn/win"
+
+	"wa-go/internal/media"
 )
 
 // testdata/anim.webp: 8x4, three frames (40, 120, 80 ms). All red; then a green square appears on
@@ -27,7 +29,7 @@ func TestAnimatedWebPFramesAreComposited(t *testing.T) {
 		delay       time.Duration
 	}
 	var got []shot
-	err = decodeAnimatedWebP(data, func(canvas *image.NRGBA, delay time.Duration) error {
+	err = media.DecodeAnimatedWebP(data, func(canvas *image.NRGBA, delay time.Duration) error {
 		if b := canvas.Bounds(); b.Dx() != 8 || b.Dy() != 4 {
 			t.Fatalf("canvas %v, want 8x4", b)
 		}
@@ -52,8 +54,36 @@ func TestAnimatedWebPFramesAreComposited(t *testing.T) {
 	}
 
 	still, _ := base64.StdEncoding.DecodeString("UklGRhoAAABXRUJQVlA4TA0AAAAvAAAAEAcQERGIiP4HAA==")
-	if err := decodeAnimatedWebP(still, func(*image.NRGBA, time.Duration) error { return nil }); !errors.Is(err, errStill) {
+	if err := media.DecodeAnimatedWebP(still, func(*image.NRGBA, time.Duration) error { return nil }); !errors.Is(err, errStill) {
 		t.Fatalf("a still WebP: %v, want errStill", err)
+	}
+}
+
+func TestPlayWebPLoopsUntilStopped(t *testing.T) {
+	data, err := os.ReadFile("testdata/anim.webp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	var frames [][]byte
+	err = playWebP(data, walk.RGB(10, 20, 30), stop, func(pix []byte) {
+		if frames = append(frames, pix); len(frames) == 4 { // three frames, then the first again
+			close(stop)
+		}
+	})
+	if err != nil || len(frames) != 4 {
+		t.Fatalf("playWebP: %v after %d frames", err, len(frames))
+	}
+	at := (1*8 + 5) * 4 // (5, 1), on the right; BGRX at the sticker's own 8x4
+	// Red; then transparent, so the background's; then red again.
+	for i, want := range map[int]byte{0: 255, 2: 10, 3: 255} {
+		if got := frames[i][at+2]; got != want {
+			t.Errorf("frame %d red %d, want %d", i, got, want)
+		}
+	}
+	still, _ := base64.StdEncoding.DecodeString("UklGRhoAAABXRUJQVlA4TA0AAAAvAAAAEAcQERGIiP4HAA==")
+	if err := playWebP(still, 0, stop, nil); !errors.Is(err, errStill) {
+		t.Errorf("a still WebP: %v, want errStill", err)
 	}
 }
 

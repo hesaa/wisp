@@ -12,6 +12,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 
 	"wa-go/internal/lock"
+	"wa-go/internal/store"
 	"wa-go/internal/theme"
 	"wa-go/internal/whatsapp"
 )
@@ -35,6 +36,7 @@ const (
 	KeyNotifySoundName    = "notify.sound.name"         // sound file name: default, message, mail, reminder, sms
 	KeyTheme              = "ui.theme"                  // system, dark or light
 	KeyLockPIN            = "lock.pin"                  // the app-lock PIN's hash (see package lock); "" is lock off
+	KeyLockTimeout        = "lock.timeout"              // auto-lock timeout in minutes; "0" is immediately, "5" is 5 minutes
 	KeyMCPEnabled         = "mcp.enabled"               // built-in local MCP bridge ("true" or "false")
 )
 
@@ -42,11 +44,48 @@ const (
 type option struct{ label, value string }
 
 var (
-	visibilityOptions = []option{{"Everyone", "all"}, {"My contacts", "contacts"}, {"Contacts except…", "contact_blacklist"}, {"Nobody", "none"}}
-	timerOptions      = []option{{"Off", "0"}, {"24 hours", "86400"}, {"7 days", "604800"}, {"90 days", "7776000"}}
-	themeOptions      = []option{{"System default", "system"}, {"Dark", "dark"}, {"Light", "light"}}
-	soundOptions      = []option{{"Default", "default"}, {"Message", "message"}, {"Mail", "mail"}, {"Reminder", "reminder"}, {"SMS", "sms"}}
+	visibilityOptions  = []option{{"Everyone", "all"}, {"My contacts", "contacts"}, {"Contacts except…", "contact_blacklist"}, {"Nobody", "none"}}
+	timerOptions       = []option{{"Off", "0"}, {"24 hours", "86400"}, {"7 days", "604800"}, {"90 days", "7776000"}}
+	themeOptions       = []option{{"System default", "system"}, {"Dark", "dark"}, {"Light", "light"}}
+	soundOptions       = []option{{"Default", "default"}, {"Message", "message"}, {"Mail", "mail"}, {"Reminder", "reminder"}, {"SMS", "sms"}}
+	lockTimeoutOptions = []option{{"Immediately", "0"}, {"1m", "1"}, {"5m", "5"}, {"15m", "15"}, {"1h", "60"}}
 )
+
+// validateCustomTimeout checks that input is a valid timeout in minutes (0 to 10080).
+func validateCustomTimeout(input string) (string, error) {
+	s := strings.TrimSpace(input)
+	if s == "" {
+		return "", errors.New("Enter a number of minutes.")
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 || n > 10080 {
+		return "", errors.New("Enter a number between 0 and 10080 minutes.")
+	}
+	return strconv.Itoa(n), nil
+}
+
+// lockTimeoutChoiceOptions builds the options for the auto-lock timeout choice widget.
+func lockTimeoutChoiceOptions(currentVal string) []option {
+	presets := []option{
+		{"Immediately", "0"},
+		{"1m", "1"},
+		{"5m", "5"},
+		{"15m", "15"},
+		{"1h", "60"},
+	}
+	isPreset := false
+	for _, p := range presets {
+		if p.value == currentVal {
+			isPreset = true
+			break
+		}
+	}
+	customLabel := "Custom..."
+	if !isPreset && currentVal != "" {
+		customLabel = fmt.Sprintf("Custom (%sm)", currentVal)
+	}
+	return append(presets, option{label: customLabel, value: "custom"})
+}
 
 // privacyKeys are the per-account settings, with the values WhatsApp accepts for each.
 var privacyKeys = map[string][]option{
@@ -67,20 +106,22 @@ var settingNames = map[string]string{
 	KeyAutoDownloadImages: "Auto-download images", KeyGiphyAPIKey: "GIPHY API key", KeyProxy: "Proxy",
 	KeyNotify: "Notifications", KeyNotifyPrivate: "Private notifications", KeyNotifySound: "Notification sound",
 	KeyNotifySoundName: "Sound",
-	KeyTheme: "Theme", KeyLockPIN: "App lock", KeyMCPEnabled: "MCP server",
+	KeyTheme: "Theme", KeyLockPIN: "App lock", KeyLockTimeout: "Auto-lock timeout", KeyMCPEnabled: "MCP server",
 }
 
 // defaults are the values of settings never saved. Privacy ones stand in until WhatsApp's answer.
 var defaults = map[string]string{
 	KeyLastSeen: "all", KeyReadReceipts: "all", KeyProfilePhoto: "all", KeyDisappearing: "0",
 	KeyGhostTyping: "false", KeyAppearOffline: "false", KeyAutoDownloadImages: "true", KeyGiphyAPIKey: "",
-	KeyProxy: "", KeyNotify: "true", KeyNotifyPrivate: "false", KeyNotifySound: "true", KeyNotifySoundName: "default", KeyTheme: "system", KeyLockPIN: "", KeyMCPEnabled: "false",
+	KeyProxy: "", KeyNotify: "true", KeyNotifyPrivate: "false", KeyNotifySound: "true", KeyNotifySoundName: "default", KeyTheme: "system", KeyLockPIN: "",
+	KeyLockTimeout: "5", KeyMCPEnabled: "false",
 }
 
 // SettingsStore is the part of *store.DB the settings use.
 type SettingsStore interface {
 	GetSetting(accountID, key string) (value string, ok bool, err error)
 	SetSetting(accountID, key, value string) error
+	QueryMessageLogs(f store.MessageFilter) ([]store.Message, error)
 }
 
 // PrivacyClient is the part of *whatsapp.Manager the privacy settings use.

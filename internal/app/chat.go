@@ -39,12 +39,28 @@ func (a *App) showChatPane(open bool) {
 
 // saveCurrentDraft saves any typed text in the input bar as the draft for the open chat.
 func (a *App) saveCurrentDraft() {
-	if a.v.open.jid == "" || a.bar == nil {
+	if a.v.open.jid == "" || a.bar == nil || a.v.isNotMember(a.v.open) {
 		return
 	}
 	text := a.bar.Text()
 	a.v.setDraft(a.v.open, text)
 	a.side.Model().SetDraft(a.v.open.jid, text)
+}
+
+// isGroupNotMemberDB reports whether c's latest system notice in the local database records
+// that the user was removed from or left the group.
+func (a *App) isGroupNotMemberDB(c chatRef) bool {
+	if a.db == nil || !isGroup(c.jid) {
+		return false
+	}
+	body, ok, err := a.db.LatestSystemMessage(c.acct, c.jid)
+	if err != nil || !ok {
+		return false
+	}
+	lower := strings.ToLower(body)
+	return strings.Contains(lower, "removed you") ||
+		strings.Contains(lower, "no longer a member") ||
+		strings.Contains(lower, "you left")
 }
 
 // closeActiveChat closes the active conversation and shows the empty pane.
@@ -82,11 +98,16 @@ func (a *App) openChat(acct, jid, name string) {
 	a.closeMedia()
 	a.closeInfo()
 	_ = notify.ClearChatToasts("Wisp.App", jid, acct)
+	if isGroup(c.jid) && !a.v.isNotMember(c) && a.isGroupNotMemberDB(c) {
+		a.v.setNotMember(c, true)
+	}
 	if c == a.v.open {
 		if a.chatUnread(jid) > 0 {
 			a.markChatRead(c)
 		}
-		a.bar.Focus()
+		if !a.v.isNotMember(c) {
+			a.bar.Focus()
+		}
 		return
 	}
 	if name == "" {
@@ -95,18 +116,20 @@ func (a *App) openChat(acct, jid, name string) {
 	a.saveCurrentDraft()
 	a.bar.Reset() // before the switch: it may still tell the chat being left that typing stopped
 	if a.v.isNotMember(c) {
+		a.v.clearDraft(c)
+		a.side.Model().SetDraft(c.jid, "")
 		a.bar.SetReadOnlyNotice("You can't send messages to this group because you're no longer a member.")
 	} else {
 		a.bar.SetReadOnlyNotice("")
-	}
-	if d := a.v.draft(c); d != "" {
-		a.bar.SetDraft(d)
-		a.side.Model().SetDraft(c.jid, d)
+		if d := a.v.draft(c); d != "" {
+			a.bar.SetDraft(d)
+			a.side.Model().SetDraft(c.jid, d)
+		}
+		a.bar.Focus()
 	}
 	a.loadMentions(c)
 	a.loadChat(c, name)
 	a.showChatPane(true)
-	a.bar.Focus()
 }
 
 // loadChat shows c in the chat view from its newest page, read off the UI thread once disappeared
@@ -368,7 +391,7 @@ func (a *App) openFile(path string) {
 // send sends text to the open chat; the stored message comes back as a MessageEvent. Failed, the
 // text goes back in the box if its chat is still open and nothing new was typed.
 func (a *App) send(text string) {
-	if a.locked {
+	if a.locked || a.v.isNotMember(a.v.open) {
 		return // nothing is shown, opened or sent behind the lock page
 	}
 	c := a.v.open
@@ -464,6 +487,12 @@ func (a *App) loadMentions(c chatRef) {
 				}
 				return
 			}
+			if a.v.isNotMember(c) {
+				a.v.setNotMember(c, false)
+				if a.v.open == c && !a.locked {
+					a.bar.SetReadOnlyNotice("")
+				}
+			}
 			if a.v.open == c && !a.locked {
 				a.bar.SetGroupParticipants(mentionMembers(jids, c.acct, a.dir(c.acct)))
 			}
@@ -476,7 +505,7 @@ func (a *App) loadMentions(c chatRef) {
 // stops it: the files after it are not sent.
 func (a *App) attach(files []ui.Attachment, done func()) {
 	c := a.v.open
-	if a.locked || c.jid == "" {
+	if a.locked || c.jid == "" || a.v.isNotMember(c) {
 		if done != nil {
 			done()
 		}
@@ -509,7 +538,7 @@ func (a *App) attach(files []ui.Attachment, done func()) {
 // sendGIF downloads a picked GIPHY MP4 (allowlist checked again, size capped) and sends it to the
 // open chat as a GIF.
 func (a *App) sendGIF(mp4URL string) {
-	if a.locked {
+	if a.locked || a.v.isNotMember(a.v.open) {
 		return // nothing is shown, opened or sent behind the lock page
 	}
 	c := a.v.open
@@ -546,7 +575,7 @@ func (a *App) sendOff(what string, send func(ctx context.Context) error, timeout
 // typing tells the open chat the user is typing (or stopped), unless ghost typing is on or the user
 // appears offline.
 func (a *App) typing(composing bool) {
-	if a.locked {
+	if a.locked || a.v.isNotMember(a.v.open) {
 		return // nothing is shown, opened or sent behind the lock page
 	}
 	c := a.v.open
@@ -735,21 +764,32 @@ func isNotInGroup(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "not participating in that group") ||
 		strings.Contains(msg, "not-authorized") ||
-		strings.Contains(msg, "not in group")
+		strings.Contains(msg, "not in group") ||
+		strings.Contains(msg, "forbidden") ||
+		strings.Contains(msg, "server returned error 401") ||
+		strings.Contains(msg, "server returned error 403")
 }
 
 // setGroupNotMember puts the chat into non-member state: disables message composer, shows
 // the read-only banner matching WhatsApp, and ensures a removal system notice is displayed.
 func (a *App) setGroupNotMember(c chatRef) {
 	a.v.setNotMember(c, true)
-	if a.v.open == c {
+	a.v.clearDraft(c)
+	if a.side != nil && a.side.Model() != nil {
+		a.side.Model().SetDraft(c.jid, "")
+	}
+	if a.v.open == c && a.bar != nil {
+		a.bar.Reset()
 		a.bar.SetReadOnlyNotice("You can't send messages to this group because you're no longer a member.")
+	}
+	if a.db == nil {
+		return
 	}
 	go func() {
 		hasSystem := false
 		if msgs, err := a.db.GetChatMessages(c.acct, c.jid, 0); err == nil {
 			for _, m := range msgs {
-				if m.Type == "system" && (strings.Contains(m.Body, "removed you") || strings.Contains(m.Body, "no longer a member")) {
+				if m.Type == "system" && (strings.Contains(m.Body, "removed you") || strings.Contains(m.Body, "no longer a member") || strings.Contains(m.Body, "You left")) {
 					hasSystem = true
 					break
 				}

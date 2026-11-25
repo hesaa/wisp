@@ -205,6 +205,18 @@ func (b *InputBar) SetReadOnlyNotice(notice string) {
 	if isReadOnly {
 		b.banner.SetVisible(false)
 		b.list.SetVisible(false)
+		if b.edit != nil {
+			b.suppressDraft = true
+			logErr("read only clear text", b.edit.SetText(""))
+			b.suppressDraft = false
+			logErr("read only set readonly", b.edit.SetReadOnly(true))
+			b.edit.SetEnabled(false)
+		}
+	} else {
+		if b.edit != nil {
+			logErr("restore readonly", b.edit.SetReadOnly(false))
+			b.edit.SetEnabled(true)
+		}
 	}
 	b.fit()
 }
@@ -429,7 +441,7 @@ func (b *InputBar) Restore(text string) { b.composer.restore(text) }
 
 // Text returns the text currently in the message box.
 func (b *InputBar) Text() string {
-	if b == nil || b.edit == nil {
+	if b == nil || b.edit == nil || b.noticeText != "" {
 		return ""
 	}
 	return b.edit.Text()
@@ -438,7 +450,7 @@ func (b *InputBar) Text() string {
 // SetDraft fills the box with draft text without firing typing events, and places
 // the cursor at the end of the text.
 func (b *InputBar) SetDraft(text string) {
-	if b == nil || b.edit == nil {
+	if b == nil || b.edit == nil || b.noticeText != "" {
 		return
 	}
 	b.suppressDraft = true
@@ -450,7 +462,12 @@ func (b *InputBar) SetDraft(text string) {
 }
 
 // Focus puts the keyboard focus in the message box.
-func (b *InputBar) Focus() { focusOn(b.edit) }
+func (b *InputBar) Focus() {
+	if b == nil || b.edit == nil || b.noticeText != "" {
+		return
+	}
+	focusOn(b.edit)
+}
 
 // SetEnabled enables or disables the whole bar.
 func (b *InputBar) SetEnabled(enabled bool) {
@@ -525,6 +542,9 @@ func (b *InputBar) paintButton(c *walk.Canvas, cw *walk.CustomWidget, icon icons
 }
 
 func (b *InputBar) edited() {
+	if b.noticeText != "" {
+		return
+	}
 	b.composer.edited()
 	b.refreshMentions()
 	if _, ok := outgoingText(b.edit.Text()); ok != b.canSend {
@@ -540,6 +560,9 @@ func (b *InputBar) edited() {
 
 // sendNow sends the box's text (Enter or the Send button) and leaves the focus in the box.
 func (b *InputBar) sendNow() {
+	if b.noticeText != "" {
+		return
+	}
 	b.send()
 	focusOn(b.edit)
 }

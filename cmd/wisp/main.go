@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"unsafe"
 
@@ -162,6 +163,9 @@ var giphyKey string
 const logLimit = 1 << 20
 
 func main() {
+	// Set a 64 MB soft memory limit so the Go runtime aggressively reclaims and returns
+	// memory to Windows before the heap can grow unchecked.
+	debug.SetMemoryLimit(64 * 1024 * 1024)
 	_ = setAppID(appUserModelID)
 	go ensureShortcut()
 	go ensureProtocol()

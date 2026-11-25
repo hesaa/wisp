@@ -11,12 +11,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"runtime/debug"
 	"time"
 
 	"github.com/lxn/walk"
 	"github.com/lxn/win"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
+	"golang.org/x/sys/windows"
 
 	"wa-go/internal/lock"
 	"wa-go/internal/mcp"
@@ -62,7 +64,7 @@ const (
 
 // globalKeys are the app-global settings kept in memory (account "" of the settings table).
 var globalKeys = []string{ui.KeyGhostTyping, ui.KeyAppearOffline, ui.KeyAutoDownloadImages, ui.KeyGiphyAPIKey,
-	ui.KeyProxy, ui.KeyNotify, ui.KeyNotifyPrivate, ui.KeyNotifySound, ui.KeyNotifySoundName, ui.KeyTheme, ui.KeyLockPIN, ui.KeyMCPEnabled}
+	ui.KeyProxy, ui.KeyNotify, ui.KeyNotifyPrivate, ui.KeyNotifySound, ui.KeyNotifySoundName, ui.KeyTheme, ui.KeyLockPIN, ui.KeyLockTimeout, ui.KeyMCPEnabled}
 
 // App is the running main window.
 type App struct {
@@ -114,7 +116,8 @@ type App struct {
 	showingInfo bool // the details view replaces the chat and the input bar
 	infoGen     int
 	sideVisible bool // whether the chats sidebar is shown
-
+	hiddenAt    time.Time
+	lockTimer   *time.Timer
 	mcpBridge   *mcp.Bridge
 	mcpInfoPath string // non-empty in tests to avoid touching %LOCALAPPDATA%\Wisp\mcp.json
 }
@@ -332,7 +335,7 @@ func (a *App) build() error {
 	a.bar.OnAttach(a.attach)
 	a.bar.OnSendGIF(a.sendGIF)
 	a.bar.OnDraft(func(text string) {
-		if a.v.open.jid == "" {
+		if a.v.open.jid == "" || a.v.isNotMember(a.v.open) {
 			return
 		}
 		a.v.setDraft(a.v.open, text)
@@ -435,7 +438,7 @@ func (a *App) closing(canceled *bool, _ walk.CloseReason) {
 	*canceled = true
 	a.mw.Hide()
 	a.hiding = true
-	a.lockNow() // locked while hidden: a restore never flashes the chats
+	a.onHidden()
 	// closing an owned dialog shows its owner again: hide once they are gone
 	a.mw.Synchronize(func() {
 		if a.hiding && a.mw.Visible() {
@@ -445,6 +448,20 @@ func (a *App) closing(canceled *bool, _ walk.CloseReason) {
 	})
 	a.showPage() // stops pairing while hidden
 	a.sendPresence(true)
+	trimMemory()
+}
+
+var (
+	kernel32DLL               = windows.NewLazySystemDLL("kernel32.dll")
+	pSetProcessWorkingSetSize = kernel32DLL.NewProc("SetProcessWorkingSetSize")
+)
+
+// trimMemory returns unused heap memory to the OS and trims the working set when idle in tray or minimised.
+func trimMemory() {
+	debug.FreeOSMemory()
+	if h, err := windows.GetCurrentProcess(); err == nil {
+		_, _, _ = pSetProcessWorkingSetSize.Call(uintptr(h), ^uintptr(0), ^uintptr(0))
+	}
 }
 
 // exit quits from the tray's Exit item.
@@ -466,6 +483,7 @@ func (a *App) Restore() { a.mw.Synchronize(a.restore) }
 // restore brings the window back from the tray (or a minimised state) to the front.
 func (a *App) restore() {
 	a.hiding = false
+	a.onRestored()
 	if !a.mw.Visible() {
 		a.mw.Show()
 	}
@@ -500,6 +518,9 @@ func (a *App) activated() {
 
 // foreground reports whether the user is looking at the window.
 func (a *App) foreground() bool {
+	if a.mw == nil {
+		return false
+	}
 	h := a.mw.Handle()
 	return inFront(a.mw.Visible(), win.IsIconic(h), a.locked || a.page != pageChats, win.GetForegroundWindow() == h)
 }
@@ -529,7 +550,10 @@ func (a *App) sizeChanged() {
 		a.minimized = m
 		a.sendPresence(m)
 		if m {
-			a.lockNow() // locked while minimised: a restore never shows the chats
+			a.onHidden()
+			trimMemory()
+		} else {
+			a.onRestored()
 		}
 		a.showPage() // pairing stops while minimised
 	}
@@ -640,6 +664,17 @@ func (a *App) settingChanged(key string) {
 		a.chat.SetAutoDownload(v == "true")
 	case ui.KeyLockPIN:
 		logErr("taskbar preview", forceIconic(a.mw.Handle(), v != ""))
+		if v == "" {
+			if a.lockTimer != nil {
+				a.lockTimer.Stop()
+				a.lockTimer = nil
+			}
+			a.hiddenAt = time.Time{}
+		}
+	case ui.KeyLockTimeout:
+		if (a.minimized || a.hiding) && !a.locked {
+			a.onHidden()
+		}
 	case ui.KeyMCPEnabled:
 		a.syncMCPBridge()
 	}
@@ -747,24 +782,82 @@ func (a *App) focusPage() {
 	}
 }
 
+// onHidden is called when the window is minimised or closed to the tray.
+// If the lock timeout is 0 (immediately), it locks right away.
+// Otherwise, it records the hidden timestamp and arms a background timer to lock when the timeout expires.
+func (a *App) onHidden() {
+	if a.cfg[ui.KeyLockPIN] == "" || a.locked {
+		return
+	}
+	timeout := parseLockTimeout(a.cfg[ui.KeyLockTimeout])
+	if timeout == 0 {
+		a.lockNow()
+		return
+	}
+	if a.hiddenAt.IsZero() {
+		a.hiddenAt = time.Now()
+	}
+	if a.lockTimer != nil {
+		a.lockTimer.Stop()
+	}
+	a.lockTimer = time.AfterFunc(timeout, func() {
+		if a.mw != nil {
+			a.mw.Synchronize(func() {
+				if a.minimized || a.hiding {
+					a.lockNow()
+				}
+			})
+		}
+	})
+}
+
+// onRestored is called when the window is restored from tray or unminimised.
+// It stops the pending lock timer and locks immediately if the timeout has expired.
+func (a *App) onRestored() {
+	if a.lockTimer != nil {
+		a.lockTimer.Stop()
+		a.lockTimer = nil
+	}
+	if a.cfg[ui.KeyLockPIN] != "" && !a.locked {
+		if lockTimeoutExpired(a.cfg[ui.KeyLockPIN], a.cfg[ui.KeyLockTimeout], a.hiddenAt, time.Now()) {
+			a.lockNow()
+		}
+	}
+	a.hiddenAt = time.Time{}
+}
+
 // lockNow covers the window with the lock page; it does nothing while no PIN is set.
 func (a *App) lockNow() {
 	if a.cfg[ui.KeyLockPIN] == "" || a.locked {
 		return // off, or already locked (a countdown in progress stays)
 	}
 	a.locked = true
-	endMenu.Call() // an open context menu could still Copy behind the lock
-	if !a.resetting {
-		closeModals(a.mw.Handle()) // Settings, New chat, the status viewer, their dialogs
+	if a.lockTimer != nil {
+		a.lockTimer.Stop()
+		a.lockTimer = nil
 	}
-	a.mw.Synchronize(a.focusPage) // once they are gone
+	a.hiddenAt = time.Time{}
+	endMenu.Call() // an open context menu could still Copy behind the lock
+	if a.mw != nil {
+		if !a.resetting {
+			closeModals(a.mw.Handle()) // Settings, New chat, the status viewer, their dialogs
+		}
+		a.mw.Synchronize(a.focusPage) // once they are gone
+	}
 	a.closeMedia()
 	a.closeInfo()
-	a.bar.ClearReply() // the banner quotes a message
-	a.bar.DismissMentions()
-	a.lockPage.Clear()
-	a.showPage()
+	if a.bar != nil {
+		a.bar.ClearReply() // the banner quotes a message
+		a.bar.DismissMentions()
+	}
+	if a.lockPage != nil {
+		a.lockPage.Clear()
+	}
+	if a.mw != nil {
+		a.showPage()
+	}
 	a.presence.appLock(true)
+	trimMemory()
 }
 
 // unlock checks pin against the stored hash, with the back-off for wrong tries. pin is not kept.

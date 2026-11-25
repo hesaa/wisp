@@ -141,3 +141,14 @@ func TestHeartIsDrawnRed(t *testing.T) {
 		t.Fatalf("%d red pixels: the heart was drawn as a plain glyph", red)
 	}
 }
+
+func TestColorEmojiRenderTargetIsSoftware(t *testing.T) {
+	if err := colourInit(); err != nil {
+		t.Fatalf("colourInit failed: %v", err)
+	}
+	// Verify that heavy GPU compiler dll (igc64.dll) was not loaded
+	h := win.GetModuleHandle(syscall.StringToUTF16Ptr("igc64.dll"))
+	if h != 0 {
+		t.Fatalf("igc64.dll (Intel Graphics Compiler) is loaded; render target should use software mode")
+	}
+}

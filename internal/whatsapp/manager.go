@@ -121,6 +121,10 @@ type msgStore interface {
 	SetMediaPath(accountID, chatJID, id, path string) error
 	UpsertPeople(accountID string, people []store.Person) error
 	SetAvatar(accountID, jid, avatarID string, ts int64) error
+	DeleteUnsupported(accountID, chatJID, id string) error
+	UnsupportedTimelines(accountID string) ([]store.Message, error)
+	GetSetting(accountID, key string) (string, bool, error)
+	SetSetting(accountID, key, value string) error
 }
 
 // Manager runs every paired account. It is safe for concurrent use and never touches the UI.

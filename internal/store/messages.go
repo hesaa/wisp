@@ -92,6 +92,15 @@ func (d *DB) insertChunk(msgs []Message) (int64, error) {
 		return 0, err
 	}
 	defer ins.Close()
+	// A redelivered message whose stored copy was "unsupported" replaces it: an app that learned the
+	// kind since shows it. Its status and media path stay; it is not counted as new.
+	upgrade, err := tx.Prepare(`UPDATE messages SET message_type = ?4, body = ?5, media_meta = COALESCE(?6, x''),
+		expires_at = ?7, mentions = ?8, quoted_id = ?9, quoted_sender = ?10, quoted_body = ?11, quoted_type = ?12
+		WHERE account_id = ?1 AND chat_jid = ?2 AND id = ?3 AND message_type = 'unsupported'`)
+	if err != nil {
+		return 0, err
+	}
+	defer upgrade.Close()
 	chat, err := tx.Prepare(`INSERT INTO chats (account_id, jid, last_message_ts) VALUES (?,?,?)
 		ON CONFLICT(account_id, jid) DO UPDATE SET last_message_ts = MAX(last_message_ts, excluded.last_message_ts)`)
 	if err != nil {
@@ -110,6 +119,12 @@ func (d *DB) insertChunk(msgs []Message) (int64, error) {
 			return 0, err
 		}
 		inserted += n
+		if n == 0 && m.Type != "unsupported" {
+			if _, err := upgrade.Exec(m.AccountID, m.ChatJID, m.ID, m.Type, m.Body, m.MediaMeta,
+				m.ExpiresAt, m.Mentions, m.QuotedID, m.QuotedSender, m.QuotedBody, m.QuotedType); err != nil {
+				return 0, err
+			}
+		}
 		if m.ChatJID == statusBroadcastJID {
 			continue
 		}
@@ -118,6 +133,28 @@ func (d *DB) insertChunk(msgs []Message) (int64, error) {
 		}
 	}
 	return inserted, tx.Commit()
+}
+
+// DeleteUnsupported removes a stored "unsupported" message that turned out not to be chat content
+// (an encrypted edit, a history notice, ...); any other stored message is left alone.
+func (d *DB) DeleteUnsupported(accountID, chatJID, id string) error {
+	_, err := d.sql.Exec(`DELETE FROM messages WHERE account_id = ? AND chat_jid = ? AND id = ? AND message_type = 'unsupported'`,
+		accountID, chatJID, id)
+	return err
+}
+
+// UnsupportedTimelines returns every message of the chats of accountID that hold an "unsupported"
+// message, by chat, newest first; status broadcasts are left out.
+func (d *DB) UnsupportedTimelines(accountID string) ([]Message, error) {
+	rows, err := d.sql.Query(`SELECT `+messageCols+` FROM messages
+		WHERE account_id = ?1 AND chat_jid <> ?2 AND chat_jid IN
+			(SELECT chat_jid FROM messages WHERE account_id = ?1 AND message_type = 'unsupported')
+		ORDER BY chat_jid, timestamp DESC, id DESC`, accountID, statusBroadcastJID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanMessages(rows)
 }
 
 // GetChatMessages returns one page (0-based) of a chat, newest first. A page past the end is empty.
@@ -406,3 +443,97 @@ func (d *DB) ListChats(accountID string) ([]Chat, error) {
 	}
 	return out, rows.Err()
 }
+
+// LatestSystemMessage returns the body of the newest system message in chatJID, if any.
+func (d *DB) LatestSystemMessage(accountID, chatJID string) (body string, ok bool, err error) {
+	row := d.sql.QueryRow(`SELECT body FROM messages WHERE account_id = ? AND chat_jid = ? AND message_type = 'system'
+		ORDER BY timestamp DESC, id DESC LIMIT 1`, accountID, chatJID)
+	err = row.Scan(&body)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return body, true, nil
+}
+
+// MessageFilter specifies criteria for querying message logs for debugging.
+type MessageFilter struct {
+	AccountID string
+	ChatJID   string
+	Type      string // "text", "image", etc., or "" for all
+	Query     string // substring search in body, sender_jid, chat_jid, or id
+	Since     int64  // unix seconds; 0 means no lower bound
+	Until     int64  // unix seconds; 0 means no upper bound
+	Received  bool   // true to only show received messages (from_me = 0)
+	Limit     int    // max rows, defaults to 100
+}
+
+// QueryMessageLogs returns messages matching filter ordered by timestamp DESC.
+func (d *DB) QueryMessageLogs(f MessageFilter) ([]Message, error) {
+	query := `SELECT account_id, chat_jid, id, sender_jid, timestamp, message_type, body,
+		media_path, status, from_me, media_meta, wire_chat_jid, wire_sender_jid, expires_at,
+		mentions, quoted_id, quoted_sender, quoted_body, quoted_type
+		FROM messages WHERE 1=1`
+	var args []any
+
+	if f.AccountID != "" {
+		query += " AND account_id = ?"
+		args = append(args, f.AccountID)
+	}
+	if f.ChatJID != "" {
+		query += " AND chat_jid = ?"
+		args = append(args, f.ChatJID)
+	}
+	if f.Received {
+		query += " AND from_me = 0"
+	}
+	if f.Type == "media" {
+		query += " AND message_type IN ('image', 'video', 'audio', 'document', 'sticker')"
+	} else if f.Type != "" && f.Type != "all" {
+		query += " AND message_type = ?"
+		args = append(args, f.Type)
+	}
+	if f.Since > 0 {
+		query += " AND timestamp >= ?"
+		args = append(args, f.Since)
+	}
+	if f.Until > 0 {
+		query += " AND timestamp <= ?"
+		args = append(args, f.Until)
+	}
+	if f.Query != "" {
+		pattern := "%" + f.Query + "%"
+		query += " AND (body LIKE ? OR sender_jid LIKE ? OR chat_jid LIKE ? OR id LIKE ?)"
+		args = append(args, pattern, pattern, pattern, pattern)
+	}
+	query += " ORDER BY timestamp DESC"
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	query += " LIMIT ?"
+	args = append(args, limit)
+
+	rows, err := d.sql.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Message
+	for rows.Next() {
+		var m Message
+		var fromMe int
+		if err := rows.Scan(&m.AccountID, &m.ChatJID, &m.ID, &m.SenderJID, &m.Timestamp, &m.Type,
+			&m.Body, &m.MediaPath, &m.Status, &fromMe, &m.MediaMeta, &m.WireChatJID, &m.WireSenderJID,
+			&m.ExpiresAt, &m.Mentions, &m.QuotedID, &m.QuotedSender, &m.QuotedBody, &m.QuotedType); err != nil {
+			return nil, err
+		}
+		m.FromMe = fromMe != 0
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
@@ -921,10 +922,25 @@ func TestViewNotMember(t *testing.T) {
 		t.Fatal("initially isNotMember should be false")
 	}
 
+	v.setDraft(c1, "some draft")
+	if v.draft(c1) != "some draft" {
+		t.Fatalf("draft = %q, want 'some draft'", v.draft(c1))
+	}
+
 	v.setNotMember(c1, true)
 	if !v.isNotMember(c1) {
 		t.Fatal("expected c1 to be notMember")
 	}
+	if v.draft(c1) != "" {
+		t.Fatalf("setNotMember should have cleared draft, got %q", v.draft(c1))
+	}
+
+	// Setting draft while not member should be ignored
+	v.setDraft(c1, "another draft")
+	if v.draft(c1) != "" {
+		t.Fatalf("setDraft on notMember chat should be ignored, got %q", v.draft(c1))
+	}
+
 	if v.isNotMember(c2) {
 		t.Fatal("c2 should not be notMember")
 	}
@@ -934,4 +950,169 @@ func TestViewNotMember(t *testing.T) {
 		t.Fatal("expected c1 to no longer be notMember")
 	}
 }
+
+func TestParseLockTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want time.Duration
+	}{
+		{"0", 0},
+		{"1", 1 * time.Minute},
+		{"5", 5 * time.Minute},
+		{"15", 15 * time.Minute},
+		{"60", 60 * time.Minute},
+		{"", 5 * time.Minute},
+		{"abc", 5 * time.Minute},
+		{"-5", 0},
+	} {
+		if got := parseLockTimeout(tc.in); got != tc.want {
+			t.Errorf("parseLockTimeout(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestLockTimeoutExpired(t *testing.T) {
+	now := time.Now()
+	if lockTimeoutExpired("", "5", now.Add(-10*time.Minute), now) {
+		t.Error("lockTimeoutExpired with no PIN set: want false")
+	}
+	if lockTimeoutExpired("hash", "5", time.Time{}, now) {
+		t.Error("lockTimeoutExpired with zero hiddenAt: want false")
+	}
+	if !lockTimeoutExpired("hash", "0", now.Add(-1*time.Second), now) {
+		t.Error("lockTimeoutExpired(0) after 1s: want true")
+	}
+	if lockTimeoutExpired("hash", "5", now.Add(-4*time.Minute-59*time.Second), now) {
+		t.Error("lockTimeoutExpired(5m) after 4m59s: want false")
+	}
+	if !lockTimeoutExpired("hash", "5", now.Add(-5*time.Minute), now) {
+		t.Error("lockTimeoutExpired(5m) after 5m: want true")
+	}
+	if !lockTimeoutExpired("hash", "5", now.Add(-10*time.Minute), now) {
+		t.Error("lockTimeoutExpired(5m) after 10m: want true")
+	}
+}
+
+func TestIsNotInGroup(t *testing.T) {
+	tests := []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{errors.New("network timeout"), false},
+		{whatsmeow.ErrNotInGroup, true},
+		{errors.New("you're not participating in that group"), true},
+		{errors.New("whatsapp: group info: you're not participating in that group"), true},
+		{errors.New("failed to get group members: you're not participating in that group"), true},
+		{errors.New("server returned error 401"), true},
+		{errors.New("server returned error 403"), true},
+		{errors.New("forbidden"), true},
+		{errors.New("not in group"), true},
+		{errors.New("not-authorized"), true},
+	}
+	for _, tc := range tests {
+		got := isNotInGroup(tc.err)
+		if got != tc.want {
+			t.Errorf("isNotInGroup(%v) = %v, want %v", tc.err, got, tc.want)
+		}
+	}
+}
+
+func TestIsGroupNotMemberDB(t *testing.T) {
+	tmp := t.TempDir()
+	db, err := store.Open(filepath.Join(tmp, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	a := &App{db: db}
+
+	dm := chatRef{acctA, "6281111111111@s.whatsapp.net"}
+	group := chatRef{acctA, "120363000000000001@g.us"}
+
+	if a.isGroupNotMemberDB(dm) {
+		t.Error("DM returned true for isGroupNotMemberDB")
+	}
+
+	if a.isGroupNotMemberDB(group) {
+		t.Error("empty group DB returned true for isGroupNotMemberDB")
+	}
+
+	_, _ = db.InsertMessage(store.Message{
+		ID: "m1", ChatJID: group.jid, AccountID: group.acct,
+		Timestamp: 100, Type: "text", Body: "hello",
+	})
+	if a.isGroupNotMemberDB(group) {
+		t.Error("group with text message returned true for isGroupNotMemberDB")
+	}
+
+	_, _ = db.InsertMessage(store.Message{
+		ID: "sys1", ChatJID: group.jid, AccountID: group.acct,
+		Timestamp: 200, Type: "system", Body: "~ Admin removed you",
+	})
+	if !a.isGroupNotMemberDB(group) {
+		t.Error("group after removal returned false for isGroupNotMemberDB")
+	}
+
+	_, _ = db.InsertMessage(store.Message{
+		ID: "sys2", ChatJID: group.jid, AccountID: group.acct,
+		Timestamp: 300, Type: "system", Body: "~ Admin added you",
+	})
+	if a.isGroupNotMemberDB(group) {
+		t.Error("group after being added returned true for isGroupNotMemberDB")
+	}
+
+	_, _ = db.InsertMessage(store.Message{
+		ID: "sys3", ChatJID: group.jid, AccountID: group.acct,
+		Timestamp: 400, Type: "system", Body: "You left",
+	})
+	if !a.isGroupNotMemberDB(group) {
+		t.Error("group after leaving returned false for isGroupNotMemberDB")
+	}
+}
+
+func TestOnMessageSystemRemovalSetsNotMember(t *testing.T) {
+	a := &App{}
+	c := chatRef{acctA, "120363000000000001@g.us"}
+
+	if a.v.isNotMember(c) {
+		t.Fatal("expected isNotMember false initially")
+	}
+
+	a.v.setDraft(c, "my draft")
+	if a.v.draft(c) != "my draft" {
+		t.Fatalf("draft = %q, want 'my draft'", a.v.draft(c))
+	}
+
+	a.onMessage(store.Message{
+		AccountID: c.acct,
+		ChatJID:   c.jid,
+		Type:      "system",
+		Body:      "~ Admin removed you",
+	})
+
+	if !a.v.isNotMember(c) {
+		t.Fatal("expected isNotMember true after removal system message")
+	}
+	if a.v.draft(c) != "" {
+		t.Fatalf("draft should have been cleared, got %q", a.v.draft(c))
+	}
+}
+
+func TestSaveCurrentDraftIgnoredForNotMember(t *testing.T) {
+	c := chatRef{acctA, "120363000000000001@g.us"}
+	a := &App{}
+	a.v.open = c
+	a.v.setNotMember(c, true)
+
+	a.saveCurrentDraft()
+	if a.v.draft(c) != "" {
+		t.Fatalf("draft should be empty, got %q", a.v.draft(c))
+	}
+}
+
+
+
+
 

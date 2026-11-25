@@ -12,6 +12,7 @@ import (
 	"golang.org/x/sys/windows"
 
 	"wa-go/internal/notify"
+	"wa-go/internal/ui"
 )
 
 // The main window's messages walk does not publish, both for presence: WM_ACTIVATEAPP (the user
@@ -55,9 +56,11 @@ func mainWndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 		hooked.presence.activated(wParam != 0)
 	case win.WM_SYSCOMMAND:
 		if wParam&0xFFF0 == win.SC_MINIMIZE {
-			hooked.lockNow() // while the window still paints: the taskbar preview and Alt+Tab keep the lock page
-			// UpdateWindow, children included: the lock page is a child window
-			win.RedrawWindow(hwnd, nil, 0, win.RDW_INVALIDATE|win.RDW_UPDATENOW|win.RDW_ALLCHILDREN)
+			if parseLockTimeout(hooked.cfg[ui.KeyLockTimeout]) == 0 {
+				hooked.lockNow() // while the window still paints: the taskbar preview and Alt+Tab keep the lock page
+				// UpdateWindow, children included: the lock page is a child window
+				win.RedrawWindow(hwnd, nil, 0, win.RDW_INVALIDATE|win.RDW_UPDATENOW|win.RDW_ALLCHILDREN)
+			}
 		}
 	case wmWTSSessionChange:
 		switch wParam {

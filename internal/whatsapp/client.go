@@ -7,9 +7,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"runtime/debug"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -22,7 +24,10 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"wa-go/internal/store"
 )
@@ -46,6 +51,8 @@ const revokedBody = "This message was deleted"
 type waClient interface {
 	Disconnect()
 	SendMessage(ctx context.Context, to types.JID, message *waE2E.Message, extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error)
+	SendPeerMessage(ctx context.Context, message *waE2E.Message) (whatsmeow.SendResponse, error)
+	BuildHistorySyncRequest(lastKnownMessageInfo *types.MessageInfo, count int) *waE2E.Message
 	SendPresence(ctx context.Context, state types.Presence) error
 	SendChatPresence(ctx context.Context, jid types.JID, state types.ChatPresence, media types.ChatPresenceMedia) error
 	SetPrivacySetting(ctx context.Context, name types.PrivacySettingType, value types.PrivacySetting) (types.PrivacySettings, error)
@@ -149,6 +156,7 @@ func (m *Manager) handleEvent(ctx context.Context, id string, cli waClient, evt 
 		if info.MessageSource, err = pnSource(ctx, cli, info.MessageSource); err != nil {
 			return err
 		}
+		logReceivedMessage(id, info, rawSender, pnJID, e.Message)
 		if pm := e.Message.GetProtocolMessage(); pm != nil {
 			return m.revise(ctx, id, cli, info, pm)
 		}
@@ -185,6 +193,7 @@ func (m *Manager) handleEvent(ctx context.Context, id string, cli waClient, evt 
 		}
 		return m.persist(msg)
 	case *events.Receipt:
+		log.Printf("whatsapp [%s]: receipt recv type=%s chat=%s ids=%v from_me=%t", id, e.Type, e.Chat, e.MessageIDs, e.IsFromMe)
 		status := receiptStatus(e.Type)
 		if status == "" {
 			return nil
@@ -199,10 +208,13 @@ func (m *Manager) handleEvent(ctx context.Context, id string, cli waClient, evt 
 		}
 		m.emit(ReceiptEvent{AccountID: id, ChatJID: chat, IDs: e.MessageIDs, Status: status, FromMe: e.IsFromMe})
 	case *events.MarkChatAsRead:
+		log.Printf("whatsapp [%s]: mark_chat_read recv chat=%s read=%t ts=%d", id, e.JID, e.Action.GetRead(), e.Timestamp.Unix())
 		return m.chatReadElsewhere(ctx, id, cli, e)
 	case *events.JoinedGroup:
+		log.Printf("whatsapp [%s]: joined_group recv jid=%s name=%q", id, e.JID, e.Name)
 		return m.nameChat(id, e.JID, e.Name)
 	case *events.GroupInfo:
+		log.Printf("whatsapp [%s]: group_info recv jid=%s join=%v leave=%v name=%v", id, e.JID, e.Join, e.Leave, e.Name)
 		if len(e.Join)+len(e.Leave) > 0 {
 			m.peopleMu.Lock()
 			delete(m.members, id+" "+e.JID.String())
@@ -253,14 +265,17 @@ func (m *Manager) handleEvent(ctx context.Context, id string, cli waClient, evt 
 			return m.nameChat(id, e.JID, e.Name.Name)
 		}
 	case *events.PushNameSetting:
+		log.Printf("whatsapp [%s]: push_name_setting recv", id)
 		m.emit(PushNameEvent{AccountID: id})
 	case *events.Picture:
+		log.Printf("whatsapp [%s]: picture recv jid=%s", id, e.JID)
 		jid := e.JID.ToNonAD().String()
 		if err := m.store.SetAvatar(id, jid, "", 0); err != nil {
 			return err
 		}
 		m.emit(AvatarEvent{AccountID: id, JID: jid})
 	case *events.HistorySync:
+		log.Printf("whatsapp [%s]: history_sync recv type=%s conversations=%d", id, e.Data.GetSyncType(), len(e.Data.GetConversations()))
 		err := m.ingestHistory(ctx, id, cli, e)
 		// whatsmeow decoded the whole blob before this event; drop our handle (we are its only
 		// reader) and return the spike to the OS so idle RSS recovers.
@@ -268,24 +283,35 @@ func (m *Manager) handleEvent(ctx context.Context, id string, cli waClient, evt 
 		debug.FreeOSMemory()
 		return err
 	case *events.PairSuccess:
+		log.Printf("whatsapp [%s]: paired", id)
 		m.add(id, cli)
 		m.emit(ConnectionEvent{AccountID: id, State: StatePaired})
 	case *events.Connected:
+		log.Printf("whatsapp [%s]: connected", id)
 		m.syncContacts(ctx, id, cli)
 		m.emit(ConnectionEvent{AccountID: id, State: StateConnected})
+		go m.refetchUnsupported(context.Background(), id, cli, time.Second)
 	case *events.Disconnected:
+		log.Printf("whatsapp [%s]: disconnected", id)
 		m.emit(ConnectionEvent{AccountID: id, State: StateDisconnected})
 	case *events.StreamReplaced:
+		log.Printf("whatsapp [%s]: stream_replaced", id)
 		m.emit(ConnectionEvent{AccountID: id, State: StateStreamReplaced})
 	case *events.LoggedOut:
+		log.Printf("whatsapp [%s]: logged_out reason=%s", id, e.Reason)
 		m.remove(id, cli) // whatsmeow deletes the session itself
 		m.emit(ConnectionEvent{AccountID: id, State: StateLoggedOut, Detail: e.Reason.String()})
 	case *events.TemporaryBan:
+		log.Printf("whatsapp [%s]: temporary_ban %s", id, e.String())
 		m.emit(ConnectionEvent{AccountID: id, State: StateFailed, Detail: e.String()})
 	case *events.ConnectFailure:
+		log.Printf("whatsapp [%s]: connect_failure reason=%s: %s", id, e.Reason, e.Message)
 		m.emit(ConnectionEvent{AccountID: id, State: StateFailed, Detail: e.Reason.String() + ": " + e.Message})
 	case *events.ClientOutdated:
+		log.Printf("whatsapp [%s]: client_outdated", id)
 		m.emit(ConnectionEvent{AccountID: id, State: StateFailed, Detail: "client outdated"})
+	default:
+		log.Printf("whatsapp [%s]: unhandled_event type=%T", id, evt)
 	}
 	return nil
 }
@@ -386,6 +412,77 @@ func (m *Manager) syncContacts(ctx context.Context, id string, cli waClient) {
 	}
 }
 
+// refetchSetting records that an account's unsupported messages were asked for again.
+const refetchSetting = "refetch_unsupported_v1"
+
+// refetchUnsupported asks the phone, once per account, to send again the chats holding messages
+// an older version stored as unsupported; the replies arrive as on-demand history syncs, whose
+// copies replace them (see store insertChunk) or delete them (not chat content). Requests go one
+// per gap apart; a failed send leaves the account to try again on the next connect.
+func (m *Manager) refetchUnsupported(ctx context.Context, id string, cli waClient, gap time.Duration) {
+	if done, _, err := m.store.GetSetting(id, refetchSetting); err != nil || done != "" {
+		return
+	}
+	rows, err := m.store.UnsupportedTimelines(id)
+	if err != nil {
+		log.Printf("whatsapp [%s]: refetch unsupported: %v", id, err)
+		return
+	}
+	reqs := refetchPlan(rows, 50, time.Now())
+	log.Printf("whatsapp [%s]: refetch unsupported: %d requests", id, len(reqs))
+	for i, r := range reqs {
+		if i > 0 {
+			time.Sleep(gap)
+		}
+		if _, err := cli.SendPeerMessage(ctx, cli.BuildHistorySyncRequest(&r.anchor, r.count)); err != nil {
+			log.Printf("whatsapp [%s]: refetch unsupported: request %d of %d: %v", id, i+1, len(reqs), err)
+			return
+		}
+		log.Printf("whatsapp [%s]: refetch request chat=%s anchor=%s count=%d", id, r.anchor.Chat, r.anchor.ID, r.count)
+	}
+	if err := m.store.SetSetting(id, refetchSetting, time.Now().Format(time.RFC3339)); err != nil {
+		log.Printf("whatsapp [%s]: refetch unsupported: %v", id, err)
+	}
+}
+
+type refetchRequest struct {
+	anchor types.MessageInfo // the phone sends the count messages just before it
+	count  int
+}
+
+// refetchPlan covers every unsupported message of rows (by chat, newest first) with requests of
+// at most window messages each. A request is anchored on the message just newer than the first
+// unsupported one it covers; when that one is the chat's newest there is none, and the anchor is a
+// made-up message at now (shortcut: the phone may ignore an anchor it doesn't know; then those
+// stay unsupported).
+func refetchPlan(rows []store.Message, window int, now time.Time) []refetchRequest {
+	var out []refetchRequest
+	for start := 0; start < len(rows); {
+		end := start
+		for end < len(rows) && rows[end].ChatJID == rows[start].ChatJID {
+			end++
+		}
+		chat := rows[start:end]
+		wire, err := types.ParseJID(cmp.Or(chat[0].WireChatJID, chat[0].ChatJID))
+		for i := 0; err == nil && i < len(chat); i++ {
+			if chat[i].Type != TypeUnsupported {
+				continue
+			}
+			anchor := types.MessageInfo{MessageSource: types.MessageSource{Chat: wire}}
+			if i == 0 {
+				anchor.ID, anchor.Timestamp = "3EB0"+strings.ToUpper(strconv.FormatInt(now.UnixNano(), 16)), now
+			} else {
+				a := chat[i-1]
+				anchor.ID, anchor.IsFromMe, anchor.Timestamp = a.ID, a.FromMe, time.Unix(a.Timestamp, 0)
+			}
+			out = append(out, refetchRequest{anchor: anchor, count: window})
+			i += window - 1 // the rest of this window is covered
+		}
+		start = end
+	}
+	return out
+}
+
 // nameDM records the best name for a 1:1 chat: the address-book name always wins; a push name only
 // names a chat that has none ("-" means no name, as in whatsmeow). Masked names are never stored.
 func (m *Manager) nameDM(ctx context.Context, id string, cli waClient, chat types.JID, pushName string) error {
@@ -437,8 +534,10 @@ func (m *Manager) revise(ctx context.Context, id string, cli waClient, info type
 			return nil
 		}
 		body = b
+		log.Printf("whatsapp [%s]: revise message_edit id=%s target_key=%s new_body=%q", id, info.ID, pm.GetKey().GetID(), body)
 	case waE2E.ProtocolMessage_REVOKE:
 		typ, body = TypeRevoked, revokedBody
+		log.Printf("whatsapp [%s]: revise revoke id=%s target_key=%s", id, info.ID, pm.GetKey().GetID())
 	default:
 		return nil
 	}
@@ -529,6 +628,9 @@ func (m *Manager) ingestHistory(ctx context.Context, id string, cli waClient, h 
 			firstErr = cmp.Or(firstErr, err)
 		}
 		if !ok {
+			if err == nil { // not chat content: drop a copy an older version stored as unsupported
+				return nil, m.store.DeleteUnsupported(id, evt.Info.Chat.String(), evt.Info.ID)
+			}
 			return nil, nil
 		}
 		if !msg.FromMe && msg.Timestamp < unreadFrom {
@@ -642,6 +744,7 @@ func unreadCutoff(conv *waHistorySync.Conversation) int64 {
 // toStoreMessage converts a message of account id. ok is false for what is not chat content
 // (see content).
 func toStoreMessage(id string, info types.MessageInfo, m *waE2E.Message) (msg store.Message, ok bool, err error) {
+	m = unwrap(m) // so contextInfo sees the mentions and quote of wrapped content too
 	typ, body, media, skip := content(m)
 	if skip {
 		return msg, false, nil
@@ -714,6 +817,24 @@ func (m *Manager) creditQuote(ctx context.Context, cli waClient, msg *store.Mess
 // true for what is not chat content: protocol messages, bare sender-key distribution, reactions,
 // poll votes, pins and keep-in-chat markers.
 func content(m *waE2E.Message) (typ, body string, media proto.Message, skip bool) {
+	m = unwrap(m)
+	if m == nil {
+		return "", "", nil, true
+	}
+	if t, b, ok := described(m); ok {
+		return TypeText, cmp.Or(b, t), nil, false
+	}
+	switch {
+	case m.GetPtvMessage() != nil: // round video note
+		return TypeVideo, m.GetPtvMessage().GetCaption(), markVideoNote(m.GetPtvMessage()), false
+	case m.GetInstantImageMessage() != nil:
+		return TypeImage, m.GetInstantImageMessage().GetCaption(), m.GetInstantImageMessage(), false
+	case m.GetEncReactionMessage() != nil, m.GetEncEventResponseMessage() != nil, m.GetEncCommentMessage() != nil,
+		m.GetSecretEncryptedMessage() != nil, m.GetAlbumMessage() != nil, m.GetPollAddOptionMessage() != nil,
+		m.GetScheduledCallEditMessage() != nil, m.GetMessageHistoryBundle() != nil, m.GetMessageHistoryNotice() != nil,
+		m.GetStickerSyncRmrMessage() != nil:
+		return "signal", "", nil, true // encrypted votes/reactions, album headers, history notices: not chat content
+	}
 	switch {
 	case m.GetConversation() != "":
 		return TypeText, m.GetConversation(), nil, false
@@ -730,12 +851,181 @@ func content(m *waE2E.Message) (typ, body string, media proto.Message, skip bool
 		return TypeDocument, cmp.Or(d.GetCaption(), d.GetFileName()), d, false
 	case m.GetStickerMessage() != nil:
 		return TypeSticker, "", m.GetStickerMessage(), false
-	case m.GetProtocolMessage() != nil, m.GetSenderKeyDistributionMessage() != nil,
-		m.GetReactionMessage() != nil, m.GetPollUpdateMessage() != nil,
-		m.GetPinInChatMessage() != nil, m.GetKeepInChatMessage() != nil:
-		return "", "", nil, true
+	case m.GetReactionMessage() != nil:
+		return "reaction", m.GetReactionMessage().GetText(), nil, true
+	case m.GetProtocolMessage() != nil:
+		return "protocol", m.GetProtocolMessage().GetType().String(), nil, true
+	case m.GetPollUpdateMessage() != nil:
+		return "poll_update", "", nil, true
+	case m.GetSenderKeyDistributionMessage() != nil:
+		return "sender_key", "", nil, true
+	case m.GetPinInChatMessage() != nil:
+		return "pin", "", nil, true
+	case m.GetKeepInChatMessage() != nil:
+		return "keep_in_chat", "", nil, true
 	}
 	return TypeUnsupported, "", nil, false
+}
+
+// videoNoteField marks a stored VideoMessage as a round video note. VideoMessage has no field
+// for that, so it rides as an unknown field (high number, far from WhatsApp's), which proto keeps.
+const videoNoteField protowire.Number = 1 << 28
+
+// markVideoNote returns a copy of v marked as a video note.
+func markVideoNote(v *waE2E.VideoMessage) *waE2E.VideoMessage {
+	v = proto.Clone(v).(*waE2E.VideoMessage)
+	r := v.ProtoReflect()
+	r.SetUnknown(protowire.AppendVarint(protowire.AppendTag(r.GetUnknown(), videoNoteField, protowire.VarintType), 1))
+	return v
+}
+
+// IsVideoNote reports whether a stored VideoMessage is a round video note, and drops the marker so
+// v is safe to send on.
+func IsVideoNote(v *waE2E.VideoMessage) bool {
+	r := v.ProtoReflect()
+	b, kept, found := r.GetUnknown(), protoreflect.RawFields(nil), false
+	for len(b) > 0 {
+		num, _, n := protowire.ConsumeField(b)
+		if n < 0 {
+			return found // malformed: left as is
+		}
+		if num == videoNoteField {
+			found = true
+		} else {
+			kept = append(kept, b[:n]...)
+		}
+		b = b[n:]
+	}
+	if found {
+		r.SetUnknown(kept)
+	}
+	return found
+}
+
+// unwrap strips the FutureProofMessage wrappers whatsmeow leaves in place (quoted and edited
+// content, mentions, spoilers, album children, ...), returning the message they carry.
+func unwrap(m *waE2E.Message) *waE2E.Message {
+	for i := 0; m != nil && i < 8; i++ { // bounded: a forged wrapper chain must not spin
+		var inner *waE2E.Message
+		for _, w := range []*waE2E.FutureProofMessage{
+			m.GetEphemeralMessage(), m.GetViewOnceMessage(), m.GetViewOnceMessageV2(), m.GetViewOnceMessageV2Extension(),
+			m.GetDocumentWithCaptionMessage(), m.GetEditedMessage(), m.GetGroupMentionedMessage(), m.GetBotInvokeMessage(),
+			m.GetLottieStickerMessage(), m.GetStatusMentionMessage(), m.GetAssociatedChildMessage(),
+			m.GetGroupStatusMentionMessage(), m.GetGroupStatusMessage(), m.GetGroupStatusMessageV2(),
+			m.GetSpoilerMessage(), m.GetAudioStickerMessage(), m.GetPollCreationMessageV4(),
+			m.GetEventCoverImage(), m.GetPollCreationOptionImageMessage(),
+		} {
+			if inner = w.GetMessage(); inner != nil {
+				break
+			}
+		}
+		if inner == nil {
+			if inner = m.GetDeviceSentMessage().GetMessage(); inner == nil {
+				return m
+			}
+		}
+		m = inner
+	}
+	return m
+}
+
+// described labels message kinds the app shows as plain text: the label alone, or "label: detail".
+func described(m *waE2E.Message) (label, body string, ok bool) {
+	with := func(label, detail string) (string, string, bool) {
+		if detail == "" {
+			return label, "", true
+		}
+		return label, label + ": " + detail, true
+	}
+	poll := cmp.Or(m.GetPollCreationMessage(), m.GetPollCreationMessageV2(), m.GetPollCreationMessageV3(),
+		m.GetPollCreationMessageV5(), m.GetPollCreationMessageV6())
+	switch {
+	case m.GetLocationMessage() != nil:
+		l := m.GetLocationMessage()
+		return with("Location", cmp.Or(l.GetName(), l.GetAddress()))
+	case m.GetLiveLocationMessage() != nil:
+		return with("Live location", m.GetLiveLocationMessage().GetCaption())
+	case m.GetRequestLocationMessage() != nil:
+		return with("Location request", "")
+	case m.GetContactMessage() != nil:
+		return with("Contact", m.GetContactMessage().GetDisplayName())
+	case m.GetContactsArrayMessage() != nil:
+		c := m.GetContactsArrayMessage()
+		return with("Contacts", cmp.Or(c.GetDisplayName(), fmt.Sprint(len(c.GetContacts()))))
+	case poll != nil:
+		return with("Poll", poll.GetName())
+	case m.GetPollResultSnapshotMessage() != nil:
+		return with("Poll results", m.GetPollResultSnapshotMessage().GetName())
+	case m.GetPollResultSnapshotMessageV3() != nil:
+		return with("Poll results", m.GetPollResultSnapshotMessageV3().GetName())
+	case m.GetEventMessage() != nil:
+		return with("Event", m.GetEventMessage().GetName())
+	case m.GetCallLogMesssage() != nil:
+		if m.GetCallLogMesssage().GetIsVideo() {
+			return with("Video call", "")
+		}
+		return with("Voice call", "")
+	case m.GetBcallMessage() != nil:
+		return with("Call", "")
+	case m.GetScheduledCallCreationMessage() != nil:
+		return with("Scheduled call", m.GetScheduledCallCreationMessage().GetTitle())
+	case m.GetGroupInviteMessage() != nil:
+		return with("Group invite", m.GetGroupInviteMessage().GetGroupName())
+	case m.GetNewsletterAdminInviteMessage() != nil:
+		return with("Channel admin invite", m.GetNewsletterAdminInviteMessage().GetNewsletterName())
+	case m.GetStickerPackMessage() != nil:
+		return with("Sticker pack", m.GetStickerPackMessage().GetName())
+	case m.GetRequestPhoneNumberMessage() != nil:
+		return with("Phone number request", "")
+	case m.GetProductMessage() != nil:
+		return with("Product", m.GetProductMessage().GetProduct().GetTitle())
+	case m.GetOrderMessage() != nil:
+		return with("Order", m.GetOrderMessage().GetOrderTitle())
+	case m.GetSendPaymentMessage() != nil, m.GetRequestPaymentMessage() != nil, m.GetInvoiceMessage() != nil,
+		m.GetPaymentInviteMessage() != nil, m.GetPaymentReminderMessage() != nil, m.GetSplitPaymentMessage() != nil:
+		return with("Payment", "")
+	// business messages: their visible text, else a label
+	case m.GetButtonsMessage() != nil:
+		return "Message", m.GetButtonsMessage().GetContentText(), true
+	case m.GetTemplateMessage() != nil:
+		t := m.GetTemplateMessage()
+		return "Message", cmp.Or(t.GetHydratedTemplate().GetHydratedContentText(), t.GetHydratedFourRowTemplate().GetHydratedContentText()), true
+	case m.GetListMessage() != nil:
+		l := m.GetListMessage()
+		return "Message", cmp.Or(l.GetDescription(), l.GetTitle()), true
+	case m.GetInteractiveMessage() != nil:
+		return "Message", m.GetInteractiveMessage().GetBody().GetText(), true
+	case m.GetButtonsResponseMessage() != nil:
+		return "Reply", m.GetButtonsResponseMessage().GetSelectedDisplayText(), true
+	case m.GetTemplateButtonReplyMessage() != nil:
+		return "Reply", m.GetTemplateButtonReplyMessage().GetSelectedDisplayText(), true
+	case m.GetListResponseMessage() != nil:
+		return "Reply", m.GetListResponseMessage().GetTitle(), true
+	case m.GetInteractiveResponseMessage() != nil:
+		return "Reply", m.GetInteractiveResponseMessage().GetBody().GetText(), true
+	case m.GetHighlyStructuredMessage() != nil:
+		return "Message", "", true
+	}
+	return "", "", false
+}
+
+// logReceivedMessage logs all data received for an incoming WhatsApp message for debug purposes.
+func logReceivedMessage(accountID string, info types.MessageInfo, sender types.JID, pnJID string, m *waE2E.Message) {
+	typ, body, _, _ := content(m)
+	var raw string
+	if m != nil {
+		if b, err := protojson.Marshal(m); err == nil {
+			raw = string(b)
+		} else {
+			raw = m.String()
+		}
+	}
+	var ts int64
+	if !info.Timestamp.IsZero() {
+		ts = info.Timestamp.Unix()
+	}
+	log.Printf("whatsapp [%s]: message recv id=%s chat=%s sender=%s pn=%s push=%q from_me=%t ts=%d type=%s body=%q raw=%s",
+		accountID, info.ID, info.Chat, sender, pnJID, info.PushName, info.IsFromMe, ts, typ, body, raw)
 }
 
 // contextInfo is the context info (quote, disappearing timer, ...) of a message's content; nil when
@@ -830,6 +1120,9 @@ func quotedMessage(r *store.Message) *waE2E.Message {
 	}
 	if media == nil || len(r.MediaMeta) == 0 || proto.Unmarshal(r.MediaMeta, media) != nil {
 		return &waE2E.Message{Conversation: proto.String(r.Body)}
+	}
+	if q.VideoMessage != nil && IsVideoNote(q.VideoMessage) { // quoted as what it is, marker dropped
+		q.PtvMessage, q.VideoMessage = q.VideoMessage, nil
 	}
 	return q
 }

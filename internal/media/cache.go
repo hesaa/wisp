@@ -152,9 +152,8 @@ func (c *Cache) Thumbnail(path string) (string, error) {
 	return out, nil
 }
 
-// scaledDown decodes the image file at path, fitted within thumbMax x thumbMax; one of more than
-// maxPixels is refused undecoded.
-func scaledDown(path string) (image.Image, error) {
+// decodeLimited decodes the image file at path; one of more than maxPixels is refused undecoded.
+func decodeLimited(path string) (image.Image, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -171,10 +170,37 @@ func scaledDown(path string) (image.Image, error) {
 		return nil, err
 	}
 	src, _, err := image.Decode(f)
+	return src, err
+}
+
+// firstFrameOf is FirstWebPFrame of the WebP file at path, refusing a file far bigger than stickers
+// are.
+func firstFrameOf(path string) (image.Image, error) {
+	if st, err := os.Stat(path); err != nil {
+		return nil, err
+	} else if st.Size() > 8<<20 {
+		return nil, ErrImageTooLarge
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	w, h := cfg.Width, cfg.Height
+	return FirstWebPFrame(data)
+}
+
+// scaledDown decodes the image file at path, fitted within thumbMax x thumbMax; one of more than
+// maxPixels is refused undecoded.
+func scaledDown(path string) (image.Image, error) {
+	src, err := decodeLimited(path)
+	if err != nil && strings.EqualFold(filepath.Ext(path), ".webp") {
+		if first, ferr := firstFrameOf(path); ferr == nil {
+			src, err = first, nil // an animated sticker, or a still one x/image/webp refuses
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	w, h := src.Bounds().Dx(), src.Bounds().Dy()
 	if w > thumbMax || h > thumbMax {
 		if w >= h {
 			h = max(1, h*thumbMax/w)

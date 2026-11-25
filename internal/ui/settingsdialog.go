@@ -3,11 +3,14 @@ package ui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/lxn/walk"
 	"github.com/lxn/win"
@@ -16,6 +19,7 @@ import (
 	"wa-go/internal/mcp"
 	"wa-go/internal/media"
 	"wa-go/internal/notify"
+	"wa-go/internal/store"
 	"wa-go/internal/theme"
 	"wa-go/internal/ui/icons"
 	"wa-go/internal/whatsapp"
@@ -54,7 +58,7 @@ const (
 	fieldH    = 36 // text fields and buttons
 )
 
-var sectionNames = [...]string{"Privacy & Security", "Chats & Presence", "Media & Storage", "Network & Proxy", "Accounts & Sessions", "Notifications & Theme", "MCP"}
+var sectionNames = [...]string{"Privacy & Security", "Chats & Presence", "Media & Storage", "Network & Proxy", "Accounts & Sessions", "Notifications & Theme", "Message Logs", "MCP"}
 
 const (
 	secPrivacy = iota
@@ -63,6 +67,7 @@ const (
 	secNetwork
 	secAccounts
 	secNotify
+	secLogs
 	secMCP
 )
 
@@ -126,9 +131,18 @@ type settingsDialog struct {
 	proxyEdit  *walk.LineEdit
 	accounts   *walk.Composite
 	addBtn     *button
-	lockStored string // the app-lock PIN's hash ("" is off); loaded with the app-global settings
-	lockState  *label
-	lockBtns   [3]*button // Set PIN, Change PIN, Turn off
+	lockStored  string // the app-lock PIN's hash ("" is off); loaded with the app-global settings
+	lockTimeout string // current timeout in minutes
+	lockState   *label
+	lockBtns    [3]*button // Set PIN, Change PIN, Turn off
+	lockChoice  *choice
+
+	logDateChoice *choice
+	logTypeChoice *choice
+	logSearchEdit *walk.LineEdit
+	logsView      *walk.TextEdit
+	logDateFilter string
+	logTypeFilter string
 }
 
 func (d *settingsDialog) build() error {
@@ -156,7 +170,7 @@ func (d *settingsDialog) build() error {
 	if err := errors.Join(setBox(content, walk.NewVBoxLayout(), walk.Margins{}), d.themed(content, false), fillRest(d.Dialog, content)); err != nil {
 		return err
 	}
-	builders := [...]func(*walk.Composite) error{d.buildPrivacy, d.buildChats, d.buildMedia, d.buildNetwork, d.buildAccounts, d.buildNotify, d.buildMCP}
+	builders := [...]func(*walk.Composite) error{d.buildPrivacy, d.buildChats, d.buildMedia, d.buildNetwork, d.buildAccounts, d.buildNotify, d.buildLogs, d.buildMCP}
 	for i, build := range builders {
 		pg, err := walk.NewComposite(content)
 		if err != nil {
@@ -173,15 +187,17 @@ func (d *settingsDialog) build() error {
 		if err := build(pg); err != nil {
 			return err
 		}
-		if d.notes[i], err = d.newLabel(pg, "", 9, 0, toneSecondary, 40); err != nil {
+		if d.notes[i], err = d.newLabel(pg, "", 9, 0, toneSecondary, 28); err != nil {
 			return err
 		}
-		spacer, err := walk.NewVSpacer(pg)
-		if err != nil {
-			return err
-		}
-		if err := fillRest(pg, spacer); err != nil {
-			return err
+		if i != secLogs {
+			spacer, err := walk.NewVSpacer(pg)
+			if err != nil {
+				return err
+			}
+			if err := fillRest(pg, spacer); err != nil {
+				return err
+			}
 		}
 	}
 	if err := escCloses(d.Dialog); err != nil {
@@ -255,13 +271,23 @@ func (d *settingsDialog) buildLock(pg *walk.Composite) error {
 		}
 		d.lockBtns[i].SetVisible(false)
 	}
+	if d.lockChoice, err = d.newChoice(pg, "Auto-lock timeout", lockTimeoutChoiceOptions("5")); err != nil {
+		return err
+	}
+	d.lockChoice.listen(d.switchLockTimeout)
+	d.lockChoice.SetVisible(false)
 	_, err = d.newLabel(pg, "The lock hides Wisp's window; it doesn't encrypt Wisp's files.", 9, 0, toneSecondary, 20)
 	return err
 }
 
 // showLock shows the lock state for hash and the buttons that fit it.
-func (d *settingsDialog) showLock(hash string) {
+func (d *settingsDialog) showLock(hash, timeout string) {
 	d.lockStored = hash
+	if timeout != "" {
+		d.lockTimeout = timeout
+	} else if d.lockTimeout == "" {
+		d.lockTimeout = "5"
+	}
 	state := "App lock: Off"
 	if hash != "" {
 		state = "App lock: On"
@@ -270,6 +296,67 @@ func (d *settingsDialog) showLock(hash string) {
 	d.lockBtns[0].SetVisible(hash == "")
 	d.lockBtns[1].SetVisible(hash != "")
 	d.lockBtns[2].SetVisible(hash != "")
+	if d.lockChoice != nil {
+		d.lockChoice.SetVisible(hash != "")
+		if hash != "" {
+			d.updateLockTimeoutChoice(d.lockTimeout)
+		}
+	}
+}
+
+func (d *settingsDialog) updateLockTimeoutChoice(val string) {
+	if d.lockChoice == nil {
+		return
+	}
+	d.lockTimeout = val
+	d.lockChoice.opts = lockTimeoutChoiceOptions(val)
+	targetVal := val
+	hasVal := false
+	for _, o := range d.lockChoice.opts {
+		if o.value == val {
+			hasVal = true
+			break
+		}
+	}
+	if !hasVal {
+		targetVal = "custom"
+	}
+	d.lockChoice.setValue(targetVal)
+}
+
+func (d *settingsDialog) switchLockTimeout(val string) {
+	if val == "custom" {
+		cur := d.lockTimeout
+		if cur == "" {
+			cur = "10"
+		}
+		entered, ok, err := askCustomTimeout(d.Dialog, d.pal, cur)
+		if err != nil {
+			d.say(secPrivacy, "Invalid timeout: "+err.Error(), toneError)
+			d.updateLockTimeoutChoice(d.lockTimeout)
+			return
+		}
+		if !ok {
+			d.updateLockTimeoutChoice(d.lockTimeout)
+			return
+		}
+		val = entered
+	}
+	d.lockChoice.setBusy(true)
+	d.ctl.setGlobal(KeyLockTimeout, val, func(err error) {
+		if d.closed {
+			return
+		}
+		d.lockChoice.setBusy(false)
+		if err != nil {
+			d.say(secPrivacy, "Timeout setting was not saved: "+err.Error(), toneError)
+			d.updateLockTimeoutChoice(d.lockTimeout)
+			return
+		}
+		d.lockTimeout = val
+		d.updateLockTimeoutChoice(val)
+		d.say(secPrivacy, "Auto-lock timeout saved.", toneSecondary)
+	})
 }
 
 // editLock asks for the PINs mode needs and saves the result.
@@ -302,7 +389,7 @@ func (d *settingsDialog) editLock(mode pinMode) {
 			d.say(secPrivacy, "App lock was not saved: "+err.Error(), toneError)
 			return
 		}
-		d.showLock(hash)
+		d.showLock(hash, d.lockTimeout)
 		d.say(secPrivacy, msg, toneSecondary)
 	})
 }
@@ -513,6 +600,225 @@ func (d *settingsDialog) buildMCP(pg *walk.Composite) error {
 	return err
 }
 
+var logDateOptions = []option{
+	{"All time", "all"},
+	{"Today", "today"},
+	{"Last 24h", "24h"},
+	{"Last 7d", "7d"},
+	{"Last 30d", "30d"},
+}
+
+var logTypeOptions = []option{
+	{"Received (All)", "recv_all"},
+	{"Received Text", "recv_text"},
+	{"Received Media", "recv_media"},
+	{"All Messages", "all"},
+}
+
+func (d *settingsDialog) buildLogs(pg *walk.Composite) error {
+	var err error
+	d.logDateFilter = "all"
+	d.logTypeFilter = "recv_all"
+
+	if d.logDateChoice, err = d.newChoice(pg, "Date range", logDateOptions); err != nil {
+		return err
+	}
+	d.logDateChoice.setValue("all")
+	d.logDateChoice.listen(func(v string) {
+		d.logDateFilter = v
+		d.refreshLogs()
+	})
+
+	if d.logTypeChoice, err = d.newChoice(pg, "Message filter", logTypeOptions); err != nil {
+		return err
+	}
+	d.logTypeChoice.setValue("recv_all")
+	d.logTypeChoice.listen(func(v string) {
+		d.logTypeFilter = v
+		d.refreshLogs()
+	})
+
+	row, err := d.newRow(pg, fieldH)
+	if err != nil {
+		return err
+	}
+	pill, err := walk.NewComposite(row)
+	if err != nil {
+		return err
+	}
+	pl := walk.NewHBoxLayout()
+	if err := errors.Join(setBox(pill, pl, walk.Margins{HNear: 12, HFar: 12}), pl.SetAlignment(walk.AlignHNearVCenter),
+		d.themed(pill, true), fillRest(row, pill)); err != nil {
+		return err
+	}
+	if _, err := walk.NewVSpacerFixed(pill, fieldH); err != nil {
+		return err
+	}
+	if d.logSearchEdit, err = walk.NewLineEdit(pill); err != nil {
+		return err
+	}
+	d.logSearchEdit.SetFont(font(10, 0))
+	d.logSearchEdit.SetTextColor(theme.Color(d.pal.Text))
+	d.edits = append(d.edits, d.logSearchEdit)
+	if err := errors.Join(noBorder(d.logSearchEdit), cueBanner(d.logSearchEdit, "Search text, sender, or chat ID..."),
+		d.logSearchEdit.Accessibility().SetName("Search log messages"), d.themed(d.logSearchEdit, true)); err != nil {
+		return err
+	}
+	d.logSearchEdit.KeyDown().Attach(func(key walk.Key) {
+		if key == walk.KeyReturn {
+			d.refreshLogs()
+		}
+	})
+
+	if _, err := d.newButton(row, "Refresh", btnPrimary, 75, d.refreshLogs); err != nil {
+		return err
+	}
+	if _, err := d.newButton(row, "Copy Log", btnPlain, 75, func() {
+		if d.logsView != nil {
+			_ = walk.Clipboard().SetText(d.logsView.Text())
+			d.say(secLogs, "Copied log to clipboard.", toneSecondary)
+		}
+	}); err != nil {
+		return err
+	}
+	if _, err := d.newButton(row, "Open File", btnPlain, 80, func() {
+		openWispLog()
+	}); err != nil {
+		return err
+	}
+
+	if d.logsView, err = walk.NewTextEditWithStyle(pg, win.WS_VSCROLL|win.ES_AUTOVSCROLL); err != nil {
+		return err
+	}
+	d.logsView.SetReadOnly(true)
+	d.logsView.SetFont(font(9, fontMono))
+	d.logsView.SetTextColor(theme.Color(d.pal.Text))
+	d.logsView.MouseDown().Attach(func(x, y int, button walk.MouseButton) {
+		d.logsView.SetFocus()
+	})
+	d.textEdits = append(d.textEdits, d.logsView)
+	if err := errors.Join(noBorder(d.logsView), d.themed(d.logsView, true), fillRest(pg, d.logsView)); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (d *settingsDialog) refreshLogs() {
+	if d.logsView == nil || d.deps.Store == nil {
+		return
+	}
+	filter := store.MessageFilter{
+		Limit: 100,
+	}
+	now := time.Now()
+	switch d.logDateFilter {
+	case "today":
+		startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+		filter.Since = startOfDay.Unix()
+	case "24h":
+		filter.Since = now.Add(-24 * time.Hour).Unix()
+	case "7d":
+		filter.Since = now.Add(-7 * 24 * time.Hour).Unix()
+	case "30d":
+		filter.Since = now.Add(-30 * 24 * time.Hour).Unix()
+	}
+
+	switch d.logTypeFilter {
+	case "recv_all":
+		filter.Received = true
+	case "recv_text":
+		filter.Received = true
+		filter.Type = "text"
+	case "recv_media":
+		filter.Received = true
+		filter.Type = "media"
+	case "all":
+		filter.Received = false
+	}
+
+	if d.logSearchEdit != nil {
+		filter.Query = strings.TrimSpace(d.logSearchEdit.Text())
+	}
+
+	d.say(secLogs, "Loading messages...", toneSecondary)
+	var formattedText string
+	var count int
+	d.ctl.bg(func() error {
+		msgs, err := d.deps.Store.QueryMessageLogs(filter)
+		if err != nil {
+			return err
+		}
+		count = len(msgs)
+		var b strings.Builder
+		if count == 0 {
+			b.WriteString("No messages match the current filters.\r\n")
+		} else {
+			for i, m := range msgs {
+				formatLogMessage(&b, m)
+				if i < count-1 {
+					b.WriteString("\r\n" + strings.Repeat("-", 60) + "\r\n\r\n")
+				}
+			}
+		}
+		formattedText = b.String()
+		return nil
+	}, func(err error) {
+		if d.closed || d.logsView == nil {
+			return
+		}
+		if err != nil {
+			d.say(secLogs, "Failed to load messages: "+err.Error(), toneError)
+			return
+		}
+		_ = d.logsView.SetText(formattedText)
+		d.say(secLogs, fmt.Sprintf("Showing %d messages (date: %s, filter: %s)", count, d.logDateFilter, d.logTypeFilter), toneSecondary)
+	})
+}
+
+func formatLogMessage(b *strings.Builder, m store.Message) {
+	tm := time.Unix(m.Timestamp, 0).Format("2006-01-02 15:04:05")
+	dir := "INCOMING"
+	if m.FromMe {
+		dir = "OUTGOING"
+	}
+	fmt.Fprintf(b, "[%s] %s | TYPE: %s | STATUS: %s\r\n", tm, dir, m.Type, m.Status)
+	fmt.Fprintf(b, "Account: %s\r\n", m.AccountID)
+	fmt.Fprintf(b, "Chat:    %s\r\n", m.ChatJID)
+	if m.SenderJID != "" {
+		fmt.Fprintf(b, "Sender:  %s\r\n", m.SenderJID)
+	}
+	if m.WireSenderJID != "" && m.WireSenderJID != m.SenderJID {
+		fmt.Fprintf(b, "Wire:    %s\r\n", m.WireSenderJID)
+	}
+	fmt.Fprintf(b, "ID:      %s\r\n", m.ID)
+	if m.Body != "" {
+		fmt.Fprintf(b, "Body:    %s\r\n", m.Body)
+	}
+	if m.QuotedID != "" {
+		fmt.Fprintf(b, "Quoted:  ID=%s Sender=%s Type=%s Body=%q\r\n", m.QuotedID, m.QuotedSender, m.QuotedType, m.QuotedBody)
+	}
+	if m.Mentions != "" {
+		fmt.Fprintf(b, "Mention: %s\r\n", m.Mentions)
+	}
+	if len(m.MediaMeta) > 0 {
+		fmt.Fprintf(b, "Media:   meta=%d bytes", len(m.MediaMeta))
+		if m.MediaPath != "" {
+			fmt.Fprintf(b, ", path=%s", m.MediaPath)
+		}
+		b.WriteString("\r\n")
+	}
+}
+
+func openWispLog() {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return
+	}
+	p := filepath.Join(dir, "Wisp", "wisp.log")
+	_ = exec.Command("cmd", "/c", "start", "", p).Start()
+}
+
 // bind saves w's changes to key, a per-account or an app-global setting.
 func (d *settingsDialog) bind(sec int, key string, w valueWidget) {
 	name := settingNames[key]
@@ -534,6 +840,9 @@ func (d *settingsDialog) show(i int) {
 		}
 	}
 	d.pages[i].SetVisible(true)
+	if i == secLogs {
+		d.refreshLogs()
+	}
 	logErr("settings nav repaint", d.nav.Invalidate())
 	announce(d.nav, navName, sectionNames[i])
 }
@@ -568,7 +877,7 @@ func (d *settingsDialog) loadGlobals() {
 			d.soundChoice.SetEnabled(vals[KeyNotifySound] == "true")
 		}
 		if err == nil { // else the PIN state is unknown: no button, so Set PIN can't replace a PIN unasked
-			d.showLock(vals[KeyLockPIN])
+			d.showLock(vals[KeyLockPIN], vals[KeyLockTimeout])
 		}
 		logErr("GIPHY key field", d.keyEdit.SetText(vals[KeyGiphyAPIKey]))
 		logErr("proxy field", d.proxyEdit.SetText(vals[KeyProxy]))

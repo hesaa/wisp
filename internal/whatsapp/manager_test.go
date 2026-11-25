@@ -822,7 +822,7 @@ func TestReactionsSkippedUnknownKindsStoredRead(t *testing.T) {
 	react := incoming(alice, "x1", "")
 	react.Message = &waE2E.Message{ReactionMessage: &waE2E.ReactionMessage{Text: proto.String("ok"), Key: &waCommon.MessageKey{ID: proto.String("m")}}}
 	poll := incoming(alice, "p1", "")
-	poll.Message = &waE2E.Message{PollCreationMessage: &waE2E.PollCreationMessage{Name: proto.String("lunch?")}}
+	poll.Message = &waE2E.Message{PlaceholderMessage: &waE2E.PlaceholderMessage{}} // a kind still unmapped
 	for _, e := range []*events.Message{react, poll} {
 		if err := m.handleEvent(ctx, acctA, fa, e); err != nil {
 			t.Fatal(err)

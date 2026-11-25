@@ -10,7 +10,9 @@ import (
 	_ "image/jpeg" // embedded previews and cached thumbnails
 	_ "image/png"  // sticker previews
 	"io"
+	"math"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -648,6 +650,27 @@ func flatten(img *image.RGBA, bg walk.Color) {
 	copy(img.Pix, out.Pix)
 }
 
+// circleCrop paints bg over img outside the largest centred circle, with a one-pixel soft edge.
+func circleCrop(img *image.RGBA, bg walk.Color) {
+	b := img.Bounds()
+	cx, cy := float64(b.Min.X+b.Max.X)/2, float64(b.Min.Y+b.Max.Y)/2
+	r := float64(min(b.Dx(), b.Dy())) / 2
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			d := math.Hypot(float64(x)+0.5-cx, float64(y)+0.5-cy)
+			out := min(max(d-r+0.5, 0), 1) // 0 inside, 1 outside, blended across the edge
+			if out == 0 {
+				continue
+			}
+			p := img.PixOffset(x, y)
+			for i, c := range [3]uint8{bg.R(), bg.G(), bg.B()} {
+				img.Pix[p+i] = uint8(float64(img.Pix[p+i])*(1-out) + float64(c)*out + 0.5)
+			}
+			img.Pix[p+3] = 0xff
+		}
+	}
+}
+
 // makeThumb has the cache make a downloaded image's thumbnail off the UI thread (it decodes the
 // full image) and repaints with it.
 func (v *ChatView) makeThumb(id, path string) {
@@ -690,6 +713,9 @@ func (v *ChatView) thumbFor(m *store.Message, preview bool, w, h int) *walk.Bitm
 	var bmp *walk.Bitmap
 	if err == nil && m.Type == "sticker" {
 		flatten(img, theme.Color(bubbleColor(v.pal, m.FromMe)))
+	}
+	if info, _ := parseMedia(m); err == nil && info.note {
+		circleCrop(img, theme.Color(bubbleColor(v.pal, m.FromMe)))
 	}
 	if err == nil {
 		bmp, err = walk.NewBitmapFromImageForDPI(img, v.canvas.DPI())
@@ -741,6 +767,11 @@ func decodeFull(path string) (*image.RGBA, error) {
 	}
 	defer f.Close()
 	src, err := decodeCapped(f, maxFullPixels)
+	if err != nil && strings.EqualFold(filepath.Ext(path), ".webp") {
+		if first, ferr := firstWebPFrame(path); ferr == nil {
+			return first, nil // an animated sticker, or a still one x/image/webp refuses
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1419,7 +1450,11 @@ func (v *ChatView) paintBubble(c *walk.Canvas, m *store.Message, b bubble, dy in
 		} else if bmp := v.thumbFor(m, b.preview, r.Width, r.Height); bmp != nil {
 			errs = append(errs, c.DrawImageStretchedPixels(bmp, r))
 		} else {
-			errs = append(errs, icons.FillRounded(c, r, s(4), theme.Color(p.ChatBg)))
+			radius := s(4)
+			if b.info.note {
+				radius = r.Width / 2
+			}
+			errs = append(errs, icons.FillRounded(c, r, radius, theme.Color(p.ChatBg)))
 			if !b.play && m.MediaPath == "" {
 				errs = append(errs, icons.Draw(c, icons.IconDownload, square(r.X+r.Width/2, r.Y+r.Height/2, s(36)), secondary))
 			}

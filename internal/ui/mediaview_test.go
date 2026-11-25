@@ -134,6 +134,14 @@ func TestDecodeFull(t *testing.T) {
 	if _, err := decodeCapped(bytes.NewReader(buf.Bytes()), 11); !errors.Is(err, media.ErrImageTooLarge) {
 		t.Errorf("over the cap: %v, want ErrImageTooLarge", err)
 	}
+	// An animated sticker, which x/image/webp cannot decode, shows its first frame (all red).
+	img, err = decodeFull("testdata/anim.webp")
+	if err != nil || img.Bounds().Dx() != 8 || img.Bounds().Dy() != 4 {
+		t.Fatalf("decodeFull of an animated WebP: %v, %v", img, err)
+	}
+	if c := img.RGBAAt(6, 2); c.R != 255 || c.G != 0 || c.A != 255 {
+		t.Errorf("first frame pixel %v, want red", c)
+	}
 }
 
 type fakePlayer struct {

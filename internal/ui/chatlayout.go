@@ -16,6 +16,7 @@ import (
 	"wa-go/internal/store"
 	"wa-go/internal/theme"
 	"wa-go/internal/ui/icons"
+	"wa-go/internal/whatsapp"
 )
 
 // The chat pane's message layout: a pure function of the messages, the view width and DPI and a text
@@ -71,6 +72,7 @@ type mediaInfo struct {
 	preview []byte // embedded thumbnail (JPEG; PNG for stickers); not kept in layouts
 	gif     bool   // a video sent as a GIF
 	voice   bool   // audio recorded in the app (a voice message)
+	note    bool   // a round video note
 }
 
 // parseMedia reads a message's MediaMeta, the marshaled media sub-message of its type.
@@ -86,7 +88,7 @@ func parseMedia(m *store.Message) (mediaInfo, error) {
 	case "video":
 		var x waE2E.VideoMessage
 		err := proto.Unmarshal(m.MediaMeta, &x)
-		return mediaInfo{size: x.GetFileLength(), w: int(x.GetWidth()), h: int(x.GetHeight()), preview: x.GetJPEGThumbnail(), gif: x.GetGifPlayback()}, err
+		return mediaInfo{size: x.GetFileLength(), w: int(x.GetWidth()), h: int(x.GetHeight()), preview: x.GetJPEGThumbnail(), gif: x.GetGifPlayback(), note: whatsapp.IsVideoNote(&x)}, err
 	case "audio":
 		var x waE2E.AudioMessage
 		err := proto.Unmarshal(m.MediaMeta, &x)
@@ -440,6 +442,10 @@ func (l *chatLayout) layout(m *store.Message, named bool, ms measurer, album []s
 				side = stickerSide
 			}
 			media.Width, media.Height = fitBox(info.w, info.h, s(side), maxW-2*s(bubbleInset))
+			if info.note { // a circle: square box, the picture cropped to it
+				media.Width = min(s(side), maxW-2*s(bubbleInset))
+				media.Height = media.Width
+			}
 			if len(album) > 0 {
 				media.Width = min(s(thumbSide), maxW-2*s(bubbleInset))
 				media.Height = media.Width

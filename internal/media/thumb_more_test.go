@@ -41,6 +41,64 @@ func TestThumbnailOfAStickerIsAPNG(t *testing.T) {
 	}
 }
 
+// webpChunk is a RIFF chunk: id, little-endian length, body, padded to an even size.
+func webpChunk(id string, body []byte) []byte {
+	b := append([]byte(id), byte(len(body)), byte(len(body)>>8), byte(len(body)>>16), byte(len(body)>>24))
+	b = append(b, body...)
+	if len(body)%2 == 1 {
+		b = append(b, 0)
+	}
+	return b
+}
+
+// Stickers x/image/webp cannot decode still get a thumbnail: an animated WebP of a single frame,
+// and a still in the extended format flagged as having alpha (and EXIF) over a lossless picture,
+// which that package refuses although the format allows it.
+func TestThumbnailOfStickersXImageRefuses(t *testing.T) {
+	still, err := base64.StdEncoding.DecodeString(tinyWebP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vp8l := still[12:] // its VP8L chunk, padded
+	for name, chunks := range map[string][][]byte{
+		"one-frame animation": {
+			webpChunk("VP8X", []byte{0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0}), // animated, 1x1
+			webpChunk("ANIM", make([]byte, 6)),
+			webpChunk("ANMF", append([]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 100, 0, 0, 0}, vp8l...)),
+		},
+		"extended still with alpha and EXIF": {
+			webpChunk("VP8X", []byte{0x18, 0, 0, 0, 0, 0, 0, 0, 0, 0}), // alpha and EXIF flags, 1x1
+			vp8l,
+			webpChunk("EXIF", []byte("II*\x00")),
+		},
+	} {
+		body := []byte("WEBP")
+		for _, c := range chunks {
+			body = append(body, c...)
+		}
+		raw := append([]byte{'R', 'I', 'F', 'F', byte(len(body)), byte(len(body) >> 8), 0, 0}, body...)
+		c, _ := newCache(t)
+		p, err := c.Save("acc", ".webp", bytes.NewReader(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		tp, err := c.Thumbnail(p)
+		if err != nil {
+			t.Errorf("%s: Thumbnail: %v", name, err)
+			continue
+		}
+		f, err := os.Open(tp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg, format, err := image.DecodeConfig(f)
+		f.Close()
+		if err != nil || format != "png" || cfg.Width != 1 || cfg.Height != 1 {
+			t.Errorf("%s: thumbnail is %s %dx%d (%v)", name, format, cfg.Width, cfg.Height, err)
+		}
+	}
+}
+
 // Windows makes the thumbnail of what this app cannot decode (video): any file type Explorer shows
 // a picture for goes the same way, so a PNG stands in for a video here.
 func TestShellThumbnailFitsTheSide(t *testing.T) {

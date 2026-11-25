@@ -16,6 +16,7 @@ import (
 
 	"github.com/lxn/walk"
 	"github.com/lxn/win"
+	"golang.org/x/sys/windows"
 
 	"wa-go/internal/media"
 	"wa-go/internal/store"
@@ -158,8 +159,10 @@ type MediaView struct {
 	state     mediaState
 	failure   string
 	bmp       *walk.Bitmap
-	size      walk.Size // the picture's pixels
-	gen       int       // per picture shown: a decode finished for another is dropped
+	frame     []byte        // an animated sticker's frame on show (BGRX, size), over bmp; nil when still
+	animStop  chan struct{} // closed to end the sticker's animation
+	size      walk.Size     // the picture's pixels
+	gen       int           // per picture shown: a decode finished for another is dropped
 	zoom      float64
 	pan       walk.Point
 	dragging  bool
@@ -335,12 +338,20 @@ func (v *MediaView) Open(list []store.Message, i int, sender func(store.Message)
 	focusOn(v.area())
 }
 
+var (
+	kernel32Dll               = windows.NewLazySystemDLL("kernel32.dll")
+	pSetProcessWorkingSetSize = kernel32Dll.NewProc("SetProcessWorkingSetSize")
+)
+
 // Close drops the picture or shuts the player down, drops the messages and gives the memory back.
 func (v *MediaView) Close() {
 	v.gen++
 	v.drop()
 	v.list, v.sender, v.dragging = nil, nil, false
 	debug.FreeOSMemory()
+	if h, err := windows.GetCurrentProcess(); err == nil {
+		_, _, _ = pSetProcessWorkingSetSize.Call(uintptr(h), ^uintptr(0), ^uintptr(0))
+	}
 }
 
 func (v *MediaView) drop() {
@@ -348,6 +359,11 @@ func (v *MediaView) drop() {
 		v.bmp.Dispose()
 		v.bmp = nil
 	}
+	if v.animStop != nil {
+		close(v.animStop)
+		v.animStop = nil
+	}
+	v.frame = nil
 	v.size, v.zoom, v.pan = walk.Size{}, 1, walk.Point{}
 	v.stopVideo()
 }
@@ -456,8 +472,35 @@ func (v *MediaView) decoded(gen int, id string, img *image.RGBA, err error, dpi 
 		v.state = mediaBroken
 	default:
 		v.bmp, v.size, v.state = bmp, walk.Size{Width: img.Bounds().Dx(), Height: img.Bounds().Dy()}, mediaShown
+		if m, ok := v.current(); ok && m.ID == id && animatable(m.Type, m.MediaPath, false) {
+			v.playSticker(m.MediaPath)
+		}
 	}
 	v.update()
+}
+
+// playSticker animates the sticker at path over its still first frame, decoding a frame at a time
+// so a big sticker costs no more memory than one, until drop. A still sticker stays as it is.
+func (v *MediaView) playSticker(path string) {
+	stop := make(chan struct{})
+	v.animStop = stop
+	bg := theme.Color(v.pal.ChatBg)
+	go func() {
+		data, err := readSticker(path)
+		if err == nil {
+			err = playWebP(data, bg, stop, func(pix []byte) {
+				v.canvas.Synchronize(func() {
+					if v.animStop == stop {
+						v.frame = pix
+						logErr("sticker repaint", v.canvas.Invalidate())
+					}
+				})
+			})
+		}
+		if err != nil && !errors.Is(err, errStill) {
+			v.canvas.Synchronize(func() { logErr("sticker animation", err) })
+		}
+	}()
 }
 
 // update refreshes the top bar and the picture after a change of message or state.
@@ -495,7 +538,13 @@ func (v *MediaView) update() {
 // startVideo creates the player for m (downloaded) and the timer that polls it.
 func (v *MediaView) startVideo(m store.Message) {
 	v.muted, v.started, v.opened, v.st, v.pos, v.dur, v.gifAt = v.gif, false, time.Now(), playerEmpty, 0, 0, 0
-	p, err := newPlayer(v.video.Handle(), m.MediaPath)
+	var p mediaPlayer
+	var err error
+	if v.gif {
+		p, err = newGifPlayer(v.video.Handle(), m.MediaPath)
+	} else {
+		p, err = newPlayer(v.video.Handle(), m.MediaPath)
+	}
 	if err != nil {
 		logErr("video "+m.ID, err)
 		v.state = mediaUnplayable
@@ -864,10 +913,12 @@ func (v *MediaView) paint(c *walk.Canvas, _ walk.Rectangle) error {
 	b, dpi := cw.ClientBoundsPixels(), cw.DPI()
 	s := scaler(dpi)
 	errs := []error{fillBand(c, b, p.ChatBg)}
-	switch v.state {
-	case mediaShown:
+	switch {
+	case v.state == mediaShown && v.frame != nil:
+		errs = append(errs, blitFrame(c.HDC(), fitRect(v.size, b, v.zoom, v.pan), v.frame, v.size.Width, v.size.Height))
+	case v.state == mediaShown:
 		errs = append(errs, c.DrawImageStretchedPixels(v.bmp, fitRect(v.size, b, v.zoom, v.pan)))
-	case mediaLoading:
+	case v.state == mediaLoading:
 	default:
 		msg := walk.Rectangle{X: s(16), Y: b.Height/2 - s(20), Width: b.Width - s(32), Height: s(28)}
 		errs = append(errs, drawText(c, dpi, v.stateText(), 11, 0, v.color(toneText), msg, centerText))

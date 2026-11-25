@@ -326,3 +326,21 @@ func TestMarkReadSelfOnly(t *testing.T) {
 		t.Fatalf("receipts %+v", fa.receipts)
 	}
 }
+
+func TestLogReceivedMessage(t *testing.T) {
+	info := types.MessageInfo{
+		ID:        "msg123",
+		Timestamp: time.Unix(1700000000, 0),
+		PushName:  "Bob",
+		MessageSource: types.MessageSource{
+			Chat:   alice,
+			Sender: alice,
+		},
+	}
+	m := &waE2E.Message{Conversation: proto.String("hello debug")}
+	logReceivedMessage(acctA, info, alice, "", m)
+	logReceivedMessage(acctA, info, alice, "", nil)
+
+	rm := &waE2E.Message{ReactionMessage: &waE2E.ReactionMessage{Text: proto.String("👍")}}
+	logReceivedMessage(acctA, info, alice, "", rm)
+}

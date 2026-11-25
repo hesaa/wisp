@@ -543,3 +543,70 @@ func TestQuotedMessageRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+func TestLatestSystemMessage(t *testing.T) {
+	db := openTest(t)
+	body, ok, err := db.LatestSystemMessage("a", "c1")
+	if err != nil || ok || body != "" {
+		t.Fatalf("empty db: got %q, %v, %v", body, ok, err)
+	}
+
+	// Insert text message
+	_, _ = db.InsertMessage(Message{ID: "m1", ChatJID: "c1", AccountID: "a", Timestamp: 100, Type: "text", Body: "hello"})
+	body, ok, err = db.LatestSystemMessage("a", "c1")
+	if err != nil || ok || body != "" {
+		t.Fatalf("only text msg: got %q, %v, %v", body, ok, err)
+	}
+
+	// Insert older system message
+	_, _ = db.InsertMessage(Message{ID: "sys1", ChatJID: "c1", AccountID: "a", Timestamp: 200, Type: "system", Body: "You joined"})
+	body, ok, err = db.LatestSystemMessage("a", "c1")
+	if err != nil || !ok || body != "You joined" {
+		t.Fatalf("sys1: got %q, %v, %v", body, ok, err)
+	}
+
+	// Insert newer system message
+	_, _ = db.InsertMessage(Message{ID: "sys2", ChatJID: "c1", AccountID: "a", Timestamp: 300, Type: "system", Body: "~ Jun removed you"})
+	body, ok, err = db.LatestSystemMessage("a", "c1")
+	if err != nil || !ok || body != "~ Jun removed you" {
+		t.Fatalf("sys2: got %q, %v, %v", body, ok, err)
+	}
+}
+
+func TestQueryMessageLogs(t *testing.T) {
+	db := openTest(t)
+	m1 := Message{ID: "m1", ChatJID: "chat1@s.whatsapp.net", AccountID: "acct1", SenderJID: "sender1@s.whatsapp.net",
+		Timestamp: 1000, Type: "text", Body: "first message", FromMe: false, Status: StatusReceived}
+	m2 := Message{ID: "m2", ChatJID: "chat1@s.whatsapp.net", AccountID: "acct1", SenderJID: "acct1@s.whatsapp.net",
+		Timestamp: 2000, Type: "text", Body: "reply sent", FromMe: true, Status: StatusSent}
+	m3 := Message{ID: "m3", ChatJID: "chat2@s.whatsapp.net", AccountID: "acct1", SenderJID: "sender2@s.whatsapp.net",
+		Timestamp: 3000, Type: "image", Body: "vacation photo", FromMe: false, Status: StatusReceived}
+	_, _ = db.InsertMessage(m1)
+	_, _ = db.InsertMessage(m2)
+	_, _ = db.InsertMessage(m3)
+
+	// Test date range filter
+	logs, err := db.QueryMessageLogs(MessageFilter{Since: 1500, Until: 2500})
+	if err != nil || len(logs) != 1 || logs[0].ID != "m2" {
+		t.Fatalf("date range filter: len=%d, err=%v", len(logs), err)
+	}
+
+	// Test received only filter
+	logs, err = db.QueryMessageLogs(MessageFilter{Received: true})
+	if err != nil || len(logs) != 2 {
+		t.Fatalf("received only filter: len=%d, err=%v", len(logs), err)
+	}
+
+	// Test type filter
+	logs, err = db.QueryMessageLogs(MessageFilter{Type: "image"})
+	if err != nil || len(logs) != 1 || logs[0].ID != "m3" {
+		t.Fatalf("type filter: len=%d, err=%v", len(logs), err)
+	}
+
+	// Test text search
+	logs, err = db.QueryMessageLogs(MessageFilter{Query: "vacation"})
+	if err != nil || len(logs) != 1 || logs[0].ID != "m3" {
+		t.Fatalf("search query: len=%d, err=%v", len(logs), err)
+	}
+}
+

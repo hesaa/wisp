@@ -110,12 +110,15 @@ func colourInit() error {
 		c.formats = map[textFormatKey]unsafe.Pointer{}
 	}
 	if c.rt == nil {
-		// B8G8R8A8, alpha ignored (what a GDI surface is), 96 DPI so its units are pixels
+		// B8G8R8A8, alpha ignored (what a GDI surface is), 96 DPI so its units are pixels.
+		// D2D1_RENDER_TARGET_TYPE_SOFTWARE (1) prevents Direct2D from initializing
+		// Direct3D 11 and loading GPU vendor display drivers (e.g. Intel igc64/igd10,
+		// NVIDIA/AMD) which consume 60-100+ MB of working set and commit memory.
 		props := struct {
 			typ, format, alpha uint32
 			dpiX, dpiY         float32
 			usage, minLevel    uint32
-		}{format: 87, alpha: 3, dpiX: 96, dpiY: 96}
+		}{typ: 1, format: 87, alpha: 3, dpiX: 96, dpiY: 96}
 		err := com(c.d2d, d2dFactoryCreateDCRenderTarget, uintptr(unsafe.Pointer(&props)), uintptr(unsafe.Pointer(&c.rt)))
 		runtime.KeepAlive(&props)
 		return err

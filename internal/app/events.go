@@ -68,6 +68,12 @@ func (a *App) handle(evt any) {
 
 // onMessage folds a just-stored message into the screen (see routeMessage).
 func (a *App) onMessage(m store.Message) {
+	if m.Type == "system" && isGroup(m.ChatJID) {
+		lower := strings.ToLower(m.Body)
+		if strings.Contains(lower, "removed you") || strings.Contains(lower, "no longer a member") || strings.Contains(lower, "you left") {
+			a.setGroupNotMember(chatRef{m.AccountID, m.ChatJID})
+		}
+	}
 	r := routeMessage(m, a.v.active, a.v.open, a.foreground(), a.cfg[ui.KeyNotify] == "true")
 	if r.stories {
 		a.loadStories(m.AccountID)
@@ -77,14 +83,14 @@ func (a *App) onMessage(m store.Message) {
 		a.markMessageRead(m)
 		m.Status = store.StatusRead
 	}
-	if r.upsert {
+	if r.upsert && a.chat != nil {
 		if a.v.loaded {
 			a.chat.Upsert(m)
 		} else {
 			a.v.pending = append(a.v.pending, m) // its chat's first page is still loading
 		}
 	}
-	if r.sidebar && a.side.Model().ApplyMessage(m) {
+	if r.sidebar && a.side != nil && a.side.Model() != nil && a.side.Model().ApplyMessage(m) {
 		a.v.unread[m.AccountID] = a.side.Model().Unread()
 		a.v.listChanged(m.AccountID)
 	} else if r.unread {
@@ -214,6 +220,9 @@ func (a *App) loadChats(acct string) {
 // the active account. A list that may be older than what the screen shows is dropped and read again
 // (see view.reloadArrived).
 func (a *App) reloadList(acct string) {
+	if a.db == nil {
+		return
+	}
 	seq := a.v.reloadStarted(acct)
 	go func() {
 		chats, err := a.db.ListChats(acct)
@@ -319,6 +328,9 @@ func (a *App) loadStories(acct string) {
 
 // showUnread puts every account's unread total on the rail and their sum on the tray icon.
 func (a *App) showUnread() {
+	if a.rail == nil || a.rail.Model() == nil {
+		return
+	}
 	ids := a.rail.Model().Accounts()
 	for _, id := range ids {
 		a.rail.Model().SetUnread(id, a.v.unread[id])

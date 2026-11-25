@@ -556,4 +556,96 @@ func TestMCPBinaryPathAndSnippet(t *testing.T) {
 	}
 }
 
+func TestLockTimeoutSetting(t *testing.T) {
+	h := newSettingsHarness(t)
+	vals, err := h.ctl.values(acctA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := vals[KeyLockTimeout]; got != "5" {
+		t.Errorf("default KeyLockTimeout = %q, want %q", got, "5")
+	}
+	var setErr error
+	h.ctl.setGlobal(KeyLockTimeout, "15", func(err error) { setErr = err })
+	if setErr != nil {
+		t.Fatal(setErr)
+	}
+	vals, err = h.ctl.values(acctA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := vals[KeyLockTimeout]; got != "15" {
+		t.Errorf("updated KeyLockTimeout = %q, want %q", got, "15")
+	}
+}
 
+func TestValidateCustomTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		in      string
+		want    string
+		wantErr bool
+	}{
+		{"0", "0", false},
+		{"5", "5", false},
+		{" 10 ", "10", false},
+		{"120", "120", false},
+		{"", "", true},
+		{"-1", "", true},
+		{"abc", "", true},
+		{"100000", "", true},
+	} {
+		got, err := validateCustomTimeout(tc.in)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("validateCustomTimeout(%q) error = %v, wantErr = %v", tc.in, err, tc.wantErr)
+		}
+		if got != tc.want {
+			t.Errorf("validateCustomTimeout(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestLockTimeoutChoiceOptions(t *testing.T) {
+	opts := lockTimeoutChoiceOptions("5")
+	if len(opts) != 6 {
+		t.Fatalf("expected 6 options, got %d", len(opts))
+	}
+	if opts[5].label != "Custom..." || opts[5].value != "custom" {
+		t.Errorf("expected last option to be Custom..., got %+v", opts[5])
+	}
+
+	optsCustom := lockTimeoutChoiceOptions("10")
+	if len(optsCustom) != 6 {
+		t.Fatalf("expected 6 options, got %d", len(optsCustom))
+	}
+	if optsCustom[5].label != "Custom (10m)" || optsCustom[5].value != "custom" {
+		t.Errorf("expected last option to be Custom (10m), got %+v", optsCustom[5])
+	}
+}
+
+func TestFormatLogMessageAndSections(t *testing.T) {
+	if len(sectionNames) != 8 || sectionNames[secLogs] != "Message Logs" || sectionNames[secMCP] != "MCP" {
+		t.Fatalf("unexpected sectionNames: %v", sectionNames)
+	}
+
+	var b strings.Builder
+	msg := store.Message{
+		ID:         "msg100",
+		ChatJID:    "628123456@s.whatsapp.net",
+		AccountID:  "acct1",
+		SenderJID:  "628999999@s.whatsapp.net",
+		Timestamp:  1700000000,
+		Type:       "text",
+		Body:       "debug log test",
+		FromMe:     false,
+		Status:     "received",
+		QuotedID:   "q1",
+		QuotedBody: "quoted text",
+	}
+	formatLogMessage(&b, msg)
+	s := b.String()
+	for _, expected := range []string{"INCOMING", "TYPE: text", "STATUS: received", "Chat:    628123456@s.whatsapp.net", "Sender:  628999999@s.whatsapp.net", "ID:      msg100", "Body:    debug log test", "Quoted:  ID=q1"} {
+		if !strings.Contains(s, expected) {
+			t.Errorf("formatLogMessage missing %q in:\n%s", expected, s)
+		}
+	}
+}

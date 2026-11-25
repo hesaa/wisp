@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"log"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -235,6 +236,9 @@ type presenceCtl struct {
 // update broadcasts the presence the state calls for: always when forced (minimised, hidden to the
 // tray, locked, a setting change, a reconnect), otherwise only when it changed.
 func (p *presenceCtl) update(force bool) {
+	if p.window == nil {
+		return
+	}
 	visible, iconic := p.window()
 	w := stateOf(visible, iconic, p.locked || p.appLocked, p.active, p.grace.pending())
 	if pr, send := p.last.next(w, p.appearOffline(), force); send {
@@ -362,6 +366,7 @@ func (v *view) setNotMember(c chatRef, notMember bool) {
 	}
 	if notMember {
 		v.notMember[c] = true
+		delete(v.drafts, c)
 	} else {
 		delete(v.notMember, c)
 	}
@@ -375,12 +380,12 @@ func (v *view) isNotMember(c chatRef) bool {
 	return v.notMember[c]
 }
 
-// setDraft records draft text for c (cleared if empty or whitespace only).
+// setDraft records draft text for c (cleared if empty or whitespace only, or if user is not a member).
 func (v *view) setDraft(c chatRef, text string) {
 	if v.drafts == nil {
 		v.drafts = make(map[chatRef]string)
 	}
-	if strings.TrimSpace(text) == "" {
+	if strings.TrimSpace(text) == "" || v.isNotMember(c) {
 		delete(v.drafts, c)
 	} else {
 		v.drafts[c] = text
@@ -614,4 +619,36 @@ func mentionMembers(jids []string, self string, d *ui.Directory) []ui.GroupMembe
 // being left, whose messages must not be quoted into the new one.
 func replyAllowed(m store.Message, open chatRef, loaded bool) bool {
 	return loaded && m.AccountID == open.acct && m.ChatJID == open.jid
+}
+
+// parseLockTimeout returns the duration for the auto-lock timeout setting in minutes.
+// Invalid or empty settings default to 5 minutes. Negative numbers are clamped to 0 (immediately).
+func parseLockTimeout(setting string) time.Duration {
+	if setting == "" {
+		return 5 * time.Minute
+	}
+	n, err := strconv.Atoi(setting)
+	if err != nil {
+		return 5 * time.Minute
+	}
+	if n <= 0 {
+		return 0
+	}
+	return time.Duration(n) * time.Minute
+}
+
+// lockTimeoutExpired reports whether the lock timeout has passed since the app was hidden or minimised.
+// If pinHash is empty, the lock is off, so it returns false.
+// If hiddenAt is zero, the app was never hidden/minimised, so it returns false.
+// If timeout is 0 (immediately), any non-zero hiddenAt returns true.
+// Otherwise, it returns true when now.Sub(hiddenAt) >= timeout.
+func lockTimeoutExpired(pinHash, setting string, hiddenAt, now time.Time) bool {
+	if pinHash == "" || hiddenAt.IsZero() {
+		return false
+	}
+	timeout := parseLockTimeout(setting)
+	if timeout == 0 {
+		return true
+	}
+	return !now.Before(hiddenAt.Add(timeout))
 }
