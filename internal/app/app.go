@@ -19,6 +19,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 
 	"wa-go/internal/lock"
+	"wa-go/internal/mcp"
 	"wa-go/internal/media"
 	"wa-go/internal/notify"
 	"wa-go/internal/store"
@@ -61,7 +62,7 @@ const (
 
 // globalKeys are the app-global settings kept in memory (account "" of the settings table).
 var globalKeys = []string{ui.KeyGhostTyping, ui.KeyAppearOffline, ui.KeyAutoDownloadImages, ui.KeyGiphyAPIKey,
-	ui.KeyProxy, ui.KeyNotify, ui.KeyNotifyPrivate, ui.KeyNotifySound, ui.KeyNotifySoundName, ui.KeyTheme, ui.KeyLockPIN}
+	ui.KeyProxy, ui.KeyNotify, ui.KeyNotifyPrivate, ui.KeyNotifySound, ui.KeyNotifySoundName, ui.KeyTheme, ui.KeyLockPIN, ui.KeyMCPEnabled}
 
 // App is the running main window.
 type App struct {
@@ -113,6 +114,9 @@ type App struct {
 	showingInfo bool // the details view replaces the chat and the input bar
 	infoGen     int
 	sideVisible bool // whether the chats sidebar is shown
+
+	mcpBridge   *mcp.Bridge
+	mcpInfoPath string // non-empty in tests to avoid touching %LOCALAPPDATA%\Wisp\mcp.json
 }
 
 // New builds the main window, themed by the settings in db; nothing connects until Attach.
@@ -380,6 +384,7 @@ func (a *App) Attach(mgr Backend) {
 	go a.presenceWorker()
 	go a.typingWorker()
 	a.lockNow() // before the window is first shown: the chats never appear
+	a.syncMCPBridge()
 	go func() {
 		_ = a.db.ResetEmptyAvatars()
 		a.purgeExpired()                       // before any chat list is read
@@ -412,6 +417,7 @@ func (a *App) Run() (reset bool, err error) {
 		logErr("tray", a.tray.Dispose())
 	}
 	a.stopBG() // queued typing is skipped; a broadcast under way stops, so it cannot land after this one
+	a.stopMCPBridge()
 	ctx, cancel := context.WithTimeout(context.Background(), exitTimeout)
 	logErr("presence", a.mgr.SetPresenceAll(ctx, types.PresenceUnavailable))
 	cancel()
@@ -634,6 +640,50 @@ func (a *App) settingChanged(key string) {
 		a.chat.SetAutoDownload(v == "true")
 	case ui.KeyLockPIN:
 		logErr("taskbar preview", forceIconic(a.mw.Handle(), v != ""))
+	case ui.KeyMCPEnabled:
+		a.syncMCPBridge()
+	}
+}
+
+// syncMCPBridge starts or stops the local MCP HTTP bridge to match KeyMCPEnabled.
+// Independent of app lock. UI thread only.
+func (a *App) syncMCPBridge() {
+	if a.db == nil {
+		return
+	}
+	v, err := ui.Setting(a.db, "", ui.KeyMCPEnabled)
+	if err != nil {
+		logErr("read setting "+ui.KeyMCPEnabled, err)
+	}
+	a.cfg[ui.KeyMCPEnabled] = v
+	if v == "true" {
+		if a.mcpBridge != nil || a.mgr == nil {
+			return
+		}
+		infoPath := a.mcpInfoPath
+		if infoPath == "" {
+			infoPath, err = mcp.DefaultInfoPath()
+			if err != nil {
+				logErr("mcp info path", err)
+				return
+			}
+		}
+		b := mcp.NewBridge(mcp.NewService(a.db, a.mgr), infoPath)
+		if err := b.Start(); err != nil {
+			logErr("mcp bridge start", err)
+			return
+		}
+		a.mcpBridge = b
+		return
+	}
+	a.stopMCPBridge()
+}
+
+// stopMCPBridge shuts down the local MCP HTTP bridge and removes its info file if running.
+func (a *App) stopMCPBridge() {
+	if a.mcpBridge != nil {
+		logErr("mcp bridge stop", a.mcpBridge.Stop())
+		a.mcpBridge = nil
 	}
 }
 

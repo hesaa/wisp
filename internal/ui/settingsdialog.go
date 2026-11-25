@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"github.com/lxn/win"
 	"golang.org/x/sys/windows"
 
+	"wa-go/internal/mcp"
 	"wa-go/internal/media"
 	"wa-go/internal/notify"
 	"wa-go/internal/theme"
@@ -52,7 +54,7 @@ const (
 	fieldH    = 36 // text fields and buttons
 )
 
-var sectionNames = [...]string{"Privacy & Security", "Chats & Presence", "Media & Storage", "Network & Proxy", "Accounts & Sessions", "Notifications & Theme"}
+var sectionNames = [...]string{"Privacy & Security", "Chats & Presence", "Media & Storage", "Network & Proxy", "Accounts & Sessions", "Notifications & Theme", "MCP"}
 
 const (
 	secPrivacy = iota
@@ -61,6 +63,7 @@ const (
 	secNetwork
 	secAccounts
 	secNotify
+	secMCP
 )
 
 // RunSettings shows the modal Settings dialog over owner: a section list on the left (Up/Down
@@ -153,7 +156,7 @@ func (d *settingsDialog) build() error {
 	if err := errors.Join(setBox(content, walk.NewVBoxLayout(), walk.Margins{}), d.themed(content, false), fillRest(d.Dialog, content)); err != nil {
 		return err
 	}
-	builders := [...]func(*walk.Composite) error{d.buildPrivacy, d.buildChats, d.buildMedia, d.buildNetwork, d.buildAccounts, d.buildNotify}
+	builders := [...]func(*walk.Composite) error{d.buildPrivacy, d.buildChats, d.buildMedia, d.buildNetwork, d.buildAccounts, d.buildNotify, d.buildMCP}
 	for i, build := range builders {
 		pg, err := walk.NewComposite(content)
 		if err != nil {
@@ -433,6 +436,81 @@ func (d *settingsDialog) buildNotify(pg *walk.Composite) error {
 	}
 	d.bind(secNotify, KeyTheme, th)
 	return nil
+}
+
+// mcpBinaryPath resolves wisp-mcp.exe alongside the current wisp executable.
+func mcpBinaryPath(executable func() (string, error)) string {
+	if executable != nil {
+		if exe, err := executable(); err == nil && strings.TrimSpace(exe) != "" {
+			return filepath.Join(filepath.Dir(exe), "wisp-mcp.exe")
+		}
+	}
+	return "wisp-mcp.exe"
+}
+
+func (d *settingsDialog) buildMCP(pg *walk.Composite) error {
+	mcpToggle, err := d.newToggle(pg, "Enable MCP", "Allow local AI tools to read chats and send with confirmation.", "true", "false")
+	if err != nil {
+		return err
+	}
+	d.bind(secMCP, KeyMCPEnabled, mcpToggle)
+
+	if _, err := d.newLabel(pg, "Client configuration", 10, walk.FontBold, toneText, 22); err != nil {
+		return err
+	}
+	if _, err := d.newLabel(pg, "Add this snippet to your AI client's MCP config file:", 9, 0, toneSecondary, 20); err != nil {
+		return err
+	}
+
+	snippet := mcp.DefaultClientConfigSnippet(mcpBinaryPath(os.Executable))
+	pill, err := walk.NewComposite(pg)
+	if err != nil {
+		return err
+	}
+	pl := walk.NewVBoxLayout()
+	if err := errors.Join(setBox(pill, pl, walk.Margins{HNear: 12, VNear: 8, HFar: 12, VFar: 8}),
+		d.themed(pill, true), pill.SetMinMaxSize(walk.Size{Height: 150}, walk.Size{Height: 150})); err != nil {
+		return err
+	}
+	preview, err := walk.NewTextEditWithStyle(pill, win.ES_AUTOVSCROLL)
+	if err != nil {
+		return err
+	}
+	preview.SetFont(font(9, 0))
+	preview.SetTextColor(theme.Color(d.pal.Text))
+	d.textEdits = append(d.textEdits, preview)
+	if err := errors.Join(noBorder(preview), preview.SetReadOnly(true), preview.SetText(crlf(snippet)),
+		preview.Accessibility().SetName("MCP config snippet"), d.themed(preview, true), fillRest(pill, preview)); err != nil {
+		return err
+	}
+
+	row, err := d.newRow(pg, fieldH)
+	if err != nil {
+		return err
+	}
+	if _, err := d.newButton(row, "Copy MCP config", btnPlain, 165, func() {
+		cb := walk.Clipboard()
+		err := cb.Clear()
+		if err == nil {
+			err = cb.SetText(snippet)
+		}
+		if err != nil {
+			d.say(secMCP, "Couldn't copy MCP config: "+err.Error(), toneError)
+			return
+		}
+		d.say(secMCP, "MCP config copied to clipboard.", toneSecondary)
+	}); err != nil {
+		return err
+	}
+	spacer, err := walk.NewHSpacer(row)
+	if err != nil {
+		return err
+	}
+	if err := fillRest(row, spacer); err != nil {
+		return err
+	}
+	_, err = d.newLabel(pg, "App lock does not pause or disable MCP while Wisp is running.", 9, 0, toneSecondary, 20)
+	return err
 }
 
 // bind saves w's changes to key, a per-account or an app-global setting.
@@ -936,10 +1014,11 @@ const blockText = walk.TextLeft | walk.TextTop | walk.TextWordbreak | walk.TextE
 
 // kit makes themed controls and keeps what a palette change must recolour.
 type kit struct {
-	pal      theme.Palette
-	canvases []*walk.CustomWidget
-	bgs      []themedBg
-	edits    []*walk.LineEdit
+	pal       theme.Palette
+	canvases  []*walk.CustomWidget
+	bgs       []themedBg
+	edits     []*walk.LineEdit
+	textEdits []*walk.TextEdit
 }
 
 type themedBg struct {
@@ -971,6 +1050,9 @@ func (k *kit) setPalette(p theme.Palette) error {
 	}
 	for _, e := range k.edits {
 		e.SetTextColor(theme.Color(p.Text))
+	}
+	for _, te := range k.textEdits {
+		te.SetTextColor(theme.Color(p.Text))
 	}
 	for _, cw := range k.canvases {
 		errs = append(errs, cw.Invalidate())

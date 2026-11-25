@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"slices"
@@ -14,6 +15,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 
 	"wa-go/internal/lock"
+	"wa-go/internal/mcp"
 	"wa-go/internal/store"
 	"wa-go/internal/theme"
 	"wa-go/internal/whatsapp"
@@ -494,3 +496,64 @@ func TestPinUpdate(t *testing.T) {
 		t.Fatalf("off: %q %v %q", off, ok, msg)
 	}
 }
+
+func TestSetting_MCPEnabledDefaultAndSave(t *testing.T) {
+	h := newSettingsHarness(t)
+	if v, err := Setting(h.db, "", KeyMCPEnabled); v != "false" || err != nil {
+		t.Fatalf("default %q %v, want false", v, err)
+	}
+	if err := h.db.SetSetting("", KeyMCPEnabled, "true"); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := Setting(h.db, "", KeyMCPEnabled); v != "true" || err != nil {
+		t.Fatalf("saved %q %v, want true", v, err)
+	}
+	vals, err := h.ctl.values("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vals[KeyMCPEnabled] != "true" {
+		t.Fatalf("values[%q] = %q, want true", KeyMCPEnabled, vals[KeyMCPEnabled])
+	}
+	if err := h.global(KeyMCPEnabled, "false"); err != nil {
+		t.Fatal(err)
+	}
+	if v := h.stored(t, "", KeyMCPEnabled); v != "false" {
+		t.Fatalf("stored %q, want false", v)
+	}
+	if !slices.Equal(h.changed, []string{KeyMCPEnabled}) {
+		t.Fatalf("changed callbacks %v, want [%s]", h.changed, KeyMCPEnabled)
+	}
+}
+
+func TestMCPBinaryPathAndSnippet(t *testing.T) {
+	got := mcpBinaryPath(func() (string, error) {
+		return filepath.Join(`C:\Program Files\Wisp`, "wisp.exe"), nil
+	})
+	want := filepath.Join(`C:\Program Files\Wisp`, "wisp-mcp.exe")
+	if got != want {
+		t.Fatalf("mcpBinaryPath = %q, want %q", got, want)
+	}
+
+	fallback := mcpBinaryPath(func() (string, error) {
+		return "", errors.New("unavailable")
+	})
+	if fallback != "wisp-mcp.exe" {
+		t.Fatalf("fallback mcpBinaryPath = %q, want wisp-mcp.exe", fallback)
+	}
+
+	snippet := mcp.DefaultClientConfigSnippet(got)
+	var parsed struct {
+		MCPServers map[string]struct {
+			Command string `json:"command"`
+		} `json:"mcpServers"`
+	}
+	if err := json.Unmarshal([]byte(snippet), &parsed); err != nil {
+		t.Fatalf("invalid JSON snippet: %v\n%s", err, snippet)
+	}
+	if parsed.MCPServers["wisp"].Command != want {
+		t.Fatalf("snippet command = %q, want %q", parsed.MCPServers["wisp"].Command, want)
+	}
+}
+
+
