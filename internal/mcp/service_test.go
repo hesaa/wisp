@@ -571,13 +571,79 @@ func TestPrepareSend_ExactJIDPhoneAndLIDDedup(t *testing.T) {
 		t.Fatalf("expected merged Alice entry, got res=%+v prep=%+v", res, prep)
 	}
 
-	// Formatted phone number matches Alice's PNJID (and not 1555111222200? wait: 15551112222 is prefix of 1555111222200; exact JID tests prefix disambiguation).
+	// Formatted phone number matches Alice's PNJID via isPhoneLike/digitsOnly, and exact JID disambiguates prefix collisions.
 	res = callJSON(t, svc, "prepare_send", map[string]any{
 		"recipient": "15551112222@s.whatsapp.net",
 		"text":      "Exact JID",
 	}, &prep)
 	if res.IsError || prep.Status != "needs_confirmation" || prep.Recipient.JID != "15551112222@s.whatsapp.net" {
 		t.Fatalf("expected exact JID match, got res=%+v prep=%+v", res, prep)
+	}
+}
+
+func TestPrepareSend_FormattedPhoneNumber(t *testing.T) {
+	st := &fakeStore{
+		people: map[string][]store.Person{
+			"acct1": {
+				{JID: "999888@lid", PNJID: "15551112222@s.whatsapp.net", FullName: "Alice"},
+				{JID: "15559990000@s.whatsapp.net", FullName: "Bob"},
+			},
+		},
+	}
+	wa := &fakeSender{accounts: []string{"acct1"}}
+	svc := NewService(st, wa)
+
+	var prep struct {
+		Status    string `json:"status"`
+		Recipient struct {
+			JID  string `json:"jid"`
+			Name string `json:"name"`
+		} `json:"recipient"`
+	}
+	res := callJSON(t, svc, "prepare_send", map[string]any{
+		"recipient": "+1 (555) 111-2222",
+		"text":      "Hi via formatted phone",
+	}, &prep)
+	if res.IsError || prep.Status != "needs_confirmation" || prep.Recipient.JID != "999888@lid" || prep.Recipient.Name != "Alice" {
+		t.Fatalf("expected formatted phone match to Alice, got res=%+v prep=%+v", res, prep)
+	}
+}
+
+func TestPrepareSend_RawJIDServerValidation(t *testing.T) {
+	svc := NewService(&fakeStore{}, &fakeSender{accounts: []string{"acct1"}})
+
+	for _, validJID := range []string{
+		"15557778888@s.whatsapp.net",
+		"120363000999@g.us",
+		"123456@lid",
+	} {
+		var prep struct {
+			Status    string `json:"status"`
+			Recipient struct {
+				JID string `json:"jid"`
+			} `json:"recipient"`
+		}
+		res := callJSON(t, svc, "prepare_send", map[string]any{
+			"recipient": validJID,
+			"text":      "hello",
+		}, &prep)
+		if res.IsError || prep.Status != "needs_confirmation" || prep.Recipient.JID != validJID {
+			t.Fatalf("expected valid JID %q to resolve, got res=%+v prep=%+v", validJID, res, prep)
+		}
+	}
+
+	for _, invalidJID := range []string{
+		"alice@example.com",
+		"status@broadcast",
+		"12345@broadcast",
+	} {
+		res := callJSON(t, svc, "prepare_send", map[string]any{
+			"recipient": invalidJID,
+			"text":      "hello",
+		}, nil)
+		if !res.IsError {
+			t.Fatalf("expected error for unsupported JID server %q, got %+v", invalidJID, res)
+		}
 	}
 }
 

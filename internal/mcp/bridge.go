@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -58,7 +59,6 @@ type Bridge struct {
 
 	mu     sync.Mutex
 	srv    *http.Server
-	ln     net.Listener
 	token  string
 	active string
 }
@@ -139,7 +139,7 @@ func (b *Bridge) Start() error {
 		_ = ln.Close()
 		return fmt.Errorf("mcp: marshal bridge info: %w", err)
 	}
-	if err := os.WriteFile(infoPath, infoBytes, 0o600); err != nil {
+	if err := writeFileAtomic(infoPath, infoBytes, 0o600); err != nil {
 		_ = ln.Close()
 		return fmt.Errorf("mcp: write %s: %w", infoPath, err)
 	}
@@ -153,7 +153,6 @@ func (b *Bridge) Start() error {
 	}
 
 	b.srv = srv
-	b.ln = ln
 	b.token = token
 	b.active = infoPath
 
@@ -170,7 +169,6 @@ func (b *Bridge) Stop() error {
 	srv := b.srv
 	infoPath := b.active
 	b.srv = nil
-	b.ln = nil
 	b.token = ""
 	b.active = ""
 	b.mu.Unlock()
@@ -219,7 +217,7 @@ func (b *Bridge) handleRPC(token string) http.HandlerFunc {
 		}
 
 		id := req.ID
-		if len(id) == 0 {
+		if len(bytes.TrimSpace(id)) == 0 {
 			id = json.RawMessage("null")
 		}
 		if req.JSONRPC != "" && req.JSONRPC != "2.0" {
@@ -300,4 +298,35 @@ func authorizedBearer(header, token string) bool {
 func writeRPC(w http.ResponseWriter, resp RPCResponse) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	f, err := os.CreateTemp(filepath.Dir(path), ".mcp-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := f.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if err := f.Chmod(perm); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
 }

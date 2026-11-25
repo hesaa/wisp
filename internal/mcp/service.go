@@ -709,7 +709,7 @@ func (s *Service) resolveRecipient(accounts []string, recipient string) (directo
 		return directoryEntry{}, matches, nil
 	}
 
-	if parsed, err := types.ParseJID(recipient); err == nil && parsed.User != "" && parsed.Server != "" {
+	if parsed, err := types.ParseJID(recipient); err == nil && parsed.User != "" && isValidChatServer(parsed.Server) {
 		if len(accounts) == 1 {
 			jid := parsed.ToNonAD().String()
 			return directoryEntry{
@@ -776,6 +776,15 @@ func jidUser(jid string) string {
 	user, _, _ := strings.Cut(jid, "@")
 	user, _, _ = strings.Cut(user, ":")
 	return user
+}
+
+func isValidChatServer(server string) bool {
+	switch server {
+	case types.DefaultUserServer, types.GroupServer, types.HiddenUserServer:
+		return true
+	default:
+		return false
+	}
 }
 
 func entryType(jid string) string {

@@ -146,6 +146,17 @@ func TestAppMCPBridge_LifecycleAndAppLockIndependence(t *testing.T) {
 	if a.mcpBridge == nil {
 		t.Fatal("mcpBridge failed to restart")
 	}
+
+	// Transient ui.Setting error must preserve the running bridge.
+	db.Close()
+	a.syncMCPBridge()
+	if a.mcpBridge == nil {
+		t.Fatal("syncMCPBridge stopped running bridge on ui.Setting error")
+	}
+	if _, err := os.Stat(infoPath); err != nil {
+		t.Fatalf("info file %q missing after ui.Setting error: %v", infoPath, err)
+	}
+
 	a.stopMCPBridge()
 	if a.mcpBridge != nil {
 		t.Fatal("mcpBridge still set after stopMCPBridge")

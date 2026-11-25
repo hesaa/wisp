@@ -654,6 +654,7 @@ func (a *App) syncMCPBridge() {
 	v, err := ui.Setting(a.db, "", ui.KeyMCPEnabled)
 	if err != nil {
 		logErr("read setting "+ui.KeyMCPEnabled, err)
+		return
 	}
 	a.cfg[ui.KeyMCPEnabled] = v
 	if v == "true" {

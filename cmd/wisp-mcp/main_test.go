@@ -4,9 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"wa-go/internal/mcp"
 	"wa-go/internal/store"
@@ -154,4 +159,124 @@ func TestStdio_ToolsCallForwardsToBridge(t *testing.T) {
 	if !strings.Contains(string(rawRes), "acct-main") || !strings.Contains(string(rawRes), "acct-biz") {
 		t.Fatalf("expected bridge accounts in result, got %s", rawRes)
 	}
+}
+
+func writeTestBridgeInfo(t *testing.T, port int, token string) string {
+	t.Helper()
+	infoPath := filepath.Join(t.TempDir(), "mcp.json")
+	b, err := json.Marshal(mcp.BridgeInfo{Port: port, Token: token})
+	if err != nil {
+		t.Fatalf("marshal bridge info: %v", err)
+	}
+	if err := os.WriteFile(infoPath, b, 0o600); err != nil {
+		t.Fatalf("write bridge info: %v", err)
+	}
+	return infoPath
+}
+
+func TestStdio_BridgeTimeoutsAndNonOfflineErrors(t *testing.T) {
+	if bridgeClient.Timeout != 0 {
+		t.Fatalf("bridgeClient.Timeout = %v, want 0 (per-request context controls timeout)", bridgeClient.Timeout)
+	}
+	if toolsListTimeout != 5*time.Second {
+		t.Fatalf("toolsListTimeout = %v, want 5s", toolsListTimeout)
+	}
+	if toolsCallTimeout != 5*time.Minute {
+		t.Fatalf("toolsCallTimeout = %v, want 5m", toolsCallTimeout)
+	}
+
+	callInput := `{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"list_accounts","arguments":{}}}` + "\n"
+
+	callText := func(t *testing.T, infoPath string) string {
+		t.Helper()
+		var out bytes.Buffer
+		if err := serveStdio(strings.NewReader(callInput), &out, infoPath); err != nil {
+			t.Fatalf("serveStdio: %v", err)
+		}
+		msgs := decodeLines(t, out.String())
+		if len(msgs) != 1 {
+			t.Fatalf("expected 1 response, got %d", len(msgs))
+		}
+		res, ok := msgs[0]["result"].(map[string]any)
+		if !ok || res["isError"] != true {
+			t.Fatalf("expected tool error result, got %+v", msgs[0])
+		}
+		content, _ := res["content"].([]any)
+		if len(content) != 1 {
+			t.Fatalf("expected 1 content item, got %+v", res["content"])
+		}
+		item, _ := content[0].(map[string]any)
+		text, _ := item["text"].(string)
+		return text
+	}
+
+	t.Run("timeout", func(t *testing.T) {
+		origTimeout := toolsCallTimeout
+		toolsCallTimeout = 40 * time.Millisecond
+		t.Cleanup(func() { toolsCallTimeout = origTimeout })
+
+		done := make(chan struct{})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-r.Context().Done():
+			case <-done:
+			case <-time.After(2 * time.Second):
+			}
+		}))
+		t.Cleanup(func() {
+			close(done)
+			srv.Close()
+		})
+
+		port := srv.Listener.Addr().(*net.TCPAddr).Port
+		infoPath := writeTestBridgeInfo(t, port, "tok")
+		got := callText(t, infoPath)
+		if got != bridgeTimeoutMsg {
+			t.Fatalf("got %q, want %q", got, bridgeTimeoutMsg)
+		}
+	})
+
+	t.Run("http_500", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "boom", http.StatusInternalServerError)
+		}))
+		t.Cleanup(srv.Close)
+
+		port := srv.Listener.Addr().(*net.TCPAddr).Port
+		infoPath := writeTestBridgeInfo(t, port, "tok")
+		got := callText(t, infoPath)
+		if !strings.HasPrefix(got, "MCP bridge error: ") || !strings.Contains(got, "500") {
+			t.Fatalf("expected MCP bridge error with status 500, got %q", got)
+		}
+	})
+
+	t.Run("decode_error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("{not-json"))
+		}))
+		t.Cleanup(srv.Close)
+
+		port := srv.Listener.Addr().(*net.TCPAddr).Port
+		infoPath := writeTestBridgeInfo(t, port, "tok")
+		got := callText(t, infoPath)
+		if !strings.HasPrefix(got, "MCP bridge error: ") {
+			t.Fatalf("expected MCP bridge error on invalid JSON, got %q", got)
+		}
+	})
+
+	t.Run("dial_error_reports_offline", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		port := ln.Addr().(*net.TCPAddr).Port
+		_ = ln.Close()
+
+		infoPath := writeTestBridgeInfo(t, port, "tok")
+		got := callText(t, infoPath)
+		if got != wispOfflineMessage {
+			t.Fatalf("got %q, want %q", got, wispOfflineMessage)
+		}
+	})
 }

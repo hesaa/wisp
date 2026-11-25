@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -21,9 +22,14 @@ import (
 const (
 	mcpProtocolVersion = "2024-11-05"
 	wispOfflineMessage = "Wisp is not running or MCP is disabled"
+	bridgeTimeoutMsg   = "MCP bridge timed out; if you were sending a message or media, check Wisp before retrying"
 )
 
-var bridgeClient = &http.Client{Timeout: 30 * time.Second}
+var (
+	bridgeClient     = &http.Client{}
+	toolsListTimeout = 5 * time.Second
+	toolsCallTimeout = 5 * time.Minute
+)
 
 func main() {
 	infoPath, err := mcp.DefaultInfoPath()
@@ -104,7 +110,10 @@ func handleLine(ctx context.Context, line []byte, infoPath string) (mcp.RPCRespo
 		}, true
 
 	case "tools/list":
-		if resp, err := callBridge(ctx, infoPath, req); err == nil {
+		reqCtx, cancel := context.WithTimeout(ctx, toolsListTimeout)
+		resp, err := callBridge(reqCtx, infoPath, req)
+		cancel()
+		if err == nil {
 			resp.ID = req.ID
 			return resp, true
 		}
@@ -116,13 +125,15 @@ func handleLine(ctx context.Context, line []byte, infoPath string) (mcp.RPCRespo
 		}, true
 
 	case "tools/call":
-		resp, err := callBridge(ctx, infoPath, req)
+		reqCtx, cancel := context.WithTimeout(ctx, toolsCallTimeout)
+		resp, err := callBridge(reqCtx, infoPath, req)
+		cancel()
 		if err != nil {
 			return mcp.RPCResponse{
 				JSONRPC: "2.0",
 				ID:      req.ID,
 				Result: mcp.ToolResult{
-					Content: []mcp.TextContent{{Type: "text", Text: wispOfflineMessage}},
+					Content: []mcp.TextContent{{Type: "text", Text: formatBridgeError(err)}},
 					IsError: true,
 				},
 			}, true
@@ -180,4 +191,15 @@ func callBridge(ctx context.Context, infoPath string, req mcp.RPCRequest) (mcp.R
 		return mcp.RPCResponse{}, err
 	}
 	return rpcResp, nil
+}
+
+func formatBridgeError(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return bridgeTimeoutMsg
+	}
+	var opErr *net.OpError
+	if errors.Is(err, os.ErrNotExist) || (errors.As(err, &opErr) && opErr.Op == "dial") {
+		return wispOfflineMessage
+	}
+	return "MCP bridge error: " + err.Error()
 }
