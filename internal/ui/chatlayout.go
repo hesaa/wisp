@@ -245,17 +245,17 @@ func fitBox(w, h, side, maxW int) (int, int) {
 // bubble is one message's laid-out geometry in pixels: x from the view's left, y from the bubble's
 // top (box.Y is 0). Zero rectangles are parts it does not have.
 type bubble struct {
-	kind     bubbleKind
-	out      bool
-	named    bool      // shows the sender's name
-	avatar   bool      // group incoming message starting a run shows sender avatar
-	preview  bool      // MediaMeta has an embedded thumbnail
-	play     bool      // video or GIF preview
-	gifBadge bool      // GIF preview
-	info     mediaInfo // without preview bytes
-	box      walk.Rectangle
-	name     walk.Rectangle   // sender name, incoming group messages starting a run
-	text     walk.Rectangle   // body, caption or notice: widest line by lines × line height
+	kind       bubbleKind
+	out        bool
+	named      bool      // shows the sender's name
+	avatar     bool      // group incoming message starting a run shows sender avatar
+	preview    bool      // MediaMeta has an embedded thumbnail
+	play       bool      // video or GIF preview
+	gifBadge   bool      // GIF preview
+	info       mediaInfo // without preview bytes
+	box        walk.Rectangle
+	name       walk.Rectangle   // sender name, incoming group messages starting a run
+	text       walk.Rectangle   // body, caption or notice: widest line by lines × line height
 	units      []uint16         // the text, UTF-16
 	mentions   [][2]int         // UTF-16 spans of rewritten mentions
 	linkSpans  [][2]int         // UTF-16 spans of detected URLs

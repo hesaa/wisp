@@ -1067,10 +1067,10 @@ func TestBubbleInlineLinksAndPhonesWithFormatting(t *testing.T) {
 		t.Errorf("spanAt phone = (%v, %q, %v, %v)", kind, raw, sp, ok)
 	}
 	for _, miss := range [][2]int{
-		{b.text.X + 2, b.text.Y + 10},              // on "bold"
-		{b.text.X + 36*7 + 3, b.text.Y + 10},       // space between URL and phone
+		{b.text.X + 2, b.text.Y + 10},                // on "bold"
+		{b.text.X + 36*7 + 3, b.text.Y + 10},         // space between URL and phone
 		{b.text.X + b.text.Width + 5, b.text.Y + 10}, // past right edge
-		{b.text.X + 5*7 + 3, b.text.Y - 2},         // above text
+		{b.text.X + 5*7 + 3, b.text.Y - 2},           // above text
 	} {
 		if k, r, _, ok := spanAt(b, l.lineH, ms, miss[0], miss[1]); ok {
 			t.Errorf("spanAt(%d, %d) unexpectedly hit (%v, %q)", miss[0], miss[1], k, r)

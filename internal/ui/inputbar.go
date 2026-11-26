@@ -73,9 +73,9 @@ type InputBar struct {
 	linkThumbRaw                []byte
 	linkThumbGen                int
 	linkThumbBusy               bool
-	height                      int                // the bar's height, 1/96 inch
-	listH                       int                // the mention list's height, 1/96 inch; 0: hidden
-	canSend                     bool               // the box holds more than whitespace
+	height                      int  // the bar's height, 1/96 inch
+	listH                       int  // the mention list's height, 1/96 inch; 0: hidden
+	canSend                     bool // the box holds more than whitespace
 	gifs                        *giphy
 	gifKey                      func() string
 	popup                       *walk.Dialog                                       // the open popup, nil for none

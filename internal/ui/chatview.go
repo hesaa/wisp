@@ -244,9 +244,9 @@ func NewChatView(parent walk.Container, p theme.Palette, cache *media.Cache, sen
 		return nil, err
 	}
 	v := &ChatView{Composite: comp, pal: p, cache: cache, cdpi: canvasDPI(), autoFetch: true, linkPreviews: true,
-		lay:           chatLayout{linkPreviews: true},
-		anims:         map[string]*animation{}, still: map[string]bool{},
-		picked:        map[string]bool{}, requested: map[string]bool{}, thumbFiles: map[string]string{}, thumbBusy: map[string]bool{},
+		lay:   chatLayout{linkPreviews: true},
+		anims: map[string]*animation{}, still: map[string]bool{},
+		picked: map[string]bool{}, requested: map[string]bool{}, thumbFiles: map[string]string{}, thumbBusy: map[string]bool{},
 		linkRequested: map[string]bool{}, linkThumbBusy: map[string]bool{},
 		bitmaps: newLRU(thumbCacheSize, func(t thumbBitmap) {
 			if t.bmp != nil {

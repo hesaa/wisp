@@ -165,12 +165,12 @@ func (m *linkPopupModel) close() { m.closed = true }
 
 // linkPopup is the borderless themed dialog showing link or phone actions.
 type linkPopup struct {
-	dlg   *walk.Dialog
-	k     *kit
-	list  *walk.CustomWidget
-	model *linkPopupModel
-	hover int
-	esc   bool
+	dlg    *walk.Dialog
+	k      *kit
+	list   *walk.CustomWidget
+	model  *linkPopupModel
+	hover  int
+	esc    bool
 	picked *popupItem
 }
 
