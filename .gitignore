@@ -1,4 +1,5 @@
 .superpowers/
+.worktrees/
 *.exe
 *.exe~
 giphy.key
