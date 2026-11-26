@@ -4,8 +4,11 @@ import (
 	"slices"
 	"unicode"
 	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/lxn/walk"
+
+	"wa-go/internal/linkify"
 )
 
 // WhatsApp's text formatting: *bold*, _italic_, ~strikethrough~, `inline code` and ```monospace```
@@ -36,8 +39,8 @@ type fchar struct {
 }
 
 // formatText hides text's formatting markers. It returns the text shown, spans (UTF-16 spans of
-// text, the mentions) moved to match, and the style of each UTF-16 unit of the text shown, nil when
-// there was nothing to format.
+// text, such as mentions, links, and phones) moved to match, and the style of each UTF-16 unit
+// of the text shown, nil when there was nothing to format.
 func formatText(text string, spans [][2]int) (string, [][2]int, []walk.FontStyle) {
 	cs := make([]fchar, 0, len(text))
 	at := 0
@@ -93,6 +96,67 @@ func formatText(text string, spans [][2]int) (string, [][2]int, []walk.FontStyle
 		}
 	}
 	return string(out), kept, styles
+}
+
+// detectTextSpans detects non-mention URL and phone spans in s and converts their byte offsets to UTF-16 spans.
+func detectTextSpans(s string, mentions [][2]int) (links, phones [][2]int) {
+	detected := linkify.Detect(s)
+	if len(detected) == 0 {
+		return nil, nil
+	}
+	bi, ui := 0, 0
+	advanceTo := func(target int) int {
+		for bi < target && bi < len(s) {
+			r, sz := utf8.DecodeRuneInString(s[bi:])
+			bi += sz
+			ui += utf16.RuneLen(r)
+		}
+		return ui
+	}
+	overlapsMention := func(uStart, uEnd int) bool {
+		for _, m := range mentions {
+			if uStart < m[1] && uEnd > m[0] {
+				return true
+			}
+		}
+		return false
+	}
+	for _, sp := range detected {
+		uStart := advanceTo(sp.Start)
+		uEnd := advanceTo(sp.End)
+		if uEnd <= uStart || overlapsMention(uStart, uEnd) {
+			continue
+		}
+		uSpan := [2]int{uStart, uEnd}
+		switch sp.Kind {
+		case linkify.SpanURL:
+			links = append(links, uSpan)
+		case linkify.SpanPhone:
+			phones = append(phones, uSpan)
+		}
+	}
+	return links, phones
+}
+
+// formatBubbleText detects URL/phone spans in text, locks mentions+links+phones together through
+// formatText so markers never corrupt URLs/phones, and returns shifted UTF-16 spans separately.
+func formatBubbleText(text string, mentions [][2]int) (shown string, shiftedMentions, linkSpans, phoneSpans [][2]int, styles []walk.FontStyle) {
+	links, phones := detectTextSpans(text, mentions)
+	if len(links) == 0 && len(phones) == 0 {
+		shown, shiftedMentions, styles = formatText(text, mentions)
+		return shown, shiftedMentions, nil, nil, styles
+	}
+	all := make([][2]int, 0, len(mentions)+len(links)+len(phones))
+	all = append(all, mentions...)
+	all = append(all, links...)
+	all = append(all, phones...)
+	shown, shifted, styles := formatText(text, all)
+	if len(shifted) != len(all) {
+		return shown, mentions, links, phones, styles
+	}
+	mEnd := len(mentions)
+	lEnd := mEnd + len(links)
+	return shown, shifted[:mEnd], shifted[mEnd:lEnd], shifted[lEnd:], styles
 }
 
 // markBlocks styles the paragraphs of cs that start as a quote ("> ", hidden) or a list item ("* "

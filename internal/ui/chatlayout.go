@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -13,6 +14,7 @@ import (
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"google.golang.org/protobuf/proto"
 
+	"wa-go/internal/linkify"
 	"wa-go/internal/store"
 	"wa-go/internal/theme"
 	"wa-go/internal/ui/icons"
@@ -43,6 +45,13 @@ const (
 	quotePadL    = 10 // card text from the card's left edge, past the 3 px accent bar
 	quotePadR    = 8
 	quoteMaxLen  = 120 // runes of the original kept for the card's line
+
+	linkCardMinW  = 280
+	linkCardPadX  = 10
+	linkCardPadY  = 8
+	linkCardGap   = 6
+	linkThumbMinH = 80
+	linkThumbMaxH = 150
 
 	bodyPt, namePt, metaPt = 10, 9, 8
 )
@@ -247,10 +256,12 @@ type bubble struct {
 	box      walk.Rectangle
 	name     walk.Rectangle   // sender name, incoming group messages starting a run
 	text     walk.Rectangle   // body, caption or notice: widest line by lines × line height
-	units    []uint16         // the text, UTF-16
-	mentions [][2]int         // UTF-16 spans of rewritten mentions
-	styles   []walk.FontStyle // each unit's formatting (formatText), nil for none
-	indents  []int            // each line's indent in pixels (wrapBlocks), nil for none
+	units      []uint16         // the text, UTF-16
+	mentions   [][2]int         // UTF-16 spans of rewritten mentions
+	linkSpans  [][2]int         // UTF-16 spans of detected URLs
+	phoneSpans [][2]int         // UTF-16 spans of detected phone numbers
+	styles     []walk.FontStyle // each unit's formatting (formatText), nil for none
+	indents    []int            // each line's indent in pixels (wrapBlocks), nil for none
 	// an album (album.go): how many photos it shows, from this message on, whether each has an
 	// embedded preview, and their total size; hidden for the photos after the first
 	album        int
@@ -265,6 +276,10 @@ type bubble struct {
 	// a reply's card of the message it answers, above everything but the sender's name
 	quotedBox                   walk.Rectangle
 	quotedSender, quotedSnippet string
+	// link preview card, below quotedBox and above text; zero when absent or disabled
+	linkCard, linkThumb, linkTitle, linkDesc, linkDomain walk.Rectangle
+	linkTitleText, linkDescText, linkDomainText          string
+	linkTargetURL                                        string
 }
 
 // cardParts splits a media card into its type icon, title, size line and download button.
@@ -281,18 +296,21 @@ func cardParts(card walk.Rectangle, dpi int) (icon, title, sub, download walk.Re
 // chatLayout lays out a chat's messages and keeps each bubble, by message ID, until the width or
 // DPI changes or the message is forgotten, so text is measured once, not on every paint.
 type chatLayout struct {
-	dir        *Directory
-	group      bool                    // names the senders of incoming messages
-	senderName func(jid string) string // a sender's display name, "" when unknown; may be nil
-	width, dpi int                     // what the cache was laid out for
-	lineH      int                     // height of one line of body text
-	cache      map[string]bubble
-	tops       []int // each message's top, pixels from the top of the content
-	total      int   // content height
+	dir          *Directory
+	group        bool                    // names the senders of incoming messages
+	linkPreviews bool                    // render link preview cards in bubbles
+	senderName   func(jid string) string // a sender's display name, "" when unknown; may be nil
+	width, dpi   int                     // what the cache was laid out for
+	lineH        int                     // height of one line of body text
+	cache        map[string]bubble
+	tops         []int // each message's top, pixels from the top of the content
+	total        int   // content height
 }
 
 // reset drops everything, for another chat.
-func (l *chatLayout) reset() { *l = chatLayout{dir: l.dir, senderName: l.senderName} }
+func (l *chatLayout) reset() {
+	*l = chatLayout{dir: l.dir, senderName: l.senderName, linkPreviews: l.linkPreviews}
+}
 
 // forget drops a changed message's bubble, to be laid out again.
 func (l *chatLayout) forget(id string) { delete(l.cache, id) }
@@ -401,9 +419,10 @@ func (l *chatLayout) layout(m *store.Message, named bool, ms measurer, album []s
 	padX := s(bubblePadX)
 	text, spans, muted := bubbleText(m, info, l.dir)
 	if !muted {
-		text, spans, b.styles = formatText(text, spans)
+		text, b.mentions, b.linkSpans, b.phoneSpans, b.styles = formatBubbleText(text, spans)
+	} else {
+		b.mentions = spans
 	}
-	b.mentions = spans
 	style := walk.FontStyle(0)
 	if muted {
 		style = walk.FontItalic
@@ -470,35 +489,92 @@ func (l *chatLayout) layout(m *store.Message, named bool, ms measurer, album []s
 			y += s(bubblePadY)
 		}
 	}
-	metaY := y + s(2) // own row under media without a caption
+
+	var textW, textH int
+	var inline bool
 	if text != "" {
 		var x []int
 		b.units = utf16.Encode([]rune(text))
 		b.lines, b.indents, x = wrapBlocks(b.units, maxW-2*padX, b.styles, s, func(u []uint16) []int { return styledAdv(ms, u, b.styles, style) })
-		tw, th := 0, len(b.lines)*l.lineH
+		textH = len(b.lines) * l.lineH
 		for li, ln := range b.lines {
 			ind := lineIndent(b.indents, li)
-			tw = max(tw, ind+textWidth(b.units, x, []textLine{ln}, maxW-2*padX-ind))
+			textW = max(textW, ind+textWidth(b.units, x, []textLine{ln}, maxW-2*padX-ind))
 		}
-		b.text = walk.Rectangle{X: padX, Y: y, Width: tw, Height: th}
-		inline := len(b.lines) == 1 && tw+s(metaGap)+metaW <= maxW-2*padX
+		inline = len(b.lines) == 1 && textW+s(metaGap)+metaW <= maxW-2*padX
+		twWithMeta := textW
 		if inline {
-			metaY = y + th - s(metaH)
-			tw += s(metaGap) + metaW
-		} else {
-			metaY = y + th
+			twWithMeta += s(metaGap) + metaW
 		}
-		y = max(y+th, metaY+s(metaH))
-		boxW = max(boxW, tw+2*padX)
+		boxW = max(boxW, twWithMeta+2*padX)
+	}
+	boxW = max(boxW, nameW+2*padX, metaW+2*padX)
+	if m.QuotedID != "" && b.kind == kindText { // media keeps its width: the card's line is cut short instead
+		boxW = max(boxW, quoteW+2*padX)
+	}
+
+	hasLinkCard := b.kind == kindText && !muted && l.linkPreviews &&
+		(m.LinkTitle != "" || m.LinkDesc != "" || len(m.LinkThumb) > 0)
+	if hasLinkCard {
+		boxW = max(boxW, min(s(linkCardMinW)+2*s(bubbleInset), maxW))
+		if !named && m.QuotedID == "" {
+			y = s(bubbleInset)
+		}
+		cw := max(1, boxW-2*s(bubbleInset))
+		cy := y
+		if len(m.LinkThumb) > 0 {
+			th := min(s(linkThumbMaxH), max(s(linkThumbMinH), cw*9/16))
+			b.linkThumb = walk.Rectangle{X: s(bubbleInset), Y: cy, Width: cw, Height: th}
+			cy += th
+		}
+		tx := s(bubbleInset) + s(linkCardPadX)
+		tw := max(1, cw-2*s(linkCardPadX))
+		cy += s(linkCardPadY)
+		b.linkTitleText = singleLineSpace(m.LinkTitle)
+		b.linkDescText = singleLineSpace(m.LinkDesc)
+		b.linkTargetURL = cmp.Or(m.LinkURL, m.LinkCanonical, linkify.FirstURL(m.Body))
+		b.linkDomainText = linkify.DisplayDomain(cmp.Or(m.LinkCanonical, m.LinkURL, b.linkTargetURL))
+		if b.linkTitleText != "" {
+			_, l1 := ms.measure("M", namePt, walk.FontBold, 1<<20)
+			_, th := ms.measure(b.linkTitleText, namePt, walk.FontBold, tw)
+			th = min(th, 2*l1)
+			b.linkTitle = walk.Rectangle{X: tx, Y: cy, Width: tw, Height: th}
+			cy += th + s(2)
+		}
+		if b.linkDescText != "" {
+			_, d1 := ms.measure("M", metaPt, 0, 1<<20)
+			_, dh := ms.measure(b.linkDescText, metaPt, 0, tw)
+			dh = min(dh, 2*d1)
+			b.linkDesc = walk.Rectangle{X: tx, Y: cy, Width: tw, Height: dh}
+			cy += dh + s(2)
+		}
+		if b.linkDomainText != "" {
+			_, domH := ms.measure("M", metaPt, 0, 1<<20)
+			b.linkDomain = walk.Rectangle{X: tx, Y: cy, Width: tw, Height: domH}
+			cy += domH
+		}
+		cy += s(linkCardPadY)
+		b.linkCard = walk.Rectangle{X: s(bubbleInset), Y: y, Width: cw, Height: cy - y}
+		y = cy
+		if text != "" {
+			y += s(linkCardGap)
+		}
+	}
+
+	metaY := y + s(2) // own row under media without a caption
+	if text != "" {
+		b.text = walk.Rectangle{X: padX, Y: y, Width: textW, Height: textH}
+		if inline {
+			metaY = y + textH - s(metaH)
+		} else {
+			metaY = y + textH
+		}
+		y = max(y+textH, metaY+s(metaH))
 	} else {
 		y = metaY + s(metaH)
 	}
 	y += s(bubblePadY)
-	boxW = max(boxW, nameW+2*padX, metaW+2*padX)
 	if m.QuotedID != "" {
-		if b.kind == kindText { // media keeps its width: the card's line is cut short instead
-			boxW = max(boxW, quoteW+2*padX)
-		}
 		b.quotedBox.Width = boxW - 2*padX
 	}
 	if named {
@@ -519,12 +595,142 @@ func (l *chatLayout) layout(m *store.Message, named bool, ms measurer, album []s
 	if m.FromMe {
 		b.box.X = l.width - s(bubbleEdge) - boxW
 	}
-	for _, r := range []*walk.Rectangle{&b.name, &b.text, &b.thumb, &b.card, &b.time, &b.ticks, &b.quotedBox} {
+	for _, r := range []*walk.Rectangle{&b.name, &b.text, &b.thumb, &b.card, &b.time, &b.ticks, &b.quotedBox,
+		&b.linkCard, &b.linkThumb, &b.linkTitle, &b.linkDesc, &b.linkDomain} {
 		if r.Width > 0 {
 			r.X += b.box.X
 		}
 	}
 	return b
+}
+
+func singleLineSpace(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// spanAt returns the link or phone span at (x, y) (x in view coords, y relative to bubble top).
+func spanAt(b bubble, lineH int, ms measurer, x, y int) (kind linkify.SpanKind, raw string, span [2]int, ok bool) {
+	if b.text.Width <= 0 || b.text.Height <= 0 || lineH <= 0 || (len(b.linkSpans) == 0 && len(b.phoneSpans) == 0) {
+		return 0, "", [2]int{}, false
+	}
+	if !in(b.text, x, y) {
+		return 0, "", [2]int{}, false
+	}
+	li := (y - b.text.Y) / lineH
+	if li < 0 || li >= len(b.lines) {
+		return 0, "", [2]int{}, false
+	}
+	ln := b.lines[li]
+	lineUnits := b.units[ln.start:ln.end]
+	if len(lineUnits) == 0 {
+		return 0, "", [2]int{}, false
+	}
+	lx := x - (b.text.X + lineIndent(b.indents, li))
+	if lx < 0 {
+		return 0, "", [2]int{}, false
+	}
+	adv := lineAdv(ms, lineUnits, lineStyles(b, ln), 0)
+	if len(adv) == 0 || lx >= adv[len(adv)-1] {
+		return 0, "", [2]int{}, false
+	}
+	j := sort.Search(len(adv), func(k int) bool { return adv[k] > lx })
+	if j >= len(adv) {
+		return 0, "", [2]int{}, false
+	}
+	off := ln.start + j
+	for _, sp := range b.linkSpans {
+		if off >= sp[0] && off < sp[1] {
+			return linkify.SpanURL, string(utf16.Decode(b.units[sp[0]:sp[1]])), sp, true
+		}
+	}
+	for _, sp := range b.phoneSpans {
+		if off >= sp[0] && off < sp[1] {
+			return linkify.SpanPhone, string(utf16.Decode(b.units[sp[0]:sp[1]])), sp, true
+		}
+	}
+	return 0, "", [2]int{}, false
+}
+
+type spanTarget struct {
+	kind linkify.SpanKind
+	raw  string
+	span [2]int
+	card bool
+}
+
+// spanPress tracks a left-button press on a clickable link/phone span or linkCard to distinguish
+// a click from a text-selection drag.
+type spanPress struct {
+	active  bool
+	dragged bool
+	msgID   string
+	target  spanTarget
+	downX   int
+	downY   int
+}
+
+func withinDragThreshold(x0, y0, x1, y1, dx, dy int) bool {
+	return abs(x1-x0) <= max(1, dx) && abs(y1-y0) <= max(1, dy)
+}
+
+func (p *spanPress) beginSpan(msgID string, b bubble, lineH int, ms measurer, x, y int) bool {
+	kind, raw, sp, ok := spanAt(b, lineH, ms, x, y)
+	if !ok {
+		*p = spanPress{}
+		return false
+	}
+	*p = spanPress{
+		active: true,
+		msgID:  msgID,
+		target: spanTarget{kind: kind, raw: raw, span: sp},
+		downX:  x,
+		downY:  y,
+	}
+	return true
+}
+
+func (p *spanPress) beginCard(msgID string, b bubble, x, y int) bool {
+	if b.linkCard.Width <= 0 || !in(b.linkCard, x, y) || b.linkTargetURL == "" {
+		*p = spanPress{}
+		return false
+	}
+	*p = spanPress{
+		active: true,
+		msgID:  msgID,
+		target: spanTarget{kind: linkify.SpanURL, raw: b.linkTargetURL, card: true},
+		downX:  x,
+		downY:  y,
+	}
+	return true
+}
+
+func (p *spanPress) moved(x, y, dragX, dragY int) bool {
+	if !p.active {
+		return false
+	}
+	if !p.dragged && !withinDragThreshold(p.downX, p.downY, x, y, dragX, dragY) {
+		p.dragged = true
+	}
+	return p.dragged
+}
+
+func (p *spanPress) finish(b bubble, lineH int, ms measurer, x, y, dragX, dragY int, hasSel bool) (spanTarget, bool) {
+	cur := *p
+	*p = spanPress{}
+	if !cur.active || cur.dragged || hasSel || !withinDragThreshold(cur.downX, cur.downY, x, y, dragX, dragY) {
+		return spanTarget{}, false
+	}
+	if cur.target.card {
+		if b.linkCard.Width <= 0 || !in(b.linkCard, x, y) || b.linkTargetURL == "" {
+			return spanTarget{}, false
+		}
+		return cur.target, true
+	}
+	kind, raw, sp, ok := spanAt(b, lineH, ms, x, y)
+	if !ok || kind != cur.target.kind || sp != cur.target.span || raw != cur.target.raw {
+		return spanTarget{}, false
+	}
+	return cur.target, true
 }
 
 // shouldLoadPrevious decides whether a view scrolled to off (pixels from the top) asks for the
@@ -593,9 +799,25 @@ func (l *lru[V]) put(k string, v V) {
 }
 
 func (l *lru[V]) clear() {
+	if l == nil {
+		return
+	}
 	for _, k := range l.keys {
 		l.evict(l.vals[k])
 	}
 	l.keys = l.keys[:0]
 	clear(l.vals)
+}
+
+func (l *lru[V]) del(k string) {
+	if l == nil {
+		return
+	}
+	if v, ok := l.vals[k]; ok {
+		l.evict(v)
+		delete(l.vals, k)
+		if i := slices.Index(l.keys, k); i >= 0 {
+			l.keys = slices.Delete(l.keys, i, i+1)
+		}
+	}
 }
