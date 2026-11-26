@@ -797,8 +797,7 @@ func toStoreMessage(id string, info types.MessageInfo, m *waE2E.Message) (msg st
 			etm.GetDescription() != "" || len(etm.GetJPEGThumbnail()) > 0
 		if hasPreview {
 			msg.LinkURL = cmp.Or(etm.GetMatchedText(), linkify.FirstURL(etm.GetText()))
-			msg.LinkTitle = etm.GetTitle()
-			msg.LinkDesc = etm.GetDescription()
+			msg.LinkTitle, msg.LinkDesc = linkify.SanitizePreview(etm.GetTitle(), etm.GetDescription())
 			if thumb := etm.GetJPEGThumbnail(); len(thumb) > 0 {
 				msg.LinkThumb = slices.Clone(thumb)
 			}

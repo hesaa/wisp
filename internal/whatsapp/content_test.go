@@ -3,14 +3,17 @@ package whatsapp
 import (
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 
+	"wa-go/internal/linkify"
 	"wa-go/internal/store"
 )
 
@@ -151,6 +154,25 @@ func TestToStoreMessageExtractsLinkPreview(t *testing.T) {
 	if got.LinkURL != "https://example.com" || got.LinkTitle != "Example Domain" ||
 		got.LinkDesc != "Summary text" || !bytes.Equal(got.LinkThumb, thumb) {
 		t.Fatalf("got link fields = (%q, %q, %q, %x)", got.LinkURL, got.LinkTitle, got.LinkDesc, got.LinkThumb)
+	}
+
+	// Sender-controlled title/description are sanitized and clamped at extraction.
+	hostile := &waE2E.Message{
+		ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+			Text:        proto.String("see https://x.example"),
+			Title:       proto.String("Bad\xff\n\n  title" + strings.Repeat("t", 5000)),
+			Description: proto.String(strings.Repeat("d ", 5000)),
+		},
+	}
+	got, ok, err = toStoreMessage(acctA, info, hostile)
+	if err != nil || !ok {
+		t.Fatalf("toStoreMessage(hostile): ok=%v err=%v", ok, err)
+	}
+	if !strings.HasPrefix(got.LinkTitle, "Bad� title") || !utf8.ValidString(got.LinkTitle) ||
+		utf8.RuneCountInString(got.LinkTitle) > linkify.MaxPreviewTitleRunes ||
+		utf8.RuneCountInString(got.LinkDesc) > linkify.MaxPreviewDescRunes {
+		t.Fatalf("hostile preview not sanitized: title %d runes %q..., desc %d runes",
+			utf8.RuneCountInString(got.LinkTitle), got.LinkTitle[:min(len(got.LinkTitle), 20)], utf8.RuneCountInString(got.LinkDesc))
 	}
 
 	// Falls back LinkURL to linkify.FirstURL when MatchedText is empty.

@@ -26,6 +26,7 @@ import (
 	"golang.org/x/net/html"
 	"golang.org/x/net/proxy"
 
+	"wa-go/internal/linkify"
 	"wa-go/internal/whatsapp"
 )
 
@@ -280,10 +281,8 @@ func (f *Fetcher) Fetch(ctx context.Context, rawURL string) (Result, error) {
 		finalURL = resp.Request.URL
 	}
 
-	res := Result{
-		Title:       meta.title(),
-		Description: meta.description(),
-	}
+	var res Result
+	res.Title, res.Description = linkify.SanitizePreview(meta.title(), meta.description())
 	if canonical := resolveHTTPURL(finalURL, meta.ogURL); canonical != "" {
 		res.CanonicalURL = canonical
 	} else {

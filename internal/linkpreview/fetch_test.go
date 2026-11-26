@@ -16,6 +16,9 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"unicode/utf8"
+
+	"wa-go/internal/linkify"
 )
 
 func makeTestPNG(w, h int) []byte {
@@ -579,5 +582,26 @@ func TestNonCanonicalIPv4AndBlockedRanges(t *testing.T) {
 		if ip := parseIPLiteral(host); ip != nil {
 			t.Errorf("parseIPLiteral(%q) = %s, want nil", host, ip)
 		}
+	}
+}
+
+func TestFetchSanitizesTitleAndDescription(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, `<html><head><meta property="og:title" content="A
+	   B%s"><meta property="og:description" content="%s"></head></html>`,
+			strings.Repeat("t", 10000), strings.Repeat("d\xff ", 10000))
+	}))
+	defer srv.Close()
+
+	res, err := newTestFetcher(t).Fetch(context.Background(), srv.URL)
+	if err != nil || !res.Found {
+		t.Fatalf("Fetch: found=%v err=%v", res.Found, err)
+	}
+	if !strings.HasPrefix(res.Title, "A Bttt") || utf8.RuneCountInString(res.Title) > linkify.MaxPreviewTitleRunes {
+		t.Fatalf("Title not collapsed/clamped: %d runes, prefix %q", utf8.RuneCountInString(res.Title), res.Title[:10])
+	}
+	if !utf8.ValidString(res.Description) || utf8.RuneCountInString(res.Description) > linkify.MaxPreviewDescRunes {
+		t.Fatalf("Description not valid/clamped: %d runes", utf8.RuneCountInString(res.Description))
 	}
 }
