@@ -118,3 +118,27 @@ func TestWrapBlocksIndents(t *testing.T) {
 		t.Errorf("list indents %v, want %v", indents, want)
 	}
 }
+
+func TestFormatBubbleTextDropsStaleSpansOnMismatch(t *testing.T) {
+	// Normal case: formatting strips markers and shifts link/phone spans cleanly.
+	shown, mentions, links, phones, _ := formatBubbleText("*bold* https://example.com/foo_bar +62 812-3456-7890", nil)
+	if shown != "bold https://example.com/foo_bar +62 812-3456-7890" {
+		t.Fatalf("shown = %q", shown)
+	}
+	if len(mentions) != 0 || len(links) != 1 || len(phones) != 1 {
+		t.Fatalf("unexpected span counts: m=%v l=%v p=%v", mentions, links, phones)
+	}
+	if links[0] != [2]int{5, 32} || phones[0] != [2]int{33, 50} {
+		t.Errorf("shifted spans = links:%v phones:%v", links, phones)
+	}
+
+	// If an invalid/out-of-range mention span causes formatText to drop an entry so len(shifted) != len(all),
+	// formatBubbleText must return nil spans rather than stale unshifted offsets.
+	shown, mentions, links, phones, _ = formatBubbleText("*bold* https://example.com", [][2]int{{100, 105}})
+	if shown != "bold https://example.com" {
+		t.Fatalf("shown = %q", shown)
+	}
+	if mentions != nil || links != nil || phones != nil {
+		t.Errorf("expected nil spans on length mismatch, got m=%v l=%v p=%v", mentions, links, phones)
+	}
+}

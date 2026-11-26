@@ -152,7 +152,7 @@ func formatBubbleText(text string, mentions [][2]int) (shown string, shiftedMent
 	all = append(all, phones...)
 	shown, shifted, styles := formatText(text, all)
 	if len(shifted) != len(all) {
-		return shown, mentions, links, phones, styles
+		return shown, nil, nil, nil, styles
 	}
 	mEnd := len(mentions)
 	lEnd := mEnd + len(links)

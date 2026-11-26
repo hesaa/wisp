@@ -107,3 +107,52 @@ func TestPlacePopupAtPointStaysInWorkArea(t *testing.T) {
 		t.Errorf("edge placement escaped work area: %+v", edge)
 	}
 }
+
+func TestLinkPopupRowHighlightSuppressesDualSelection(t *testing.T) {
+	items := []popupItem{
+		{label: "Open link"},
+		{label: "Copy link"},
+	}
+
+	// Hovering row 1 while keyboard cursor is on row 0 highlights only row 1.
+	if rowHighlighted(0, items[0], 1, 0) {
+		t.Error("row 0 remained highlighted while hovering row 1")
+	}
+	if !rowHighlighted(1, items[1], 1, 0) {
+		t.Error("hovered row 1 was not highlighted")
+	}
+
+	// When no row is hovered (hover == -1), keyboard cursor row is highlighted.
+	if !rowHighlighted(0, items[0], -1, 0) || rowHighlighted(1, items[1], -1, 0) {
+		t.Error("keyboard cursor row highlight failed when hover == -1")
+	}
+
+	// Disabled items are never highlighted even if hovered or selected.
+	disabled := popupItem{label: "Checking WhatsApp...", disabled: true}
+	if rowHighlighted(0, disabled, 0, 0) || rowHighlighted(0, disabled, -1, 0) {
+		t.Error("disabled item was highlighted")
+	}
+}
+
+func TestDispatchUIMarshalsOffThread(t *testing.T) {
+	ranDirect := false
+	synced := false
+	dispatchUI(true, func(f func()) { synced = true; f() }, func() { ranDirect = true })
+	if !ranDirect || synced {
+		t.Errorf("sameThread=true: ranDirect=%v synced=%v, want true/false", ranDirect, synced)
+	}
+
+	ranViaSync := false
+	synced = false
+	dispatchUI(false, func(f func()) { synced = true; f() }, func() { ranViaSync = true })
+	if !synced || !ranViaSync {
+		t.Errorf("sameThread=false: synced=%v ranViaSync=%v, want true/true", synced, ranViaSync)
+	}
+
+	// nil widget safely runs inline without panicking
+	ranNil := false
+	runOnUI(nil, func() { ranNil = true })
+	if !ranNil {
+		t.Error("runOnUI(nil) did not execute callback")
+	}
+}

@@ -345,7 +345,9 @@ func (v *ChatView) OnNeedLinkPreview(fn func(m store.Message)) { v.onNeedLinkPre
 // OnOpenLink sets the handler called when the user chooses Open link from a link popup or menu.
 func (v *ChatView) OnOpenLink(fn func(url string)) { v.onOpenLink = fn }
 
-// OnCheckPhone sets the handler called when a phone popup checks whether raw is on WhatsApp.
+// OnCheckPhone sets the handler called on the UI thread when a phone popup checks whether raw is on
+// WhatsApp. Callers should invoke done on the UI thread; done also safely marshals onto the UI
+// thread via Synchronize if invoked from a background goroutine.
 func (v *ChatView) OnCheckPhone(fn func(raw string, done func(registered bool, display, jid string))) {
 	v.onCheckPhone = fn
 }
@@ -1231,6 +1233,26 @@ func (v *ChatView) mouseUp(x, y int, b walk.MouseButton) {
 	v.showSpanPopup(target, walk.Point{X: int(pt.X), Y: int(pt.Y)})
 }
 
+func dispatchUI(sameThread bool, sync func(func()), fn func()) {
+	if sameThread || sync == nil {
+		fn()
+		return
+	}
+	sync(fn)
+}
+
+func runOnUI(w *walk.CustomWidget, fn func()) {
+	if w == nil {
+		fn()
+		return
+	}
+	if w.IsDisposed() {
+		return
+	}
+	h := w.Handle()
+	dispatchUI(h != 0 && win.GetWindowThreadProcessId(h, nil) == windows.GetCurrentThreadId(), w.Synchronize, fn)
+}
+
 func (v *ChatView) showSpanPopup(target spanTarget, screenPt walk.Point) {
 	v.DismissPopup()
 	owner := v.canvas.Form()
@@ -1252,7 +1274,9 @@ func (v *ChatView) showSpanPopup(target spanTarget, screenPt walk.Point) {
 	if target.kind == linkify.SpanPhone {
 		if v.onCheckPhone != nil {
 			v.onCheckPhone(target.raw, func(registered bool, display, jid string) {
-				lp.updatePhoneCheck(registered, display, jid)
+				runOnUI(v.canvas, func() {
+					lp.updatePhoneCheck(registered, display, jid)
+				})
 			})
 		} else {
 			lp.updatePhoneCheck(false, "", "")

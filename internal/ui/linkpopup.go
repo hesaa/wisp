@@ -301,7 +301,7 @@ func placePopupAtPoint(pt walk.Point, size walk.Size, work walk.Rectangle) walk.
 }
 
 func (lp *linkPopup) updatePhoneCheck(registered bool, display, jid string) {
-	if lp.model.closed || lp.dlg.IsDisposed() {
+	if lp == nil || lp.model == nil || lp.model.closed || lp.dlg == nil || lp.dlg.IsDisposed() {
 		return
 	}
 	if !lp.model.applyPhoneCheck(registered, display, jid) {
@@ -380,6 +380,18 @@ func (lp *linkPopup) hit(_, y int) func() {
 	}
 }
 
+// rowHighlighted reports whether popup row i should paint as highlighted: mouse hover takes
+// precedence over the keyboard cursor so hovering another row never leaves two rows highlighted.
+func rowHighlighted(i int, it popupItem, hover, cur int) bool {
+	if it.disabled {
+		return false
+	}
+	if hover >= 0 {
+		return i == hover
+	}
+	return i == cur
+}
+
 func (lp *linkPopup) paint(c *walk.Canvas, _ walk.Rectangle) error {
 	p := lp.k.pal
 	b, dpi := lp.list.ClientBoundsPixels(), lp.list.DPI()
@@ -391,12 +403,10 @@ func (lp *linkPopup) paint(c *walk.Canvas, _ walk.Rectangle) error {
 	if err := c.FillRectanglePixels(bg, b); err != nil {
 		return err
 	}
-	focused := focusCues(lp.list)
 	var errs []error
 	for i, it := range lp.model.items {
 		row := walk.Rectangle{X: s(4), Y: s(popupPadY) + i*s(popupRowH), Width: b.Width - s(8), Height: s(popupRowH)}
-		selected := !it.disabled && (i == lp.hover || (lp.hover < 0 && i == lp.model.cur) || (focused && i == lp.model.cur))
-		if selected {
+		if rowHighlighted(i, it, lp.hover, lp.model.cur) {
 			errs = append(errs, icons.FillRounded(c, row, s(6), theme.Color(p.Header)))
 		}
 		fg := theme.Color(p.Text)
