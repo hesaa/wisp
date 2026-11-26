@@ -75,7 +75,7 @@ func detectURLs(s string) []Span {
 		end := i + prefixLen
 		for end < len(s) {
 			b := s[end]
-			if b <= 0x20 || b == 0x7f || b == '<' || b == '>' || b == '"' || b == '`' {
+			if b <= 0x20 || b == 0x7f || b == '<' || b == '>' || b == '"' || b == '\'' || b == '`' {
 				break
 			}
 			if b >= utf8.RuneSelf {
@@ -124,7 +124,7 @@ func trimURLTrailing(s string, start, end int) int {
 	for end > start {
 		last := s[end-1]
 		switch last {
-		case '.', ',', ';', ':', '!', '?':
+		case '.', ',', ';', ':', '!', '?', '*', '_', '~': // sentence punctuation and *bold*/_italic_/~strike~ markers
 			end--
 		case ')', ']', '}':
 			open, closeCh := matchingBracket(last)
@@ -470,4 +470,24 @@ var threeDigitCallingCodes = map[string]bool{
 	"960": true, "961": true, "962": true, "963": true, "964": true, "965": true, "966": true, "967": true, "968": true,
 	"970": true, "971": true, "972": true, "973": true, "974": true, "975": true, "976": true, "977": true, "979": true,
 	"991": true, "992": true, "993": true, "994": true, "995": true, "996": true, "998": true,
+}
+
+// Preview text limits: enough for a 2-line card, small enough for SQLite, proto and GDI measuring.
+const (
+	MaxPreviewTitleRunes = 200
+	MaxPreviewDescRunes  = 400
+)
+
+// SanitizePreview makes untrusted link preview title/description safe to store, send and
+// measure: valid UTF-8, whitespace runs collapsed to one space, and clamped in length.
+func SanitizePreview(title, desc string) (string, string) {
+	return cleanPreviewText(title, MaxPreviewTitleRunes), cleanPreviewText(desc, MaxPreviewDescRunes)
+}
+
+func cleanPreviewText(s string, maxRunes int) string {
+	s = strings.Join(strings.Fields(strings.ToValidUTF8(s, "\uFFFD")), " ")
+	if utf8.RuneCountInString(s) > maxRunes {
+		s = strings.TrimSpace(string([]rune(s)[:maxRunes]))
+	}
+	return s
 }

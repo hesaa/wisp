@@ -2,7 +2,9 @@ package linkify
 
 import (
 	"reflect"
+	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestDetectURLsAndPhones(t *testing.T) {
@@ -80,6 +82,22 @@ func TestDetectOrderingAndEdgeCases(t *testing.T) {
 			in:   `"<https://example.com/path>"`,
 			want: []Span{
 				{Kind: SpanURL, Start: 2, End: 26, Text: "https://example.com/path"},
+			},
+		},
+		{
+			name: "single quote terminates url",
+			in:   "'https://example.com/a'b",
+			want: []Span{
+				{Kind: SpanURL, Start: 1, End: 22, Text: "https://example.com/a"},
+			},
+		},
+		{
+			name: "trailing formatting markers stripped",
+			in:   "*https://x.com* _https://y.com/p_ ~https://z.com~.",
+			want: []Span{
+				{Kind: SpanURL, Start: 1, End: 14, Text: "https://x.com"},
+				{Kind: SpanURL, Start: 17, End: 32, Text: "https://y.com/p"},
+				{Kind: SpanURL, Start: 35, End: 48, Text: "https://z.com"},
 			},
 		},
 		{
@@ -208,5 +226,22 @@ func TestDisplayDomain(t *testing.T) {
 		if got := DisplayDomain(tc.raw); got != tc.want {
 			t.Fatalf("DisplayDomain(%q) = %q, want %q", tc.raw, got, tc.want)
 		}
+	}
+}
+
+func TestSanitizePreview(t *testing.T) {
+	title, desc := SanitizePreview("  Hello\n\t world\xff  ", strings.Repeat("é", 1000))
+	if title != "Hello world\uFFFD" {
+		t.Fatalf("title = %q", title)
+	}
+	if !utf8.ValidString(desc) || utf8.RuneCountInString(desc) != MaxPreviewDescRunes {
+		t.Fatalf("desc runes = %d, valid = %v", utf8.RuneCountInString(desc), utf8.ValidString(desc))
+	}
+	long, _ := SanitizePreview(strings.Repeat("a ", 500), "")
+	if n := utf8.RuneCountInString(long); n == 0 || n > MaxPreviewTitleRunes {
+		t.Fatalf("title runes = %d, want 1..%d", n, MaxPreviewTitleRunes)
+	}
+	if strings.HasSuffix(long, " ") {
+		t.Fatalf("clamped title has trailing space: %q", long)
 	}
 }
