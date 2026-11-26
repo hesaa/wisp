@@ -65,6 +65,10 @@ type fakeClient struct {
 	picErr      map[types.JID]error
 	userInfo    map[types.JID]types.UserInfo
 	userInfoErr error
+	isOnWAMu    sync.Mutex
+	isOnWAResp  map[string]types.IsOnWhatsAppResponse
+	isOnWAErr   error
+	isOnWACalls [][]string
 }
 
 func (f *fakeClient) GetGroupInfo(_ context.Context, jid types.JID) (*types.GroupInfo, error) {
@@ -106,6 +110,26 @@ func (f *fakeClient) GetUserInfo(_ context.Context, jids []types.JID) (map[types
 			if u, ok := f.userInfo[j]; ok {
 				out[j] = u
 			}
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeClient) IsOnWhatsApp(_ context.Context, phones []string) ([]types.IsOnWhatsAppResponse, error) {
+	f.isOnWAMu.Lock()
+	f.isOnWACalls = append(f.isOnWACalls, slices.Clone(phones))
+	err := f.isOnWAErr
+	respMap := f.isOnWAResp
+	f.isOnWAMu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]types.IsOnWhatsAppResponse, 0, len(phones))
+	for _, p := range phones {
+		if r, ok := respMap[p]; ok {
+			out = append(out, r)
+		} else {
+			out = append(out, types.IsOnWhatsAppResponse{Query: p, IsIn: false})
 		}
 	}
 	return out, nil
@@ -469,6 +493,14 @@ func TestUnknownAccountIsAnError(t *testing.T) {
 		"PrivacySettings": func() error { _, err := m.PrivacySettings(ctx, "nope"); return err },
 		"SetDefaultDisappearingTimer": func() error {
 			return m.SetDefaultDisappearingTimer(ctx, "nope", 24*time.Hour)
+		},
+		"SendTextWithPreview": func() error {
+			_, err := m.SendTextWithPreview(ctx, "nope", alice.String(), "x", nil, nil, &LinkPreview{Title: "t"})
+			return err
+		},
+		"CheckPhones": func() error {
+			_, err := m.CheckPhones(ctx, "nope", []string{"+6283333333333"})
+			return err
 		},
 	}
 	for name, op := range ops {
@@ -1543,5 +1575,138 @@ func TestQuotedSenderIsStoredAsThePhoneNumber(t *testing.T) {
 	}
 	if sent.QuotedSender != alice.String() {
 		t.Fatalf("own reply stored with quoted sender %q", sent.QuotedSender)
+	}
+}
+
+func TestSendTextWithPreview(t *testing.T) {
+	m, db := newTestManager(t)
+	fa := &fakeClient{}
+	m.add(acctA, fa)
+
+	thumb := []byte{0xff, 0xd8, 0xff, 0xe0}
+	preview := &LinkPreview{
+		MatchedText:  "https://example.com",
+		CanonicalURL: "https://example.com/canonical",
+		Title:        "Example Title",
+		Description:  "Example Desc",
+		Thumb:        thumb,
+	}
+	reply := &store.Message{ID: "in1", SenderJID: alice.String(), Type: TypeText, Body: "hi"}
+	sent, err := m.SendTextWithPreview(ctx, acctA, alice.String(), "visit https://example.com", reply, []string{alice.String()}, preview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fa.sent) != 1 {
+		t.Fatalf("sent count = %d, want 1", len(fa.sent))
+	}
+	etm := fa.sent[0].GetExtendedTextMessage()
+	if etm == nil {
+		t.Fatalf("expected ExtendedTextMessage, got %v", fa.sent[0])
+	}
+	if etm.GetText() != "visit https://example.com" ||
+		etm.GetMatchedText() != "https://example.com" ||
+		etm.GetTitle() != "Example Title" ||
+		etm.GetDescription() != "Example Desc" ||
+		!slices.Equal(etm.GetJPEGThumbnail(), thumb) ||
+		etm.GetPreviewType() != waE2E.ExtendedTextMessage_NONE {
+		t.Fatalf("unexpected ExtendedTextMessage fields: %+v", etm)
+	}
+	if ci := etm.GetContextInfo(); ci.GetStanzaID() != "in1" || !slices.Equal(ci.GetMentionedJID(), []string{alice.String()}) {
+		t.Fatalf("unexpected ContextInfo: %+v", ci)
+	}
+	if sent.LinkURL != "https://example.com" ||
+		sent.LinkCanonical != "https://example.com/canonical" ||
+		sent.LinkTitle != "Example Title" ||
+		sent.LinkDesc != "Example Desc" ||
+		!slices.Equal(sent.LinkThumb, thumb) {
+		t.Fatalf("stored sent message lost link preview: %+v", sent)
+	}
+	stored, ok, err := db.GetMessage(acctA, alice.String(), sent.ID)
+	if err != nil || !ok {
+		t.Fatalf("GetMessage: ok=%v err=%v", ok, err)
+	}
+	if stored.LinkURL != "https://example.com" ||
+		stored.LinkCanonical != "https://example.com/canonical" ||
+		stored.LinkTitle != "Example Title" ||
+		stored.LinkDesc != "Example Desc" ||
+		!slices.Equal(stored.LinkThumb, thumb) {
+		t.Fatalf("db message lost link preview: %+v", stored)
+	}
+
+	// nil preview keeps plain Conversation when no context info is needed.
+	if _, err := m.SendTextWithPreview(ctx, acctA, alice.String(), "plain", nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if fa.sent[1].GetConversation() != "plain" || fa.sent[1].GetExtendedTextMessage() != nil {
+		t.Fatalf("nil preview should send plain Conversation, got %v", fa.sent[1])
+	}
+}
+
+func TestCheckPhonesCachesSessionResults(t *testing.T) {
+	m, _ := newTestManager(t)
+	lid := types.NewJID("1234567890", types.HiddenUserServer)
+	bob := types.NewJID("6284444444444", types.DefaultUserServer)
+	fa := &fakeClient{
+		isOnWAResp: map[string]types.IsOnWhatsAppResponse{
+			"+6283333333333": {Query: "+6283333333333", IsIn: true, JID: alice},
+			"+6289999999999": {Query: "+6289999999999", IsIn: false},
+			"+6284444444444": {Query: "+6284444444444", IsIn: true, JID: lid, PhoneNumber: bob},
+		},
+	}
+	fb := &fakeClient{
+		isOnWAResp: map[string]types.IsOnWhatsAppResponse{
+			"+6283333333333": {Query: "+6283333333333", IsIn: false},
+		},
+	}
+	m.add(acctA, fa)
+	m.add(acctB, fb)
+
+	got, err := m.CheckPhones(ctx, acctA, []string{"+6283333333333", "+6289999999999", "+6284444444444"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["+6283333333333"] != (PhoneStatus{Registered: true, JID: alice.String()}) {
+		t.Fatalf("+6283333333333 = %+v", got["+6283333333333"])
+	}
+	if got["+6289999999999"] != (PhoneStatus{Registered: false}) {
+		t.Fatalf("+6289999999999 = %+v", got["+6289999999999"])
+	}
+	if got["+6284444444444"] != (PhoneStatus{Registered: true, JID: bob.String()}) {
+		t.Fatalf("+6284444444444 (LID+PN) = %+v, want %s", got["+6284444444444"], bob)
+	}
+	if len(fa.isOnWACalls) != 1 {
+		t.Fatalf("IsOnWhatsApp calls = %d, want 1", len(fa.isOnWACalls))
+	}
+
+	// Second lookup for cached numbers must not call IsOnWhatsApp again.
+	got2, err := m.CheckPhones(ctx, acctA, []string{"+6283333333333", "+6289999999999"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got2["+6283333333333"] != (PhoneStatus{Registered: true, JID: alice.String()}) ||
+		got2["+6289999999999"] != (PhoneStatus{Registered: false}) {
+		t.Fatalf("cached lookup = %+v", got2)
+	}
+	if len(fa.isOnWACalls) != 1 {
+		t.Fatalf("IsOnWhatsApp calls after cache hit = %d, want 1", len(fa.isOnWACalls))
+	}
+
+	// Cache is scoped per account.
+	gotB, err := m.CheckPhones(ctx, acctB, []string{"+6283333333333"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotB["+6283333333333"] != (PhoneStatus{Registered: false}) || len(fb.isOnWACalls) != 1 {
+		t.Fatalf("acctB lookup = %+v (calls=%d)", gotB, len(fb.isOnWACalls))
+	}
+
+	// Transient errors are not cached.
+	fa.isOnWAErr = errors.New("network down")
+	if _, err := m.CheckPhones(ctx, acctA, []string{"+6285555555555"}); err == nil {
+		t.Fatal("expected error when IsOnWhatsApp fails")
+	}
+	fa.isOnWAErr = nil
+	if got3, err := m.CheckPhones(ctx, acctA, []string{"+6285555555555"}); err != nil || got3["+6285555555555"].Registered {
+		t.Fatalf("retry after error = %+v, err=%v", got3, err)
 	}
 }

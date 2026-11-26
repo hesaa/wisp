@@ -29,6 +29,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
+	"wa-go/internal/linkify"
 	"wa-go/internal/store"
 )
 
@@ -70,6 +71,7 @@ type waClient interface {
 	GetGroupInfo(ctx context.Context, jid types.JID) (*types.GroupInfo, error)
 	GetProfilePictureInfo(ctx context.Context, jid types.JID, params *whatsmeow.GetProfilePictureParams) (*types.ProfilePictureInfo, error)
 	GetUserInfo(ctx context.Context, jids []types.JID) (map[types.JID]types.UserInfo, error)
+	IsOnWhatsApp(ctx context.Context, phones []string) ([]types.IsOnWhatsAppResponse, error)
 }
 
 // liveClient adds the device-store lookups to a real client.
@@ -788,6 +790,18 @@ func toStoreMessage(id string, info types.MessageInfo, m *waE2E.Message) (msg st
 	if media != nil {
 		if msg.MediaMeta, err = proto.Marshal(media); err != nil {
 			return msg, false, fmt.Errorf("whatsapp: marshal media of %s: %w", msg.ID, err)
+		}
+	}
+	if etm := m.GetExtendedTextMessage(); etm != nil {
+		hasPreview := etm.GetMatchedText() != "" || etm.GetTitle() != "" ||
+			etm.GetDescription() != "" || len(etm.GetJPEGThumbnail()) > 0
+		if hasPreview {
+			msg.LinkURL = cmp.Or(etm.GetMatchedText(), linkify.FirstURL(etm.GetText()))
+			msg.LinkTitle = etm.GetTitle()
+			msg.LinkDesc = etm.GetDescription()
+			if thumb := etm.GetJPEGThumbnail(); len(thumb) > 0 {
+				msg.LinkThumb = slices.Clone(thumb)
+			}
 		}
 	}
 	return msg, true, nil

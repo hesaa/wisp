@@ -1,6 +1,7 @@
 package whatsapp
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"time"
@@ -118,5 +119,67 @@ func TestRefetchUnsupportedRunsOncePerAccount(t *testing.T) {
 	m.refetchUnsupported(ctx, acctA, pc, 0)
 	if len(pc.asked) != 1 || pc.asked[0].anchor.Chat.String() != alice.String() {
 		t.Fatalf("asked %+v", pc.asked)
+	}
+}
+
+func TestToStoreMessageExtractsLinkPreview(t *testing.T) {
+	info := types.MessageInfo{
+		MessageSource: types.MessageSource{Chat: alice, Sender: alice},
+		ID:            "m-link-1",
+		Timestamp:     time.Unix(1700000000, 0),
+	}
+	thumb := []byte{0xff, 0xd8, 0xff, 0xe0}
+
+	// Full ExtendedTextMessage preview metadata (wrapped in EphemeralMessage to verify unwrap).
+	wrapped := &waE2E.Message{
+		EphemeralMessage: &waE2E.FutureProofMessage{
+			Message: &waE2E.Message{
+				ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+					Text:          proto.String("check https://example.com"),
+					MatchedText:   proto.String("https://example.com"),
+					Title:         proto.String("Example Domain"),
+					Description:   proto.String("Summary text"),
+					JPEGThumbnail: thumb,
+				},
+			},
+		},
+	}
+	got, ok, err := toStoreMessage(acctA, info, wrapped)
+	if err != nil || !ok {
+		t.Fatalf("toStoreMessage(wrapped): ok=%v err=%v", ok, err)
+	}
+	if got.LinkURL != "https://example.com" || got.LinkTitle != "Example Domain" ||
+		got.LinkDesc != "Summary text" || !bytes.Equal(got.LinkThumb, thumb) {
+		t.Fatalf("got link fields = (%q, %q, %q, %x)", got.LinkURL, got.LinkTitle, got.LinkDesc, got.LinkThumb)
+	}
+
+	// Falls back LinkURL to linkify.FirstURL when MatchedText is empty.
+	noMatched := &waE2E.Message{
+		ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+			Text:  proto.String("see https://fallback.dev/path for details"),
+			Title: proto.String("Fallback Title"),
+		},
+	}
+	got, ok, err = toStoreMessage(acctA, info, noMatched)
+	if err != nil || !ok {
+		t.Fatalf("toStoreMessage(noMatched): ok=%v err=%v", ok, err)
+	}
+	if got.LinkURL != "https://fallback.dev/path" || got.LinkTitle != "Fallback Title" {
+		t.Fatalf("fallback LinkURL = %q, Title = %q", got.LinkURL, got.LinkTitle)
+	}
+
+	// Plain ExtendedTextMessage (e.g. reply with URL in text) without preview metadata leaves Link* empty.
+	plainReply := &waE2E.Message{
+		ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+			Text:        proto.String("replying about https://plain.example"),
+			ContextInfo: &waE2E.ContextInfo{StanzaID: proto.String("q1")},
+		},
+	}
+	got, ok, err = toStoreMessage(acctA, info, plainReply)
+	if err != nil || !ok {
+		t.Fatalf("toStoreMessage(plainReply): ok=%v err=%v", ok, err)
+	}
+	if got.LinkURL != "" || got.LinkTitle != "" || got.LinkDesc != "" || len(got.LinkThumb) != 0 {
+		t.Fatalf("expected empty Link* for non-preview ExtendedTextMessage, got %+v", got)
 	}
 }
