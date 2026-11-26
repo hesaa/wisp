@@ -7,10 +7,12 @@ import (
 	"cmp"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -31,6 +33,7 @@ const (
 	maxHistoryLimit     = 100
 	defaultSearchLimit  = 50
 	maxSearchLimit      = 200
+	maxImageBytes       = 5 << 20 // MCP clients (Claude) reject larger images
 	confirmTTL          = 5 * time.Minute
 	statusBroadcastJID  = "status@broadcast"
 )
@@ -40,6 +43,7 @@ type Store interface {
 	ListChats(accountID string) ([]store.Chat, error)
 	People(accountID string) ([]store.Person, error)
 	GetChatMessages(accountID, chatJID string, page int) ([]store.Message, error)
+	GetMessage(accountID, chatJID, id string) (store.Message, bool, error)
 }
 
 // Sender is the subset of *whatsapp.Manager consumed by the MCP service.
@@ -47,6 +51,7 @@ type Sender interface {
 	Accounts() []string
 	SendText(ctx context.Context, accountID, chatJID, text string, reply *store.Message, mentions []string) (store.Message, error)
 	SendMedia(ctx context.Context, accountID, chatJID, path, caption string, reply *store.Message) (store.Message, error)
+	DownloadMedia(ctx context.Context, msg store.Message) (string, error)
 }
 
 var (
@@ -61,10 +66,13 @@ type ToolDef struct {
 	InputSchema any    `json:"inputSchema"`
 }
 
-// TextContent is one text block inside a ToolResult.
+// TextContent is one content block inside a ToolResult: Type "text" uses Text, Type "image" uses
+// Data (base64) and MimeType.
 type TextContent struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	Data     string `json:"data,omitempty"`
+	MimeType string `json:"mimeType,omitempty"`
 }
 
 // ToolResult is the MCP tools/call response payload.
@@ -157,6 +165,28 @@ func (s *Service) Tools() []ToolDef {
 			},
 		},
 		{
+			Name:        "view_image",
+			Description: "View the image or sticker of a WhatsApp message (message id from get_chat_history). Downloads it if not cached yet.",
+			InputSchema: map[string]any{
+				"type":     "object",
+				"required": []string{"chat_jid", "message_id"},
+				"properties": map[string]any{
+					"chat_jid": map[string]any{
+						"type":        "string",
+						"description": "Chat or group JID the message belongs to.",
+					},
+					"message_id": map[string]any{
+						"type":        "string",
+						"description": "Message ID as returned by get_chat_history.",
+					},
+					"account": map[string]any{
+						"type":        "string",
+						"description": "Optional WhatsApp account ID. Required if multiple accounts share the chat.",
+					},
+				},
+			},
+		},
+		{
 			Name:        "prepare_send",
 			Description: "Stage a text or media message for sending. Resolves recipient and returns a short-lived confirm_token or an ambiguous candidate list without sending.",
 			InputSchema: map[string]any{
@@ -212,6 +242,8 @@ func (s *Service) CallTool(ctx context.Context, name string, args json.RawMessag
 		return s.callSearchChatsAndContacts(args), nil
 	case "get_chat_history":
 		return s.callGetChatHistory(args), nil
+	case "view_image":
+		return s.callViewImage(ctx, args), nil
 	case "prepare_send":
 		return s.callPrepareSend(args), nil
 	case "confirm_send":
@@ -373,6 +405,62 @@ func (s *Service) callGetChatHistory(raw json.RawMessage) ToolResult {
 		"order":    "newest_first",
 		"messages": out,
 	})
+}
+
+func (s *Service) callViewImage(ctx context.Context, raw json.RawMessage) ToolResult {
+	var args struct {
+		ChatJID   string `json:"chat_jid"`
+		MessageID string `json:"message_id"`
+		Account   string `json:"account"`
+	}
+	if err := unmarshalArgs(raw, &args); err != nil {
+		return errResult("invalid arguments: " + err.Error())
+	}
+	chatJID, msgID := strings.TrimSpace(args.ChatJID), strings.TrimSpace(args.MessageID)
+	if chatJID == "" || msgID == "" {
+		return errResult("chat_jid and message_id are required")
+	}
+	account, err := s.resolveAccountForChat(args.Account, chatJID)
+	if err != nil {
+		return errResult(err.Error())
+	}
+	m, ok, err := s.st.GetMessage(account, chatJID, msgID)
+	if err != nil {
+		return errResult(fmt.Sprintf("load message: %v", err))
+	}
+	if !ok {
+		return errResult(fmt.Sprintf("message %q not found in %s", msgID, chatJID))
+	}
+	if m.Type != whatsapp.TypeImage && m.Type != whatsapp.TypeSticker {
+		return errResult(fmt.Sprintf("message %q is %q, not an image or sticker", msgID, m.Type))
+	}
+	path := m.MediaPath
+	if _, statErr := os.Stat(path); path == "" || statErr != nil {
+		if path, err = s.wa.DownloadMedia(ctx, m); err != nil {
+			return errResult(fmt.Sprintf("download image: %v", err))
+		}
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return errResult(fmt.Sprintf("read image: %v", err))
+	}
+	if info.Size() > maxImageBytes {
+		return errResult(fmt.Sprintf("image is %d bytes, over the %d byte limit", info.Size(), maxImageBytes))
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return errResult(fmt.Sprintf("read image: %v", err))
+	}
+	_, mimeType, caption := extractMediaMeta(m)
+	if mimeType == "" {
+		mimeType = http.DetectContentType(data)
+	}
+	mimeType, _, _ = strings.Cut(mimeType, ";")
+	content := []TextContent{{Type: "image", Data: base64.StdEncoding.EncodeToString(data), MimeType: mimeType}}
+	if caption != "" {
+		content = append(content, TextContent{Type: "text", Text: "Caption: " + caption})
+	}
+	return ToolResult{Content: content}
 }
 
 func (s *Service) callPrepareSend(raw json.RawMessage) ToolResult {

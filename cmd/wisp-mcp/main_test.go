@@ -19,9 +19,12 @@ import (
 
 type stubStore struct{}
 
-func (stubStore) ListChats(string) ([]store.Chat, error)               { return nil, nil }
-func (stubStore) People(string) ([]store.Person, error)                { return nil, nil }
+func (stubStore) ListChats(string) ([]store.Chat, error)                       { return nil, nil }
+func (stubStore) People(string) ([]store.Person, error)                        { return nil, nil }
 func (stubStore) GetChatMessages(string, string, int) ([]store.Message, error) { return nil, nil }
+func (stubStore) GetMessage(string, string, string) (store.Message, bool, error) {
+	return store.Message{}, false, nil
+}
 
 type stubSender struct {
 	accounts []string
@@ -31,6 +34,8 @@ func (s stubSender) Accounts() []string { return s.accounts }
 func (stubSender) SendText(context.Context, string, string, string, *store.Message, []string) (store.Message, error) {
 	return store.Message{}, nil
 }
+func (stubSender) DownloadMedia(context.Context, store.Message) (string, error) { return "", nil }
+
 func (stubSender) SendMedia(context.Context, string, string, string, string, *store.Message) (store.Message, error) {
 	return store.Message{}, nil
 }

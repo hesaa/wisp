@@ -48,6 +48,15 @@ func (f *fakeStore) GetChatMessages(accountID, chatJID string, page int) ([]stor
 	return slices.Clone(msgs[start:end]), nil
 }
 
+func (f *fakeStore) GetMessage(accountID, chatJID, id string) (store.Message, bool, error) {
+	for _, m := range f.messages[accountID][chatJID] {
+		if m.ID == id {
+			return m, true, nil
+		}
+	}
+	return store.Message{}, false, nil
+}
+
 type sendTextCall struct {
 	accountID string
 	chatJID   string
@@ -66,6 +75,14 @@ type fakeSender struct {
 	textCalls  []sendTextCall
 	mediaCalls []sendMediaCall
 	sendErr    error
+	downloaded string // path DownloadMedia returns
+}
+
+func (f *fakeSender) DownloadMedia(_ context.Context, msg store.Message) (string, error) {
+	if f.downloaded == "" {
+		return "", os.ErrNotExist
+	}
+	return f.downloaded, nil
 }
 
 func (f *fakeSender) Accounts() []string {
@@ -130,8 +147,8 @@ func callJSON(t *testing.T, svc *Service, name string, args any, out any) ToolRe
 
 func TestListAccounts(t *testing.T) {
 	svc := NewService(&fakeStore{}, &fakeSender{accounts: []string{"15550001", "15550002"}})
-	if len(svc.Tools()) != 5 {
-		t.Fatalf("got %d tools, want 5", len(svc.Tools()))
+	if len(svc.Tools()) != 6 {
+		t.Fatalf("got %d tools, want 6", len(svc.Tools()))
 	}
 	var out struct {
 		Accounts []string `json:"accounts"`
@@ -652,5 +669,40 @@ func TestCallTool_UnknownTool(t *testing.T) {
 	res, err := svc.CallTool(context.Background(), "no_such_tool", nil)
 	if err == nil || !res.IsError {
 		t.Fatalf("expected error and IsError=true for unknown tool, got res=%+v err=%v", res, err)
+	}
+}
+
+func TestViewImage(t *testing.T) {
+	dir := t.TempDir()
+	cached := filepath.Join(dir, "cached.png")
+	fresh := filepath.Join(dir, "fresh.jpg")
+	os.WriteFile(cached, []byte("\x89PNG\r\n\x1a\nfake"), 0o600)
+	os.WriteFile(fresh, []byte("\xff\xd8\xff\xe0fake"), 0o600)
+	imgMeta, _ := proto.Marshal(&waE2E.ImageMessage{Mimetype: proto.String("image/png"), Caption: proto.String("chart")})
+
+	chatJID := "15551112222@s.whatsapp.net"
+	st := &fakeStore{messages: map[string]map[string][]store.Message{"acct1": {chatJID: {
+		{ID: "cached", Type: "image", MediaPath: cached, MediaMeta: imgMeta},
+		{ID: "remote", Type: "image", MediaPath: filepath.Join(dir, "gone.jpg")},
+		{ID: "txt", Type: "text", Body: "hi"},
+	}}}}
+	wa := &fakeSender{accounts: []string{"acct1"}, downloaded: fresh}
+	svc := NewService(st, wa)
+	call := func(id string) ToolResult {
+		return callJSON(t, svc, "view_image", map[string]any{"chat_jid": chatJID, "message_id": id}, nil)
+	}
+
+	res := call("cached")
+	if res.IsError || len(res.Content) != 2 || res.Content[0].Type != "image" || res.Content[0].MimeType != "image/png" ||
+		res.Content[0].Data != "iVBORw0KGgpmYWtl" || res.Content[1].Text != "Caption: chart" {
+		t.Fatalf("cached: %+v", res)
+	}
+	if res := call("remote"); res.IsError || len(res.Content) != 1 || res.Content[0].MimeType != "image/jpeg" {
+		t.Fatalf("remote (downloaded): %+v", res)
+	}
+	for _, id := range []string{"txt", "missing"} {
+		if res := call(id); !res.IsError {
+			t.Fatalf("%s: expected error, got %+v", id, res)
+		}
 	}
 }
