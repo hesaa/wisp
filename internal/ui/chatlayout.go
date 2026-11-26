@@ -532,7 +532,10 @@ func (l *chatLayout) layout(m *store.Message, named bool, ms measurer, album []s
 		cy += s(linkCardPadY)
 		b.linkTitleText = singleLineSpace(m.LinkTitle)
 		b.linkDescText = singleLineSpace(m.LinkDesc)
-		b.linkTargetURL = cmp.Or(m.LinkURL, m.LinkCanonical, linkify.FirstURL(m.Body))
+		b.linkTargetURL = linkify.FirstURL(m.Body) // the sender's MatchedText only when the body shows it
+		if m.LinkURL != "" && linkInBody(m.Body, m.LinkURL) {
+			b.linkTargetURL = m.LinkURL
+		}
 		b.linkDomainText = linkify.DisplayDomain(cmp.Or(m.LinkCanonical, m.LinkURL, b.linkTargetURL))
 		if b.linkTitleText != "" {
 			_, l1 := ms.measure("M", namePt, walk.FontBold, 1<<20)
@@ -606,6 +609,12 @@ func (l *chatLayout) layout(m *store.Message, named bool, ms measurer, album []s
 
 func singleLineSpace(s string) string {
 	return strings.Join(strings.Fields(s), " ")
+}
+
+// linkInBody reports whether link appears in body (ignoring case, so a bare-domain MatchedText
+// counts): a preview's link is trusted as a click target only when the reader can see it.
+func linkInBody(body, link string) bool {
+	return strings.Contains(strings.ToLower(body), strings.ToLower(link))
 }
 
 // spanAt returns the link or phone span at (x, y) (x in view coords, y relative to bubble top).

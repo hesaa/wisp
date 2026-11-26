@@ -201,7 +201,7 @@ func (m *chatModel) upsert(msg store.Message) bool {
 		if msg.MediaPath == "" {
 			msg.MediaPath = m.msgs[i].MediaPath
 		}
-		if msg.LinkTitle == "" && msg.LinkDesc == "" && len(msg.LinkThumb) == 0 {
+		if msg.LinkTitle == "" && msg.LinkDesc == "" && len(msg.LinkThumb) == 0 && msg.Body == m.msgs[i].Body {
 			msg.LinkURL = cmp.Or(msg.LinkURL, m.msgs[i].LinkURL)
 			msg.LinkCanonical = cmp.Or(msg.LinkCanonical, m.msgs[i].LinkCanonical)
 			msg.LinkTitle = m.msgs[i].LinkTitle
@@ -373,6 +373,13 @@ func (v *ChatView) SetLinkPreviews(enabled bool) {
 	}
 }
 
+// RetryLinkPreviews asks again for the previews of messages in view that still have none: the app
+// declines requests while the window is hidden or locked, and settle asks only once per message.
+func (v *ChatView) RetryLinkPreviews() {
+	clear(v.linkRequested)
+	v.settle()
+}
+
 // ApplyLinkPreview updates message msgID with fetched link preview metadata and repaints.
 func (v *ChatView) ApplyLinkPreview(msgID string, url, canonical, title, desc string, thumb []byte) {
 	i := v.index(msgID)
@@ -380,6 +387,9 @@ func (v *ChatView) ApplyLinkPreview(msgID string, url, canonical, title, desc st
 		return
 	}
 	m := &v.msgs[i]
+	if url != "" && !linkInBody(m.Body, url) {
+		return // the message was edited while its preview was fetched
+	}
 	if m.LinkURL == cmp.Or(url, m.LinkURL) && m.LinkCanonical == cmp.Or(canonical, m.LinkCanonical) &&
 		m.LinkTitle == title && m.LinkDesc == desc && bytes.Equal(m.LinkThumb, thumb) {
 		return
@@ -538,10 +548,10 @@ func (v *ChatView) NoMoreHistory(accountID, chatJID string) {
 // the end. Other chats' messages are ignored, and so are unknown ones older than the loaded messages
 // while older pages remain: they come with their page.
 func (v *ChatView) Upsert(msg store.Message) {
-	old := ""
+	old, oldBody := "", msg.Body
 	var oldThumb []byte
 	if i := v.index(msg.ID); i >= 0 {
-		old = v.msgs[i].MediaPath
+		old, oldBody = v.msgs[i].MediaPath, v.msgs[i].Body
 		oldThumb = v.msgs[i].LinkThumb
 	}
 	if !v.upsert(msg) {
@@ -550,7 +560,10 @@ func (v *ChatView) Upsert(msg store.Message) {
 	if msg.MediaPath != "" && msg.MediaPath != old {
 		delete(v.thumbFiles, msg.ID) // made from the old download
 	}
-	if i := v.index(msg.ID); i >= 0 && !bytes.Equal(oldThumb, v.msgs[i].LinkThumb) {
+	if msg.Body != oldBody {
+		delete(v.linkRequested, msg.ID) // an edit may bring a new link to preview
+	}
+	if i := v.index(msg.ID); i >= 0 && (msg.Body != oldBody || !bytes.Equal(oldThumb, v.msgs[i].LinkThumb)) {
 		v.linkBitmaps.del(msg.ID)
 		delete(v.linkThumbBusy, msg.ID)
 	}
@@ -883,7 +896,8 @@ func (v *ChatView) linkThumbFor(m *store.Message, w, h int) *walk.Bitmap {
 	if v.linkThumbBusy[m.ID] {
 		return nil
 	}
-	v.linkThumbBusy[m.ID] = true
+	id := m.ID // m points into v.msgs, which an upsert may shift before the decode ends
+	v.linkThumbBusy[id] = true
 	gen := v.gen
 	raw := slices.Clone(m.LinkThumb)
 	go func() {
@@ -894,13 +908,16 @@ func (v *ChatView) linkThumbFor(m *store.Message, w, h int) *walk.Bitmap {
 			if gen != v.gen || v.canvas.IsDisposed() {
 				return
 			}
-			delete(v.linkThumbBusy, m.ID)
+			if i := v.index(id); i < 0 || !bytes.Equal(v.msgs[i].LinkThumb, raw) {
+				return // the preview changed while decoding; the new one is decoded on its own
+			}
+			delete(v.linkThumbBusy, id)
 			var bmp *walk.Bitmap
 			if err == nil {
 				bmp, err = walk.NewBitmapFromImageForDPI(img, v.canvas.DPI())
 			}
-			logErr("link thumbnail of message "+m.ID, err)
-			v.linkBitmaps.put(m.ID, thumbBitmap{bmp: bmp, w: w, h: h})
+			logErr("link thumbnail of message "+id, err)
+			v.linkBitmaps.put(id, thumbBitmap{bmp: bmp, w: w, h: h})
 			logErr("chat repaint", v.canvas.Invalidate())
 		})
 	}()

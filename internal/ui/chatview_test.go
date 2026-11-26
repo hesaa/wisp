@@ -1250,3 +1250,89 @@ func TestApplyLinkPreviewAndUpsertPreservation(t *testing.T) {
 		t.Errorf("messageLinkPhoneSpans = urls=%v phones=%v", urls, phones)
 	}
 }
+
+func TestLinkCardTargetMustBeInBody(t *testing.T) {
+	msgs := []store.Message{
+		{ID: "spoof", Type: "text", Body: "see https://good.example/a", SenderJID: alice,
+			LinkURL: "https://evil.example/", LinkTitle: "Good"},
+		{ID: "bare", Type: "text", Body: "visit Example.com/x today", SenderJID: alice,
+			LinkURL: "example.com/x", LinkTitle: "Bare"},
+		{ID: "none", Type: "text", Body: "no link here", SenderJID: alice,
+			LinkURL: "https://evil.example/", LinkCanonical: "https://evil.example/c", LinkTitle: "Evil"},
+	}
+	l := &chatLayout{linkPreviews: true}
+	l.update(msgs, viewW, 96, &monoMeasurer{})
+
+	if got := l.cache["spoof"].linkTargetURL; got != "https://good.example/a" {
+		t.Errorf("spoofed MatchedText: target %q, want the body's URL", got)
+	}
+	if urls, _ := messageLinkPhoneSpans(l.cache["spoof"]); slices.Contains(urls, "https://evil.example/") {
+		t.Errorf("context menu offers a URL not in the body: %v", urls)
+	}
+	if got := l.cache["bare"].linkTargetURL; got != "example.com/x" {
+		t.Errorf("bare-domain MatchedText in body: target %q, want it kept", got)
+	}
+	b := l.cache["none"]
+	if b.linkTargetURL != "" {
+		t.Errorf("no URL in body: target %q, want none", b.linkTargetURL)
+	}
+	if b.linkCard.Width == 0 {
+		t.Fatal("the card is still shown")
+	}
+	if (&spanPress{}).beginCard("none", b, b.linkCard.X+1, b.linkCard.Y+1) {
+		t.Error("a card with no target in the body must not be clickable")
+	}
+	if urls, _ := messageLinkPhoneSpans(b); len(urls) != 0 {
+		t.Errorf("context menu offers %v for a body without links", urls)
+	}
+}
+
+func TestUpsertDropsLinkPreviewWhenBodyChanges(t *testing.T) {
+	v := &ChatView{
+		linkPreviews:  true,
+		lay:           chatLayout{linkPreviews: true},
+		linkRequested: map[string]bool{},
+		linkThumbBusy: map[string]bool{},
+		linkBitmaps:   newLRU(thumbCacheSize, func(thumbBitmap) {}),
+	}
+	orig := store.Message{ID: "m1", AccountID: acctA, ChatJID: alice, Type: "text", Body: "see https://old.example",
+		Timestamp: 10, LinkURL: "https://old.example", LinkTitle: "Old", LinkThumb: []byte{1}}
+	v.open(acctA, alice, []store.Message{orig})
+
+	edited := orig
+	edited.Body, edited.LinkURL, edited.LinkTitle, edited.LinkThumb = "see https://new.example", "", "", nil
+	v.upsert(edited)
+	if got := v.msgs[0]; got.LinkURL != "" || got.LinkTitle != "" || len(got.LinkThumb) != 0 {
+		t.Fatalf("edit kept the old preview: %+v", got)
+	}
+
+	// A late preview for the old URL must not land on the edited body.
+	v.ApplyLinkPreview("m1", "https://old.example", "", "Old", "", nil)
+	if got := v.msgs[0]; got.LinkTitle != "" {
+		t.Fatalf("stale preview applied to edited message: %+v", got)
+	}
+
+	revoked := edited
+	revoked.Body, revoked.Type = "", "revoked"
+	v.upsert(revoked)
+	if got := v.msgs[0]; got.LinkTitle != "" || got.LinkURL != "" {
+		t.Fatalf("revoke kept preview data: %+v", got)
+	}
+}
+
+func TestRetryLinkPreviewsForgetsDeclinedRequests(t *testing.T) {
+	v := &ChatView{
+		linkPreviews:  true,
+		lay:           chatLayout{linkPreviews: true},
+		linkRequested: map[string]bool{},
+		linkThumbBusy: map[string]bool{},
+		linkBitmaps:   newLRU(thumbCacheSize, func(thumbBitmap) {}),
+	}
+	m := store.Message{ID: "m1", AccountID: acctA, ChatJID: alice, Type: "text", Body: "see https://example.com", Timestamp: 1}
+	v.open(acctA, alice, []store.Message{m})
+	v.linkRequested[m.ID] = true // asked while hidden; the app declined
+	v.RetryLinkPreviews()
+	if !needLinkPreviewOnSight(m, v.linkPreviews, v.linkRequested) {
+		t.Fatal("after RetryLinkPreviews a message still lacking a preview is asked for again")
+	}
+}
