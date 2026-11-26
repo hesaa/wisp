@@ -3,6 +3,7 @@ package linkpreview
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"image"
@@ -15,6 +16,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -399,12 +401,87 @@ func validateTargetURL(u *url.URL, proxied bool, checkIP func(net.IP) bool) erro
 }
 
 func parseIPLiteral(host string) net.IP {
-	addr, err := netip.ParseAddr(host)
-	if err != nil {
+	if addr, err := netip.ParseAddr(host); err == nil {
+		addr = addr.Unmap().WithZone("")
+		return net.IP(addr.AsSlice())
+	}
+	return parseNonCanonicalIPv4(host)
+}
+
+// parseNonCanonicalIPv4 parses integer, hex, octal, and shorthand IPv4 notations
+// (e.g. 2130706433, 0x7f000001, 0177.0.0.1, 127.1) following inet_aton / WHATWG rules.
+func parseNonCanonicalIPv4(host string) net.IP {
+	h := strings.TrimSuffix(host, ".")
+	if h == "" {
 		return nil
 	}
-	addr = addr.Unmap().WithZone("")
-	return net.IP(addr.AsSlice())
+	parts := strings.Split(h, ".")
+	if len(parts) > 4 {
+		return nil
+	}
+	var vals [4]uint64
+	for i, part := range parts {
+		v, ok := parseIPv4Part(part)
+		if !ok {
+			return nil
+		}
+		vals[i] = v
+	}
+	last := len(parts) - 1
+	for i := 0; i < last; i++ {
+		if vals[i] > 0xff {
+			return nil
+		}
+	}
+	maxLast := uint64(1)<<(8*(4-last)) - 1
+	if vals[last] > maxLast {
+		return nil
+	}
+	var ip4 uint32
+	switch len(parts) {
+	case 1:
+		ip4 = uint32(vals[0])
+	case 2:
+		ip4 = uint32(vals[0]<<24 | vals[1])
+	case 3:
+		ip4 = uint32(vals[0]<<24 | vals[1]<<16 | vals[2])
+	case 4:
+		ip4 = uint32(vals[0]<<24 | vals[1]<<16 | vals[2]<<8 | vals[3])
+	}
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], ip4)
+	return net.IP(b[:])
+}
+
+func parseIPv4Part(part string) (uint64, bool) {
+	if part == "" {
+		return 0, false
+	}
+	base := 10
+	digits := part
+	if strings.HasPrefix(part, "0x") || strings.HasPrefix(part, "0X") {
+		base = 16
+		digits = part[2:]
+		if digits == "" {
+			return 0, false
+		}
+	} else if len(part) > 1 && part[0] == '0' {
+		base = 8
+		digits = part[1:]
+	}
+	for i := 0; i < len(digits); i++ {
+		c := digits[i]
+		valid := (c >= '0' && c <= '9' && (base != 8 || c <= '7')) ||
+			(base == 16 && ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+		if !valid {
+			return 0, false
+		}
+	}
+	v, err := strconv.ParseUint(digits, base, 33)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
 }
 
 func isBlockedIP(ip net.IP) bool {
@@ -412,7 +489,19 @@ func isBlockedIP(ip net.IP) bool {
 		return true
 	}
 	if v4 := ip.To4(); v4 != nil {
+		if v4[0] == 0 { // 0.0.0.0/8 ("this network")
+			return true
+		}
+		if v4[0] == 100 && v4[1]&0xc0 == 64 { // 100.64.0.0/10 (CGNAT)
+			return true
+		}
 		ip = v4
+	} else if ip16 := ip.To16(); ip16 != nil && isZeroPrefix(ip16[:12]) {
+		// Also block IPv4-compatible IPv6 (e.g. ::127.0.0.1) if its embedded IPv4 is blocked,
+		// while leaving :: (IsUnspecified) and ::1 (IsLoopback) handled below.
+		if isBlockedIP(net.IP(ip16[12:16])) {
+			return true
+		}
 	}
 	return ip.IsLoopback() ||
 		ip.IsPrivate() ||
@@ -421,6 +510,15 @@ func isBlockedIP(ip net.IP) bool {
 		ip.IsUnspecified() ||
 		ip.IsMulticast() ||
 		ip.Equal(net.IPv4bcast)
+}
+
+func isZeroPrefix(b []byte) bool {
+	for _, v := range b {
+		if v != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func resolveHTTPURL(base *url.URL, raw string) string {

@@ -172,7 +172,10 @@ func TestFetchBlocksSSRFDirectAndRedirects(t *testing.T) {
 			"http://169.254.169.254/latest/meta-data/",
 			"http://[::1]:8080/",
 			"http://[::ffff:127.0.0.1]:8080/",
+			"http://[::127.0.0.1]:8080/",
 			"http://10.0.0.1/admin",
+			"http://100.64.0.1/internal",
+			"http://0.1.2.3/",
 			"file:///etc/passwd",
 		} {
 			if _, err := f.Fetch(context.Background(), target); err == nil {
@@ -297,7 +300,7 @@ func TestFetchBlocksSSRFDirectAndRedirects(t *testing.T) {
 			t.Fatalf("proxyHits = %d, want 1", proxyHits.Load())
 		}
 
-		// Local / private / .local targets must be rejected before hitting the proxy.
+		// Local / private / .local / non-canonical IP targets must be rejected before hitting the proxy.
 		hitsBefore := proxyHits.Load()
 		for _, blocked := range []string{
 			"http://localhost/admin",
@@ -305,10 +308,24 @@ func TestFetchBlocksSSRFDirectAndRedirects(t *testing.T) {
 			"http://printer.local/status",
 			"http://local/status",
 			"http://127.0.0.1:8080/",
+			"http://2130706433/",
+			"http://0x7f000001/",
+			"http://0177.0.0.1/",
+			"http://017700000001/",
+			"http://127.1/",
+			"http://127.0.1/",
+			"http://0x7f.1/",
 			"http://10.1.2.3/",
 			"http://192.168.1.1/",
 			"http://169.254.169.254/",
+			"http://0xa9fea9fe/",
+			"http://100.64.0.1/",
+			"http://100.127.255.254/",
+			"http://0.1.2.3/",
+			"http://0/",
 			"http://[::1]/",
+			"http://[::ffff:127.0.0.1]/",
+			"http://[::127.0.0.1]/",
 		} {
 			if _, err := f.Fetch(context.Background(), blocked); err == nil {
 				t.Errorf("proxied Fetch(%q) succeeded, want block", blocked)
@@ -498,4 +515,69 @@ func TestFetchCapsOversizedHTMLAndImage(t *testing.T) {
 			t.Fatalf("expected Thumb == nil when image > 2 MB, got %d bytes", len(res.Thumb))
 		}
 	})
+}
+
+func TestNonCanonicalIPv4AndBlockedRanges(t *testing.T) {
+	blocked := []string{
+		"2130706433",
+		"0x7f000001",
+		"0X7F000001",
+		"0177.0.0.1",
+		"017700000001",
+		"127.1",
+		"127.0.1",
+		"0x7f.1",
+		"127.0.0.1.",
+		"0",
+		"0.0.0.1",
+		"0.255.255.255",
+		"100.64.0.1",
+		"100.127.255.254",
+		"::1",
+		"::ffff:127.0.0.1",
+		"::127.0.0.1",
+	}
+	for _, host := range blocked {
+		ip := parseIPLiteral(host)
+		if ip == nil {
+			t.Errorf("parseIPLiteral(%q) = nil, want non-nil", host)
+			continue
+		}
+		if !isBlockedIP(ip) {
+			t.Errorf("isBlockedIP(%q -> %s) = false, want true", host, ip)
+		}
+	}
+
+	allowed := []string{
+		"93.184.216.34",
+		"100.63.255.254",
+		"100.128.0.1",
+		"1.1.1.1",
+		"2606:4700:4700::1111",
+	}
+	for _, host := range allowed {
+		ip := parseIPLiteral(host)
+		if ip == nil {
+			t.Errorf("parseIPLiteral(%q) = nil, want non-nil", host)
+			continue
+		}
+		if isBlockedIP(ip) {
+			t.Errorf("isBlockedIP(%q -> %s) = true, want false", host, ip)
+		}
+	}
+
+	notIPs := []string{
+		"example.com",
+		"12345.example.com",
+		"0x7f.example.com",
+		"08.0.0.1",
+		"256.1.1.1",
+		"1.2.3.4.5",
+		"0x",
+	}
+	for _, host := range notIPs {
+		if ip := parseIPLiteral(host); ip != nil {
+			t.Errorf("parseIPLiteral(%q) = %s, want nil", host, ip)
+		}
+	}
 }
