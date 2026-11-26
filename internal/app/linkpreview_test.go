@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -182,5 +183,93 @@ func TestLinkPreviewCacheHitSkipsFetch(t *testing.T) {
 	}
 	if n := fetches.Load(); n != 0 {
 		t.Fatalf("fetched %d times on a cache hit", n)
+	}
+}
+
+func previewTestApp(t *testing.T, fetch func(context.Context, string) (linkpreview.Result, error)) *App {
+	t.Helper()
+	db, err := store.Open(filepath.Join(t.TempDir(), "wa.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return &App{db: db, bg: context.Background(), cfg: map[string]string{}, fetchLink: fetch}
+}
+
+func TestNeedPreviewSharesOneLookupPerURL(t *testing.T) {
+	release := make(chan struct{})
+	var fetches atomic.Int32
+	a := previewTestApp(t, func(_ context.Context, u string) (linkpreview.Result, error) {
+		fetches.Add(1)
+		<-release
+		return linkpreview.Result{Found: true, Title: "T " + u}, nil
+	})
+	got := make(chan string, 2)
+	a.needPreview("https://same", true, func(p store.LinkPreview) { got <- "first " + p.Title })
+	a.needPreview("https://same", true, func(p store.LinkPreview) { got <- "second " + p.Title })
+	time.Sleep(100 * time.Millisecond) // room for a second lookup to start, were one started
+	close(release)
+	for range 2 {
+		select {
+		case s := <-got:
+			if s != "first T https://same" && s != "second T https://same" {
+				t.Fatalf("delivered %q", s)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("a waiter never got the shared result")
+		}
+	}
+	if n := fetches.Load(); n != 1 {
+		t.Fatalf("fetched %d times for one URL, want 1", n)
+	}
+}
+
+func TestNeedPreviewRunsAtMostTwoLookups(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{}, 8)
+	var cur, peak atomic.Int32
+	a := previewTestApp(t, func(context.Context, string) (linkpreview.Result, error) {
+		n := cur.Add(1)
+		for p := peak.Load(); n > p && !peak.CompareAndSwap(p, n); p = peak.Load() {
+		}
+		started <- struct{}{}
+		<-release
+		cur.Add(-1)
+		return linkpreview.Result{}, nil
+	})
+	for _, u := range []string{"https://a", "https://b", "https://c", "https://d"} {
+		a.needPreview(u, true, func(store.LinkPreview) {})
+	}
+	for range 2 {
+		<-started
+	}
+	select {
+	case <-started:
+		t.Fatal("a third lookup started while two were under way")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	for range 2 {
+		<-started
+	}
+	if p := peak.Load(); p != 2 {
+		t.Fatalf("peak concurrent lookups = %d, want 2", p)
+	}
+}
+
+func TestSetLinkProxyFailsClosed(t *testing.T) {
+	a := &App{}
+	a.setLinkProxy("")
+	if a.linkFetch == nil {
+		t.Fatal("no fetcher for a direct connection")
+	}
+	a.setLinkProxy("ftp://bad:21") // SetProxy refuses it: the old (direct) config must not be used
+	if _, err := a.fetchLink(context.Background(), "https://example.com"); err == nil || !strings.Contains(err.Error(), "no usable proxy") {
+		t.Fatalf("bad proxy: fetch err = %v, want the fail-closed stub", err)
+	}
+	b := &App{}
+	b.setLinkProxy("socks4://127.0.0.1:1080") // NewFetcher refuses it
+	if _, err := b.fetchLink(context.Background(), "https://example.com"); err == nil || !strings.Contains(err.Error(), "no usable proxy") {
+		t.Fatalf("bad proxy at start: fetch err = %v, want the fail-closed stub", err)
 	}
 }

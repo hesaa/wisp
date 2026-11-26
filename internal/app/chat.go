@@ -927,23 +927,39 @@ func previewLookup(ctx context.Context, db *store.DB, link string, canFetch bool
 	return p, p.Status == "ok"
 }
 
+// linkSlots bounds the link preview lookups under way at once.
+var linkSlots = make(chan struct{}, 2)
+
 // needPreview fetches the preview of link off the UI thread and hands it to deliver (UI thread)
-// when there is one. Nothing is fetched or shown with the setting off, behind the lock, or (for
-// chat messages) while the window is hidden.
+// when there is one; asks for a link already being looked up wait for that lookup. Nothing is
+// fetched or shown with the setting off, behind the lock, or (for chat messages) while the window
+// is hidden.
 func (a *App) needPreview(link string, composer bool, deliver func(store.LinkPreview)) {
 	if link == "" || a.cfg[ui.KeyLinkPreviews] == "false" || a.locked || (!composer && !a.fetchAllowed()) {
 		return
 	}
+	if waiting, busy := a.linkWait[link]; busy {
+		a.linkWait[link] = append(waiting, deliver)
+		return
+	}
+	if a.linkWait == nil {
+		a.linkWait = map[string][]func(store.LinkPreview){}
+	}
+	a.linkWait[link] = []func(store.LinkPreview){deliver}
+	fetch := a.fetchLink // settingChanged swaps it on the UI thread
 	go func() {
+		linkSlots <- struct{}{}
 		ctx, cancel := context.WithTimeout(a.bg, netTimeout)
-		defer cancel()
-		p, ok := previewLookup(ctx, a.db, link, true, a.fetchLink)
-		if !ok {
-			return
-		}
+		p, ok := previewLookup(ctx, a.db, link, true, fetch)
+		cancel()
+		<-linkSlots
 		a.onUI(func() {
-			if !a.locked && a.cfg[ui.KeyLinkPreviews] != "false" {
-				deliver(p)
+			waiting := a.linkWait[link]
+			delete(a.linkWait, link)
+			if ok && !a.locked && a.cfg[ui.KeyLinkPreviews] != "false" {
+				for _, deliver := range waiting {
+					deliver(p)
+				}
 			}
 		})
 	}()

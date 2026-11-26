@@ -86,6 +86,7 @@ type App struct {
 
 	linkFetch *linkpreview.Fetcher
 	fetchLink func(ctx context.Context, url string) (linkpreview.Result, error) // linkFetch.Fetch; faked in tests
+	linkWait  map[string][]func(store.LinkPreview)                              // previews being looked up, by URL: who waits for each
 
 	mw    *walk.MainWindow
 	icon  *walk.Icon
@@ -154,13 +155,7 @@ func New(db *store.DB, cache *media.Cache, builtinGIFKey string) (*App, error) {
 		logErr("read setting "+k, err) // the default stands in
 		a.cfg[k] = v
 	}
-	// a bad saved proxy fails closed (no direct fetch) until Settings fixes it
-	a.fetchLink = func(context.Context, string) (linkpreview.Result, error) { return linkpreview.Result{}, errors.New("link previews: no usable proxy") }
-	if f, err := linkpreview.NewFetcher(a.cfg[ui.KeyProxy]); err != nil {
-		logErr("link previews", err)
-	} else {
-		a.linkFetch, a.fetchLink = f, f.Fetch
-	}
+	a.setLinkProxy(a.cfg[ui.KeyProxy])
 	a.avatars = ui.NewAvatars(cache)
 	ui.SetAvatars(a.avatars)
 	a.avatarQ = newAvatarQueue()
@@ -330,7 +325,9 @@ func (a *App) build() error {
 	a.chat.OnNeedLinkPreview(func(m store.Message) {
 		link := linkify.FirstURL(m.Body)
 		a.needPreview(link, false, func(p store.LinkPreview) {
-			a.chat.ApplyLinkPreview(m.ID, link, p.Canonical, p.Title, p.Desc, p.Thumb)
+			if a.v.loaded && a.v.open == (chatRef{m.AccountID, m.ChatJID}) { // IDs repeat across accounts
+				a.chat.ApplyLinkPreview(m.ID, link, p.Canonical, p.Title, p.Desc, p.Thumb)
+			}
 		})
 	})
 	a.bar.OnNeedLinkPreview(func(link string) {
@@ -522,6 +519,7 @@ func (a *App) restore() {
 	}
 	win.SetForegroundWindow(h)
 	a.showPage() // pairing resumes
+	a.retryLinkPreviews()
 	if a.page == pageLock {
 		a.lockPage.Focus()
 	}
@@ -567,6 +565,13 @@ func (a *App) fetchAllowed() bool {
 	return fetchAllowed(visible, a.minimized, a.locked)
 }
 
+// retryLinkPreviews asks again for the previews the chat requested while fetching was not allowed.
+func (a *App) retryLinkPreviews() {
+	if a.chat != nil && a.fetchAllowed() {
+		a.chat.RetryLinkPreviews()
+	}
+}
+
 func (a *App) dir(acct string) *ui.Directory {
 	if a.v.dirs != nil {
 		return a.v.dirs[acct]
@@ -583,6 +588,7 @@ func (a *App) sizeChanged() {
 			trimMemory()
 		} else {
 			a.onRestored()
+			a.retryLinkPreviews()
 		}
 		a.showPage() // pairing stops while minimised
 	}
@@ -681,6 +687,25 @@ func (a *App) applyLinkPreviews() {
 	a.bar.SetLinkPreviewsEnabled(on)
 }
 
+// setLinkProxy routes link previews through proxy. A proxy the fetcher cannot use fails closed (no
+// direct fetch) until Settings fixes it.
+func (a *App) setLinkProxy(proxy string) {
+	var err error
+	if a.linkFetch != nil {
+		err = a.linkFetch.SetProxy(proxy)
+	} else {
+		a.linkFetch, err = linkpreview.NewFetcher(proxy)
+	}
+	if err != nil {
+		logErr("link previews proxy", err)
+		a.fetchLink = func(context.Context, string) (linkpreview.Result, error) {
+			return linkpreview.Result{}, errors.New("link previews: no usable proxy")
+		}
+		return
+	}
+	a.fetchLink = a.linkFetch.Fetch
+}
+
 // settingChanged re-reads an app-global setting saved in Settings and applies it. Values are never
 // logged: they include the GIPHY key and proxy passwords.
 func (a *App) settingChanged(key string) {
@@ -694,11 +719,7 @@ func (a *App) settingChanged(key string) {
 	case ui.KeyProxy:
 		logErr("proxy", a.mgr.SetProxy(v))
 		ui.SetGIFProxy(v)
-		if a.linkFetch != nil {
-			logErr("link previews proxy", a.linkFetch.SetProxy(v))
-		} else if f, err := linkpreview.NewFetcher(v); err == nil {
-			a.linkFetch, a.fetchLink = f, f.Fetch
-		}
+		a.setLinkProxy(v)
 	case ui.KeyLinkPreviews:
 		a.applyLinkPreviews()
 	case ui.KeyAppearOffline:
@@ -925,6 +946,7 @@ func (a *App) unlock(pin string) {
 			a.reloadList(a.v.active)
 		}
 		a.refreshAccounts()
+		a.retryLinkPreviews()
 		return
 	}
 	now := time.Now()
