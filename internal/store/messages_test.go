@@ -610,3 +610,72 @@ func TestQueryMessageLogs(t *testing.T) {
 	}
 }
 
+func TestMessageLinkFieldsRoundTrip(t *testing.T) {
+	db := openTest(t)
+
+	m := Message{
+		ID:            "m1",
+		ChatJID:       "c1",
+		AccountID:     acct,
+		SenderJID:     "s@s.whatsapp.net",
+		Timestamp:     1000,
+		Type:          "text",
+		Body:          "check https://example.com/a",
+		Status:        StatusReceived,
+		LinkURL:       "https://example.com/a",
+		LinkCanonical: "https://example.com/canonical",
+		LinkTitle:     "Example Title",
+		LinkDesc:      "Example Description",
+		LinkThumb:     []byte{0xff, 0xd8, 0xff, 0xe0, 0x01},
+	}
+	if isNew, err := db.InsertMessage(m); err != nil || !isNew {
+		t.Fatalf("InsertMessage: new=%v, err=%v", isNew, err)
+	}
+
+	got, ok, err := db.GetMessage(acct, "c1", "m1")
+	if err != nil || !ok {
+		t.Fatalf("GetMessage: ok=%v, err=%v", ok, err)
+	}
+	page, err := db.GetChatMessages(acct, "c1", 0)
+	if err != nil || len(page) != 1 {
+		t.Fatalf("GetChatMessages: len=%d, err=%v", len(page), err)
+	}
+	logs, err := db.QueryMessageLogs(MessageFilter{AccountID: acct, ChatJID: "c1"})
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("QueryMessageLogs: len=%d, err=%v", len(logs), err)
+	}
+	for _, r := range []Message{got, page[0], logs[0]} {
+		if r.LinkURL != m.LinkURL || r.LinkCanonical != m.LinkCanonical ||
+			r.LinkTitle != m.LinkTitle || r.LinkDesc != m.LinkDesc ||
+			!bytes.Equal(r.LinkThumb, m.LinkThumb) {
+			t.Fatalf("link fields = %+v, want %+v", r, m)
+		}
+	}
+
+	// Upgrading an 'unsupported' message populates link fields too (and nil LinkThumb binds cleanly).
+	u := Message{ID: "u1", ChatJID: "c1", AccountID: acct, Timestamp: 2000, Type: "unsupported", Status: StatusRead}
+	if isNew, err := db.InsertMessage(u); err != nil || !isNew {
+		t.Fatalf("InsertMessage unsupported: new=%v, err=%v", isNew, err)
+	}
+	u2 := u
+	u2.Type = "text"
+	u2.Body = "https://upgraded.example"
+	u2.LinkURL = "https://upgraded.example"
+	u2.LinkCanonical = "https://upgraded.example/"
+	u2.LinkTitle = "Upgraded"
+	u2.LinkDesc = "Upgraded desc"
+	u2.LinkThumb = []byte{9, 8, 7}
+	if isNew, err := db.InsertMessage(u2); err != nil || isNew {
+		t.Fatalf("upgrade unsupported: new=%v, err=%v", isNew, err)
+	}
+	gotU, ok, err := db.GetMessage(acct, "c1", "u1")
+	if err != nil || !ok {
+		t.Fatalf("GetMessage upgraded: ok=%v, err=%v", ok, err)
+	}
+	if gotU.LinkURL != u2.LinkURL || gotU.LinkCanonical != u2.LinkCanonical ||
+		gotU.LinkTitle != u2.LinkTitle || gotU.LinkDesc != u2.LinkDesc ||
+		!bytes.Equal(gotU.LinkThumb, u2.LinkThumb) {
+		t.Fatalf("upgraded link fields = %+v, want %+v", gotU, u2)
+	}
+}
+

@@ -13,7 +13,7 @@ func TestOpenRefusesANewerSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.sql.Exec(`PRAGMA user_version = 4`); err != nil {
+	if _, err := db.sql.Exec(`PRAGMA user_version = 5`); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()
@@ -178,8 +178,8 @@ func TestMigrateV2ToV3KeepsRows(t *testing.T) {
 	}
 	defer db.Close()
 	var v int
-	if err := db.sql.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil || v != 3 {
-		t.Fatalf("user_version = %d (%v), want 3", v, err)
+	if err := db.sql.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil || v != schemaVersion {
+		t.Fatalf("user_version = %d (%v), want %d", v, err, schemaVersion)
 	}
 	page, err := db.GetChatMessages("a", "c1", 0)
 	if err != nil || len(page) != 2 {
