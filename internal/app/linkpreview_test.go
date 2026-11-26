@@ -117,8 +117,68 @@ func TestLinkPreviewWorkerRespectsSettingAndLock(t *testing.T) {
 		{cfg: map[string]string{}, locked: true},
 	} {
 		a.db = db
-		a.fetchLink = func(context.Context, string) (linkpreview.Result, error) { t.Fatal("fetched"); return linkpreview.Result{}, nil }
+		a.fetchLink = func(context.Context, string) (linkpreview.Result, error) {
+			t.Fatal("fetched")
+			return linkpreview.Result{}, nil
+		}
 		a.needPreview("https://ok", true, func(store.LinkPreview) { t.Fatal("delivered") })
 		a.needPreview("https://ok", false, func(store.LinkPreview) { t.Fatal("delivered") })
 	}
+}
+
+func TestOpenNewChatFromPhoneCreatesBlankComposePane(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "wa.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	a := phoneApp(nil)
+	const fresh = "6283333333333@s.whatsapp.net" // in no chat list or directory
+	if !a.canOpenChat(acctA, fresh) {
+		t.Fatal("an unseen JID must be openable")
+	}
+	if page, err := db.GetChatMessages(acctA, fresh, 0); err != nil || len(page) != 0 {
+		t.Fatalf("an unseen chat opens as an empty page: %v %v", page, err)
+	}
+	if a.canOpenChat(acctB, fresh) || a.canOpenChat(acctA, "") {
+		t.Fatal("other account / empty JID must not open")
+	}
+	a.locked = true
+	if a.canOpenChat(acctA, fresh) {
+		t.Fatal("nothing opens behind the lock")
+	}
+}
+
+func TestLinkPreviewCacheHitSkipsFetch(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "wa.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	now := time.Now().Unix()
+	for _, p := range []store.LinkPreview{
+		{URL: "https://ok", Status: "ok", Title: "T", FetchedAt: now - 99999999},
+		{URL: "https://none", Status: "none", FetchedAt: now - 60},
+	} {
+		if err := db.PutLinkPreview(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a := &App{db: db, bg: context.Background(), cfg: map[string]string{}}
+	a.fetchLink = func(context.Context, string) (linkpreview.Result, error) {
+		t.Error("fetched on a cache hit")
+		return linkpreview.Result{}, nil
+	}
+	got := make(chan string, 1)
+	a.needPreview("https://ok", true, func(p store.LinkPreview) { got <- p.Title })
+	select {
+	case title := <-got:
+		if title != "T" {
+			t.Fatalf("title %q", title)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cached preview never delivered")
+	}
+	a.needPreview("https://none", true, func(store.LinkPreview) { t.Error("delivered a none") })
+	time.Sleep(100 * time.Millisecond) // the lookup is async; a fetch or delivery would have fired by now
 }

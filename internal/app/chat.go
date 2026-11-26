@@ -87,17 +87,20 @@ func (a *App) closeActiveChat() {
 	a.side.FocusSearch()
 }
 
+// canOpenChat is whether openChat may open jid: any JID of the active account counts, known to the
+// chat list or not (a number never chatted with opens blank), but nothing opens behind the lock.
+func (a *App) canOpenChat(acct, jid string) bool {
+	return !a.locked && acct != "" && jid != "" && acct == a.v.active
+}
+
 // openChat opens acct's chat jid (named name, or as the chat list names it): its newest page loads
 // off the UI thread, and it is marked read. Opening the open chat again only reads it and focuses
 // the input box, so a draft survives.
 func (a *App) openChat(acct, jid, name string) {
-	if a.locked {
-		return // nothing is shown, opened or sent behind the lock page
-	}
-	c := chatRef{acct, jid}
-	if acct == "" || jid == "" || acct != a.v.active {
+	if !a.canOpenChat(acct, jid) {
 		return
 	}
+	c := chatRef{acct, jid}
 	a.side.Model().Select(jid)
 	a.closeMedia()
 	a.closeInfo()
@@ -140,11 +143,12 @@ func (a *App) openChat(acct, jid, name string) {
 // messages are gone, and marks it read. The input bar is left alone.
 func (a *App) loadChat(c chatRef, name string) {
 	gen := a.v.openChat(c)
+	previews := a.cfg[ui.KeyLinkPreviews] != "false" // read here: cfg belongs to the UI thread
 	go func() {
 		purged := a.purgeExpired()
 		page, err := a.db.GetChatMessages(c.acct, c.jid, 0)
 		dropMissingMedia(page)
-		a.cachedPreviews(page)
+		a.cachedPreviews(page, previews)
 		a.mw.Synchronize(func() {
 			if purged {
 				for _, acct := range a.rail.Model().Accounts() {
@@ -211,13 +215,14 @@ func (a *App) cacheCleared() {
 // view makes while it still shows the chat before is not answered: SetChat resets it.
 func (a *App) loadPrevious() {
 	c, page, gen, ok := a.v.nextPage()
+	previews := a.cfg[ui.KeyLinkPreviews] != "false"
 	if !ok {
 		return
 	}
 	go func() {
 		msgs, err := a.db.GetChatMessages(c.acct, c.jid, page)
 		dropMissingMedia(msgs)
-		a.cachedPreviews(msgs)
+		a.cachedPreviews(msgs, previews)
 		a.mw.Synchronize(func() {
 			if !a.v.current(gen) {
 				return // the chat was closed or opened again meanwhile
@@ -837,7 +842,6 @@ func (a *App) setGroupNotMember(c chatRef) {
 	}()
 }
 
-
 // linkNoneTTL is how long a fetch that found no preview is remembered before it is tried again.
 const linkNoneTTL = 24 * time.Hour
 
@@ -946,8 +950,8 @@ func (a *App) needPreview(link string, composer bool, deliver func(store.LinkPre
 }
 
 // cachedPreviews fills msgs from the preview cache (off the UI thread) so reopened chats show them at once.
-func (a *App) cachedPreviews(msgs []store.Message) {
-	if a.cfg[ui.KeyLinkPreviews] == "false" {
+func (a *App) cachedPreviews(msgs []store.Message, on bool) {
+	if !on {
 		return
 	}
 	for i := range msgs {
@@ -956,7 +960,9 @@ func (a *App) cachedPreviews(msgs []store.Message) {
 			continue
 		}
 		if link := linkify.FirstURL(m.Body); link != "" {
-			if p, hit, _ := a.db.GetLinkPreview(link); hit && p.Status == "ok" {
+			p, hit, err := a.db.GetLinkPreview(link)
+			logErr("link preview cache", err)
+			if hit && p.Status == "ok" {
 				m.LinkURL, m.LinkCanonical, m.LinkTitle, m.LinkDesc, m.LinkThumb = link, p.Canonical, p.Title, p.Desc, p.Thumb
 			}
 		}
