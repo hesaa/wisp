@@ -27,6 +27,7 @@ const (
 
 	KeyGhostTyping        = "stealth.ghost_typing"      // never send typing indicators
 	KeyAppearOffline      = "stealth.appear_offline"    // always send presence unavailable
+	KeyLinkPreviews       = "chat.link_previews"        // show link preview cards and fetch previews while typing
 	KeyAutoDownloadImages = "media.autodownload_images" // fetch incoming images without a click
 	KeyGiphyAPIKey        = "gif.giphy_api_key"         // "" uses the built-in key
 	KeyProxy              = "net.proxy"                 // see whatsapp.ValidateProxy; "" is a direct connection
@@ -103,7 +104,7 @@ var privacyTypes = map[string]types.PrivacySettingType{
 var settingNames = map[string]string{
 	KeyLastSeen: "Last seen", KeyReadReceipts: "Read receipts", KeyProfilePhoto: "Profile photo",
 	KeyDisappearing: "Default message timer", KeyGhostTyping: "Ghost typing", KeyAppearOffline: "Appear offline",
-	KeyAutoDownloadImages: "Auto-download images", KeyGiphyAPIKey: "GIPHY API key", KeyProxy: "Proxy",
+	KeyLinkPreviews: "Link previews", KeyAutoDownloadImages: "Auto-download images", KeyGiphyAPIKey: "GIPHY API key", KeyProxy: "Proxy",
 	KeyNotify: "Notifications", KeyNotifyPrivate: "Private notifications", KeyNotifySound: "Notification sound",
 	KeyNotifySoundName: "Sound",
 	KeyTheme: "Theme", KeyLockPIN: "App lock", KeyLockTimeout: "Auto-lock timeout", KeyMCPEnabled: "MCP server",
@@ -112,7 +113,7 @@ var settingNames = map[string]string{
 // defaults are the values of settings never saved. Privacy ones stand in until WhatsApp's answer.
 var defaults = map[string]string{
 	KeyLastSeen: "all", KeyReadReceipts: "all", KeyProfilePhoto: "all", KeyDisappearing: "0",
-	KeyGhostTyping: "false", KeyAppearOffline: "false", KeyAutoDownloadImages: "true", KeyGiphyAPIKey: "",
+	KeyGhostTyping: "false", KeyAppearOffline: "false", KeyLinkPreviews: "true", KeyAutoDownloadImages: "true", KeyGiphyAPIKey: "",
 	KeyProxy: "", KeyNotify: "true", KeyNotifyPrivate: "false", KeyNotifySound: "true", KeyNotifySoundName: "default", KeyTheme: "system", KeyLockPIN: "",
 	KeyLockTimeout: "5", KeyMCPEnabled: "false",
 }
