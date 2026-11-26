@@ -35,12 +35,15 @@ const (
 	maxRedirects     = 5
 	maxHTMLBytes     = 512 * 1024
 	maxImageBytes    = 2 * 1024 * 1024
-	maxImagePixels   = 4_000_000
+	maxImagePixels   = 1 << 20 // spec §6: same decode bound as the UI's maxPreviewPixels
 	maxThumbWidth    = 320
 	maxThumbHeight   = 320
 	thumbJPEGQuality = 75
 	fetchUserAgent   = "WhatsApp/2.24.0"
 )
+
+// decodeSlot lets one image decode at a time, like the UI's thumbSlot, under the 64 MB memory limit.
+var decodeSlot = make(chan struct{}, 1)
 
 // Result holds OpenGraph/HTML link preview metadata extracted from a URL.
 type Result struct {
@@ -343,6 +346,8 @@ func encodeThumbnailJPEG(data []byte) ([]byte, error) {
 	if cfg.Width <= 0 || cfg.Height <= 0 || cfg.Width > maxImagePixels/cfg.Height {
 		return nil, errors.New("linkpreview: image dimensions exceed limit")
 	}
+	decodeSlot <- struct{}{}
+	defer func() { <-decodeSlot }()
 	src, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
 		return nil, err

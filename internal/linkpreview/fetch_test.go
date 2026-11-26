@@ -277,6 +277,10 @@ func TestFetchBlocksSSRFDirectAndRedirects(t *testing.T) {
 				http.Redirect(w, r, "http://printer.local/admin", http.StatusFound)
 			case "/redir-private":
 				http.Redirect(w, r, "http://10.0.0.5/secret", http.StatusFound)
+			case "/redir-loopback":
+				http.Redirect(w, r, "http://127.0.0.1/", http.StatusFound)
+			case "/redir-metadata":
+				http.Redirect(w, r, "http://169.254.169.254/", http.StatusFound)
 			default:
 				http.NotFound(w, r)
 			}
@@ -339,7 +343,7 @@ func TestFetchBlocksSSRFDirectAndRedirects(t *testing.T) {
 		}
 
 		// Redirects to localhost / .local / private IP must be rejected by CheckRedirect.
-		for _, redirPath := range []string{"/redir-local", "/redir-dotlocal", "/redir-private"} {
+		for _, redirPath := range []string{"/redir-local", "/redir-dotlocal", "/redir-private", "/redir-loopback", "/redir-metadata"} {
 			before := proxyHits.Load()
 			if _, err := f.Fetch(context.Background(), "http://nonexistent.example.invalid"+redirPath); err == nil {
 				t.Errorf("proxied redirect %s succeeded, want block", redirPath)
@@ -603,5 +607,14 @@ func TestFetchSanitizesTitleAndDescription(t *testing.T) {
 	}
 	if !utf8.ValidString(res.Description) || utf8.RuneCountInString(res.Description) > linkify.MaxPreviewDescRunes {
 		t.Fatalf("Description not valid/clamped: %d runes", utf8.RuneCountInString(res.Description))
+	}
+}
+
+func TestEncodeThumbnailPixelCapMatchesUI(t *testing.T) {
+	if _, err := encodeThumbnailJPEG(makeTestPNG(1024, 1024)); err != nil {
+		t.Fatalf("1024x1024 (= 1<<20 px) rejected: %v", err)
+	}
+	if _, err := encodeThumbnailJPEG(makeTestPNG(1025, 1024)); err == nil {
+		t.Fatal("1025x1024 (> 1<<20 px) accepted, want pixel-cap error")
 	}
 }
