@@ -101,6 +101,14 @@ func TestDetectOrderingAndEdgeCases(t *testing.T) {
 			},
 		},
 		{
+			name: "trailing marks without an opening mark stay in the url",
+			in:   "see https://e.com/_x_ and https://e.com/a*",
+			want: []Span{
+				{Kind: SpanURL, Start: 4, End: 21, Text: "https://e.com/_x_"},
+				{Kind: SpanURL, Start: 26, End: 42, Text: "https://e.com/a*"},
+			},
+		},
+		{
 			name: "min length boundaries",
 			in:   "+1234567 and 01234567 and +123456789012345",
 			want: []Span{

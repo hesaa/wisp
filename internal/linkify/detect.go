@@ -124,7 +124,12 @@ func trimURLTrailing(s string, start, end int) int {
 	for end > start {
 		last := s[end-1]
 		switch last {
-		case '.', ',', ';', ':', '!', '?', '*', '_', '~': // sentence punctuation and *bold*/_italic_/~strike~ markers
+		case '.', ',', ';', ':', '!', '?':
+			end--
+		case '*', '_', '~': // closes *bold*, _italic_ or ~strike~ only when the same mark opens it
+			if start == 0 || s[start-1] != last {
+				return end
+			}
 			end--
 		case ')', ']', '}':
 			open, closeCh := matchingBracket(last)
