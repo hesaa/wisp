@@ -261,15 +261,17 @@ func (d *DB) MessageSender(accountID, chatJID, id string) (string, error) {
 
 // ReviseMessage rewrites a stored message's body after an edit. A non-empty msgType (a
 // delete-for-everyone) also replaces its type and unlinks its media (keys and cached path; the
-// cached file stays on disk). It reports whether the row changed.
-func (d *DB) ReviseMessage(accountID, chatJID, id, msgType, body string) (bool, error) {
+// cached file stays on disk). The link preview becomes link, the edit's own (zero for none), so
+// no card outlives the text it was made for. It reports whether the row changed.
+func (d *DB) ReviseMessage(accountID, chatJID, id, msgType, body string, link LinkPreview) (bool, error) {
 	res, err := d.sql.Exec(`UPDATE messages SET body = ?4,
 		message_type = COALESCE(NULLIF(?5, ''), message_type),
 		media_meta = CASE WHEN ?5 = '' THEN media_meta ELSE x'' END,
-		media_path = CASE WHEN ?5 = '' THEN media_path ELSE '' END
+		media_path = CASE WHEN ?5 = '' THEN media_path ELSE '' END,
+		link_url = ?6, link_canonical = ?7, link_title = ?8, link_desc = ?9, link_thumb = COALESCE(?10, x'')
 		WHERE account_id = ?1 AND chat_jid = ?2 AND id = ?3
 		AND (body <> ?4 OR message_type <> COALESCE(NULLIF(?5, ''), message_type))`,
-		accountID, chatJID, id, body, msgType)
+		accountID, chatJID, id, body, msgType, link.URL, link.Canonical, link.Title, link.Desc, link.Thumb)
 	if err != nil {
 		return false, err
 	}

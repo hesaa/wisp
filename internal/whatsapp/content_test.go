@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
@@ -203,5 +204,35 @@ func TestToStoreMessageExtractsLinkPreview(t *testing.T) {
 	}
 	if got.LinkURL != "" || got.LinkTitle != "" || got.LinkDesc != "" || len(got.LinkThumb) != 0 {
 		t.Fatalf("expected empty Link* for non-preview ExtendedTextMessage, got %+v", got)
+	}
+}
+
+func TestEditCarriesItsOwnLinkPreview(t *testing.T) {
+	m, db := newTestManager(t)
+	fa := &fakeClient{}
+	m.add(acctA, fa)
+	orig := store.Message{ID: "e1", ChatJID: alice.String(), AccountID: acctA, SenderJID: alice.String(), Timestamp: 1,
+		Type: TypeText, Body: "see https://old.example", Status: store.StatusReceived,
+		LinkURL: "https://old.example", LinkTitle: "Old", LinkThumb: []byte{1}}
+	if err := db.InsertMessagesBatch([]store.Message{orig}); err != nil {
+		t.Fatal(err)
+	}
+	e := incoming(alice, "p1", "")
+	e.Message = &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+		Type: waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(), Key: &waCommon.MessageKey{ID: proto.String("e1")},
+		EditedMessage: &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+			Text: proto.String("see https://new.example"), MatchedText: proto.String("https://new.example"),
+			Title: proto.String("New\n title"),
+		}},
+	}}
+	if err := m.handleEvent(ctx, acctA, fa, e); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := db.GetMessage(acctA, alice.String(), "e1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Body != "see https://new.example" || got.LinkURL != "https://new.example" || got.LinkTitle != "New title" || len(got.LinkThumb) != 0 {
+		t.Fatalf("edited message: %+v", got)
 	}
 }

@@ -130,7 +130,7 @@ type msgStore interface {
 	ChatExpiration(accountID, chatJID string) (int64, error)
 	UpdateMessageStatus(accountID, chatJID string, ids []string, status string) error
 	MarkChatReadUntil(accountID, chatJID string, until int64) error
-	ReviseMessage(accountID, chatJID, id, msgType, body string) (bool, error)
+	ReviseMessage(accountID, chatJID, id, msgType, body string, link store.LinkPreview) (bool, error)
 	MessageSender(accountID, chatJID, id string) (string, error)
 	SetMediaPath(accountID, chatJID, id, path string) error
 	UpsertPeople(accountID string, people []store.Person) error

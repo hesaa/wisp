@@ -679,3 +679,47 @@ func TestMessageLinkFieldsRoundTrip(t *testing.T) {
 	}
 }
 
+
+func TestReviseMessageReplacesLinkPreview(t *testing.T) {
+	db := openTest(t)
+	m := Message{ID: "m1", ChatJID: "c1", AccountID: acct, SenderJID: "s@s.whatsapp.net", Timestamp: 1000,
+		Type: "text", Body: "see https://old.example", Status: StatusReceived,
+		LinkURL: "https://old.example", LinkCanonical: "https://old.example/c", LinkTitle: "Old", LinkDesc: "Old desc", LinkThumb: []byte{1, 2}}
+	if _, err := db.InsertMessage(m); err != nil {
+		t.Fatal(err)
+	}
+	get := func() Message {
+		t.Helper()
+		got, _, err := db.GetMessage(acct, "c1", "m1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+
+	// an edit that carries its own preview
+	if ok, err := db.ReviseMessage(acct, "c1", "m1", "", "see https://new.example", LinkPreview{URL: "https://new.example", Title: "New"}); err != nil || !ok {
+		t.Fatalf("edit with preview: %v %v", ok, err)
+	}
+	if g := get(); g.LinkURL != "https://new.example" || g.LinkTitle != "New" || g.LinkDesc != "" || g.LinkCanonical != "" || len(g.LinkThumb) != 0 {
+		t.Fatalf("edit with preview: %+v", g)
+	}
+	// an edit without one drops the old card
+	if ok, err := db.ReviseMessage(acct, "c1", "m1", "", "no link now", LinkPreview{}); err != nil || !ok {
+		t.Fatalf("plain edit: %v %v", ok, err)
+	}
+	if g := get(); g.LinkURL != "" || g.LinkTitle != "" {
+		t.Fatalf("plain edit kept the preview: %+v", g)
+	}
+	// delete for everyone wipes it too
+	if _, err := db.InsertMessage(Message{ID: "m2", ChatJID: "c1", AccountID: acct, Timestamp: 1001, Type: "text",
+		Body: "https://x.example", Status: StatusReceived, LinkURL: "https://x.example", LinkTitle: "X", LinkThumb: []byte{9}}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := db.ReviseMessage(acct, "c1", "m2", "revoked", "", LinkPreview{}); err != nil || !ok {
+		t.Fatalf("revoke: %v %v", ok, err)
+	}
+	if g, _, _ := db.GetMessage(acct, "c1", "m2"); g.LinkURL != "" || g.LinkTitle != "" || len(g.LinkThumb) != 0 {
+		t.Fatalf("revoke kept the preview: %+v", g)
+	}
+}
