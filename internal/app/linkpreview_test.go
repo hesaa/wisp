@@ -235,10 +235,11 @@ func TestNeedPreviewRunsAtMostTwoLookups(t *testing.T) {
 		started <- struct{}{}
 		<-release
 		cur.Add(-1)
-		return linkpreview.Result{}, nil
+		return linkpreview.Result{Found: true, Title: "T"}, nil
 	})
+	done := make(chan struct{})
 	for _, u := range []string{"https://a", "https://b", "https://c", "https://d"} {
-		a.needPreview(u, true, func(store.LinkPreview) {})
+		a.needPreview(u, true, func(store.LinkPreview) { done <- struct{}{} })
 	}
 	for range 2 {
 		<-started
@@ -248,9 +249,10 @@ func TestNeedPreviewRunsAtMostTwoLookups(t *testing.T) {
 		t.Fatal("a third lookup started while two were under way")
 	case <-time.After(100 * time.Millisecond):
 	}
-	close(release)
-	for range 2 {
-		<-started
+	// without a window onUI runs on the worker: finish one lookup at a time, as the UI thread would
+	for range 4 {
+		release <- struct{}{}
+		<-done
 	}
 	if p := peak.Load(); p != 2 {
 		t.Fatalf("peak concurrent lookups = %d, want 2", p)
