@@ -1,9 +1,53 @@
 package store
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 )
+
+func TestMigrateV3ToV4(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wa-v3.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(schemaV1 + schemaV2 + schemaV3 + `
+		PRAGMA user_version = 3;
+		INSERT INTO messages (account_id, chat_jid, id, sender_jid, timestamp, body, quoted_id) VALUES
+			('a', 'c1', 'm1', 's1', 100, 'hello https://example.com', 'q0');`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	raw.Close()
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open v3 db: %v", err)
+	}
+	defer db.Close()
+
+	var v int
+	if err := db.sql.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil || v != 4 {
+		t.Fatalf("user_version = %d (%v), want 4", v, err)
+	}
+
+	var lpCount int
+	if err := db.sql.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'link_previews'`).Scan(&lpCount); err != nil || lpCount != 1 {
+		t.Fatalf("link_previews table count = %d (%v), want 1", lpCount, err)
+	}
+
+	got, ok, err := db.GetMessage("a", "c1", "m1")
+	if err != nil || !ok {
+		t.Fatalf("GetMessage: ok=%v, err=%v", ok, err)
+	}
+	if got.Body != "hello https://example.com" || got.QuotedID != "q0" {
+		t.Fatalf("migrated row changed: %+v", got)
+	}
+	if got.LinkURL != "" || got.LinkCanonical != "" || got.LinkTitle != "" || got.LinkDesc != "" || len(got.LinkThumb) != 0 {
+		t.Fatalf("migrated row has non-empty Link* fields: %+v", got)
+	}
+}
 
 func TestRedeliveredUnsupportedIsReplacedNotCountedNew(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "w.db"))

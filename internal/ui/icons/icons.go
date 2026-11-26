@@ -42,6 +42,8 @@ const (
 	IconBack   // left arrow: leave a view
 	IconVolume // speaker with sound waves: sound on
 	IconMute   // speaker with a cross: sound off
+	IconCopy
+	IconExternal
 )
 
 const (
@@ -146,6 +148,15 @@ var definitions = map[Icon][]op{
 	IconBack:         {poly(20, 12, 4, 12), poly(10, 6, 4, 12, 10, 18)},
 	IconVolume:       {speaker(), arc(7.5, 7.5, 9, 9, -45, 90), arc(4, 4, 16, 16, -45, 90)},
 	IconMute:         {speaker(), poly(15, 9.5, 20, 14.5), poly(20, 9.5, 15, 14.5)},
+	IconCopy: {
+		poly(9, 9, 20, 9, 20, 20, 9, 20, 9, 9),
+		poly(15, 9, 15, 4, 4, 4, 4, 15, 9, 15),
+	},
+	IconExternal: {
+		poly(11, 5, 5, 5, 5, 19, 19, 19, 19, 13),
+		poly(11, 13, 19, 5),
+		poly(14, 5, 19, 5, 19, 10),
+	},
 }
 
 func speaker() op { return poly(3, 9.5, 7, 9.5, 12, 5, 12, 19, 7, 14.5, 3, 14.5, 3, 9.5) }

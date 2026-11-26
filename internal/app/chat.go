@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"image"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -16,7 +17,10 @@ import (
 
 	"github.com/lxn/win"
 	"go.mau.fi/whatsmeow"
+	"golang.org/x/sys/windows"
 
+	"wa-go/internal/linkify"
+	"wa-go/internal/linkpreview"
 	"wa-go/internal/media"
 	"wa-go/internal/notify"
 	"wa-go/internal/store"
@@ -83,17 +87,20 @@ func (a *App) closeActiveChat() {
 	a.side.FocusSearch()
 }
 
+// canOpenChat is whether openChat may open jid: any JID of the active account counts, known to the
+// chat list or not (a number never chatted with opens blank), but nothing opens behind the lock.
+func (a *App) canOpenChat(acct, jid string) bool {
+	return !a.locked && acct != "" && jid != "" && acct == a.v.active
+}
+
 // openChat opens acct's chat jid (named name, or as the chat list names it): its newest page loads
 // off the UI thread, and it is marked read. Opening the open chat again only reads it and focuses
 // the input box, so a draft survives.
 func (a *App) openChat(acct, jid, name string) {
-	if a.locked {
-		return // nothing is shown, opened or sent behind the lock page
-	}
-	c := chatRef{acct, jid}
-	if acct == "" || jid == "" || acct != a.v.active {
+	if !a.canOpenChat(acct, jid) {
 		return
 	}
+	c := chatRef{acct, jid}
 	a.side.Model().Select(jid)
 	a.closeMedia()
 	a.closeInfo()
@@ -136,10 +143,12 @@ func (a *App) openChat(acct, jid, name string) {
 // messages are gone, and marks it read. The input bar is left alone.
 func (a *App) loadChat(c chatRef, name string) {
 	gen := a.v.openChat(c)
+	previews := a.cfg[ui.KeyLinkPreviews] != "false" // read here: cfg belongs to the UI thread
 	go func() {
 		purged := a.purgeExpired()
 		page, err := a.db.GetChatMessages(c.acct, c.jid, 0)
 		dropMissingMedia(page)
+		a.cachedPreviews(page, previews)
 		a.mw.Synchronize(func() {
 			if purged {
 				for _, acct := range a.rail.Model().Accounts() {
@@ -177,7 +186,7 @@ func (a *App) purgeExpired() bool {
 // and shows the open chat again.
 func (a *App) cacheCleared() {
 	go func() {
-		err := errors.Join(a.db.ClearMediaPaths(), a.db.ResetAvatars())
+		err := errors.Join(a.db.ClearMediaPaths(), a.db.ResetAvatars(), a.db.ClearLinkPreviews())
 		a.mw.Synchronize(func() {
 			logErr("forget downloads and avatars", err) // the views still treat a missing file as not downloaded
 			if a.avatars != nil {
@@ -206,12 +215,14 @@ func (a *App) cacheCleared() {
 // view makes while it still shows the chat before is not answered: SetChat resets it.
 func (a *App) loadPrevious() {
 	c, page, gen, ok := a.v.nextPage()
+	previews := a.cfg[ui.KeyLinkPreviews] != "false"
 	if !ok {
 		return
 	}
 	go func() {
 		msgs, err := a.db.GetChatMessages(c.acct, c.jid, page)
 		dropMissingMedia(msgs)
+		a.cachedPreviews(msgs, previews)
 		a.mw.Synchronize(func() {
 			if !a.v.current(gen) {
 				return // the chat was closed or opened again meanwhile
@@ -399,8 +410,12 @@ func (a *App) send(text string) {
 	a.side.Model().SetDraft(c.jid, "")
 	reply := a.takeReply()
 	wire, mentions := a.bar.WireMentions(text) // @Name as typed becomes @<number> on the wire
+	var preview *whatsapp.LinkPreview
+	if p := a.bar.ActiveLinkPreview(); p != nil && a.cfg[ui.KeyLinkPreviews] != "false" {
+		preview = &whatsapp.LinkPreview{MatchedText: p.URL, CanonicalURL: p.Canonical, Title: p.Title, Description: p.Desc, Thumb: p.Thumb}
+	}
 	a.sendOff("Message not sent", func(ctx context.Context) error {
-		_, err := a.mgr.SendText(ctx, c.acct, c.jid, wire, reply, mentions)
+		_, err := a.mgr.SendTextWithPreview(ctx, c.acct, c.jid, wire, reply, mentions, preview)
 		if isNotInGroup(err) {
 			a.mw.Synchronize(func() {
 				a.setGroupNotMember(c)
@@ -827,3 +842,145 @@ func (a *App) setGroupNotMember(c chatRef) {
 	}()
 }
 
+// linkNoneTTL is how long a fetch that found no preview is remembered before it is tried again.
+const linkNoneTTL = 24 * time.Hour
+
+// openableURL is raw when it is an http(s) URL with a host: the only links handed to the shell.
+func openableURL(raw string) (string, bool) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return "", false
+	}
+	return u.String(), true
+}
+
+// openLink opens an http(s) link in the default browser.
+func (a *App) openLink(raw string) {
+	if a.locked {
+		return
+	}
+	u, ok := openableURL(raw)
+	if !ok {
+		return
+	}
+	verb, target := windows.StringToUTF16Ptr("open"), windows.StringToUTF16Ptr(u)
+	logErr("open link", windows.ShellExecute(0, verb, target, nil, nil, windows.SW_SHOWNORMAL))
+}
+
+// onUI runs fn on the UI thread (directly when there is no window, as in tests).
+func (a *App) onUI(fn func()) {
+	if a.mw == nil {
+		fn()
+		return
+	}
+	a.mw.Synchronize(fn)
+}
+
+// resolvePhone answers whether raw is a WhatsApp number: at once for a known chat or contact, else
+// by asking WhatsApp off the UI thread. done runs on the UI thread; nothing is asked behind the lock.
+func (a *App) resolvePhone(raw string, done func(registered bool, display, jid string)) {
+	acct := a.v.active
+	e164, jid, ok := linkify.NormalizePhone(raw, acct)
+	if !ok {
+		done(false, "", "")
+		return
+	}
+	_, chat := a.v.names[acct][jid]
+	if _, person := a.dir(acct).Person(jid); chat || person {
+		done(true, cmp.Or(a.chatName(acct, jid), e164), jid)
+		return
+	}
+	if a.locked || a.mgr == nil {
+		done(false, "", "")
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(a.bg, netTimeout)
+		defer cancel()
+		res, err := a.mgr.CheckPhones(ctx, acct, []string{e164})
+		logErr("check phone", err)
+		st := res[e164]
+		a.onUI(func() { done(err == nil && st.Registered, e164, cmp.Or(st.JID, jid)) })
+	}()
+}
+
+// previewLookup is the preview of link: from the cache (found, or not found within linkNoneTTL),
+// else fetched when canFetch and cached either way. ok is false when there is nothing to show.
+func previewLookup(ctx context.Context, db *store.DB, link string, canFetch bool,
+	fetch func(context.Context, string) (linkpreview.Result, error)) (p store.LinkPreview, ok bool) {
+	c, hit, err := db.GetLinkPreview(link)
+	logErr("link preview cache", err)
+	if hit && (c.Status == "ok" || time.Since(time.Unix(c.FetchedAt, 0)) < linkNoneTTL) {
+		return c, c.Status == "ok"
+	}
+	if !canFetch {
+		return store.LinkPreview{}, false
+	}
+	res, err := fetch(ctx, link)
+	p = store.LinkPreview{URL: link, Status: "none", FetchedAt: time.Now().Unix()}
+	if err == nil && res.Found {
+		p.Status, p.Canonical, p.Title, p.Desc, p.Thumb = "ok", res.CanonicalURL, res.Title, res.Description, res.Thumb
+	}
+	if err == nil { // a failed fetch is retried next time
+		logErr("link preview cache", db.PutLinkPreview(p))
+	}
+	return p, p.Status == "ok"
+}
+
+// linkSlots bounds the link preview lookups under way at once.
+var linkSlots = make(chan struct{}, 2)
+
+// needPreview fetches the preview of link off the UI thread and hands it to deliver (UI thread)
+// when there is one; asks for a link already being looked up wait for that lookup. Nothing is
+// fetched or shown with the setting off, behind the lock, or (for chat messages) while the window
+// is hidden.
+func (a *App) needPreview(link string, composer bool, deliver func(store.LinkPreview)) {
+	if link == "" || a.cfg[ui.KeyLinkPreviews] == "false" || a.locked || (!composer && !a.fetchAllowed()) {
+		return
+	}
+	if waiting, busy := a.linkWait[link]; busy {
+		a.linkWait[link] = append(waiting, deliver)
+		return
+	}
+	if a.linkWait == nil {
+		a.linkWait = map[string][]func(store.LinkPreview){}
+	}
+	a.linkWait[link] = []func(store.LinkPreview){deliver}
+	fetch := a.fetchLink // settingChanged swaps it on the UI thread
+	go func() {
+		linkSlots <- struct{}{}
+		ctx, cancel := context.WithTimeout(a.bg, netTimeout)
+		p, ok := previewLookup(ctx, a.db, link, true, fetch)
+		cancel()
+		<-linkSlots
+		a.onUI(func() {
+			waiting := a.linkWait[link]
+			delete(a.linkWait, link)
+			if ok && !a.locked && a.cfg[ui.KeyLinkPreviews] != "false" {
+				for _, deliver := range waiting {
+					deliver(p)
+				}
+			}
+		})
+	}()
+}
+
+// cachedPreviews fills msgs from the preview cache (off the UI thread) so reopened chats show them at once.
+func (a *App) cachedPreviews(msgs []store.Message, on bool) {
+	if !on {
+		return
+	}
+	for i := range msgs {
+		m := &msgs[i]
+		if m.LinkTitle != "" || m.LinkDesc != "" || len(m.LinkThumb) > 0 || (m.Type != "" && m.Type != "text") {
+			continue
+		}
+		if link := linkify.FirstURL(m.Body); link != "" {
+			p, hit, err := a.db.GetLinkPreview(link)
+			logErr("link preview cache", err)
+			if hit && p.Status == "ok" {
+				m.LinkURL, m.LinkCanonical, m.LinkTitle, m.LinkDesc, m.LinkThumb = link, p.Canonical, p.Title, p.Desc, p.Thumb
+			}
+		}
+	}
+}

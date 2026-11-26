@@ -9,7 +9,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 3
+const schemaVersion = 4
 
 // unread_count is deliberately not stored on chats: it is derived from messages,
 // so it cannot drift from the data.
@@ -68,6 +68,23 @@ ALTER TABLE messages ADD COLUMN quoted_sender TEXT NOT NULL DEFAULT '';
 ALTER TABLE messages ADD COLUMN quoted_body TEXT NOT NULL DEFAULT '';
 ALTER TABLE messages ADD COLUMN quoted_type TEXT NOT NULL DEFAULT '';`
 
+// Additive: rows from before v4 have empty link preview columns, plus the local preview cache.
+const schemaV4 = `
+ALTER TABLE messages ADD COLUMN link_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN link_canonical TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN link_title TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN link_desc TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN link_thumb BLOB NOT NULL DEFAULT x'';
+CREATE TABLE link_previews (
+	url        TEXT PRIMARY KEY,
+	status     TEXT NOT NULL DEFAULT '',
+	canonical  TEXT NOT NULL DEFAULT '',
+	title      TEXT NOT NULL DEFAULT '',
+	desc       TEXT NOT NULL DEFAULT '',
+	thumb      BLOB NOT NULL DEFAULT x'',
+	fetched_at INTEGER NOT NULL DEFAULT 0
+);`
+
 // DB wraps the SQLite handle.
 type DB struct{ sql *sql.DB }
 
@@ -121,6 +138,11 @@ func (d *DB) migrate() error {
 	}
 	if v < 3 {
 		if _, err := tx.Exec(schemaV3); err != nil {
+			return err
+		}
+	}
+	if v < 4 {
+		if _, err := tx.Exec(schemaV4); err != nil {
 			return err
 		}
 	}

@@ -25,6 +25,7 @@ import (
 	_ "golang.org/x/image/webp" // sticker files, in the media view
 	"golang.org/x/sys/windows"
 
+	"wa-go/internal/linkify"
 	"wa-go/internal/media"
 	"wa-go/internal/store"
 	"wa-go/internal/theme"
@@ -96,12 +97,25 @@ type ChatView struct {
 	anims       map[string]*animation // stickers and GIFs playing now, by message ID (anim.go)
 	still       map[string]bool       // media that turned out not to animate, or failed to
 
-	onLoadPrevious func()
-	onNeedMedia    func(store.Message)
-	onOpenMedia    func(store.Message)
-	onOpenInfo     func()
-	onReply        func(store.Message)
-	hasMessage     func(id string) bool
+	linkPreviews  bool              // show preview cards and request previews for visible links
+	linkRequested map[string]bool   // message IDs whose preview was requested on sight
+	linkThumbBusy map[string]bool   // link thumbnails currently decoding off UI thread
+	linkBitmaps   *lru[thumbBitmap] // decoded link preview thumbnails
+	pressSpan     spanPress         // active press on an inline span or preview card
+	activePopup   *linkPopup        // open link/phone action popup, nil when closed
+	menu          *walk.Menu        // canvas context menu
+	dynActions    []*walk.Action    // dynamic link/phone items on the context menu
+
+	onLoadPrevious    func()
+	onNeedMedia       func(store.Message)
+	onOpenMedia       func(store.Message)
+	onOpenInfo        func()
+	onReply           func(store.Message)
+	hasMessage        func(id string) bool
+	onNeedLinkPreview func(store.Message)
+	onOpenLink        func(url string)
+	onCheckPhone      func(raw string, done func(registered bool, display, jid string))
+	onOpenPhoneChat   func(jid, display string)
 }
 
 func (v *ChatView) OnOpenInfo(fn func()) {
@@ -187,6 +201,13 @@ func (m *chatModel) upsert(msg store.Message) bool {
 		if msg.MediaPath == "" {
 			msg.MediaPath = m.msgs[i].MediaPath
 		}
+		if msg.LinkTitle == "" && msg.LinkDesc == "" && len(msg.LinkThumb) == 0 && msg.Body == m.msgs[i].Body {
+			msg.LinkURL = cmp.Or(msg.LinkURL, m.msgs[i].LinkURL)
+			msg.LinkCanonical = cmp.Or(msg.LinkCanonical, m.msgs[i].LinkCanonical)
+			msg.LinkTitle = m.msgs[i].LinkTitle
+			msg.LinkDesc = m.msgs[i].LinkDesc
+			msg.LinkThumb = m.msgs[i].LinkThumb
+		}
 		m.msgs[i] = msg
 		return true
 	}
@@ -222,10 +243,17 @@ func NewChatView(parent walk.Container, p theme.Palette, cache *media.Cache, sen
 	if err != nil {
 		return nil, err
 	}
-	v := &ChatView{Composite: comp, pal: p, cache: cache, cdpi: canvasDPI(), autoFetch: true,
+	v := &ChatView{Composite: comp, pal: p, cache: cache, cdpi: canvasDPI(), autoFetch: true, linkPreviews: true,
+		lay:   chatLayout{linkPreviews: true},
 		anims: map[string]*animation{}, still: map[string]bool{},
 		picked: map[string]bool{}, requested: map[string]bool{}, thumbFiles: map[string]string{}, thumbBusy: map[string]bool{},
+		linkRequested: map[string]bool{}, linkThumbBusy: map[string]bool{},
 		bitmaps: newLRU(thumbCacheSize, func(t thumbBitmap) {
+			if t.bmp != nil {
+				t.bmp.Dispose()
+			}
+		}),
+		linkBitmaps: newLRU(thumbCacheSize, func(t thumbBitmap) {
 			if t.bmp != nil {
 				t.bmp.Dispose()
 			}
@@ -262,11 +290,7 @@ func (v *ChatView) build() error {
 	})
 	cw.MouseDown().Attach(v.mouseDown)
 	cw.MouseMove().Attach(v.mouseMove)
-	cw.MouseUp().Attach(func(_, _ int, b walk.MouseButton) {
-		if b == walk.LeftButton {
-			v.dragging = false
-		}
-	})
+	cw.MouseUp().Attach(v.mouseUp)
 	takeEscape(cw, func() bool { _, _, ok := v.selection(); return ok || len(v.picked) > 0 })
 	takeContextMenu(cw, v.menuAt)
 	v.scroll.attach(cw, func() int { return v.lay.total }, func() int { return cw.IntFrom96DPI(100) })
@@ -282,7 +306,9 @@ func (v *ChatView) build() error {
 			}
 		}
 	})
+	cw.Disposing().Attach(v.DismissPopup)
 	cw.Disposing().Attach(v.bitmaps.clear)
+	cw.Disposing().Attach(v.linkBitmaps.clear)
 	cw.Disposing().Attach(v.stopAnims)
 	if err := v.buildMenu(); err != nil {
 		return err
@@ -312,6 +338,88 @@ func (v *ChatView) OnReply(fn func(store.Message)) { v.onReply = fn }
 // OnHasMessage sets the lookup of whether the open chat has message id stored, loaded or not: a click
 // on a reply's quote pages back to an unloaded original only when it has.
 func (v *ChatView) OnHasMessage(fn func(id string) bool) { v.hasMessage = fn }
+
+// OnNeedLinkPreview sets the handler called when a visible message with a URL has no preview yet.
+func (v *ChatView) OnNeedLinkPreview(fn func(m store.Message)) { v.onNeedLinkPreview = fn }
+
+// OnOpenLink sets the handler called when the user chooses Open link from a link popup or menu.
+func (v *ChatView) OnOpenLink(fn func(url string)) { v.onOpenLink = fn }
+
+// OnCheckPhone sets the handler called on the UI thread when a phone popup checks whether raw is on
+// WhatsApp. Callers should invoke done on the UI thread; done also safely marshals onto the UI
+// thread via Synchronize if invoked from a background goroutine.
+func (v *ChatView) OnCheckPhone(fn func(raw string, done func(registered bool, display, jid string))) {
+	v.onCheckPhone = fn
+}
+
+// OnOpenPhoneChat sets the handler called when the user chooses Chat with <number>.
+func (v *ChatView) OnOpenPhoneChat(fn func(jid, display string)) { v.onOpenPhoneChat = fn }
+
+// SetLinkPreviews turns link preview cards and on-sight preview requests on or off.
+func (v *ChatView) SetLinkPreviews(enabled bool) {
+	if v.linkPreviews == enabled && v.lay.linkPreviews == enabled {
+		return
+	}
+	v.linkPreviews = enabled
+	v.lay.linkPreviews = enabled
+	v.lay.cache = nil
+	v.stale = true
+	if v.canvas != nil {
+		logErr("chat layout", v.relayout(false))
+		logErr("chat repaint", v.canvas.Invalidate())
+		if enabled {
+			v.settle()
+		}
+	}
+}
+
+// RetryLinkPreviews asks again for the previews of messages in view that still have none: the app
+// declines requests while the window is hidden or locked, and settle asks only once per message.
+func (v *ChatView) RetryLinkPreviews() {
+	clear(v.linkRequested)
+	v.settle()
+}
+
+// ApplyLinkPreview updates message msgID with fetched link preview metadata and repaints.
+func (v *ChatView) ApplyLinkPreview(msgID string, url, canonical, title, desc string, thumb []byte) {
+	i := v.index(msgID)
+	if i < 0 || (title == "" && desc == "" && len(thumb) == 0) {
+		return
+	}
+	m := &v.msgs[i]
+	if url != "" && !linkInBody(m.Body, url) {
+		return // the message was edited while its preview was fetched
+	}
+	if m.LinkURL == cmp.Or(url, m.LinkURL) && m.LinkCanonical == cmp.Or(canonical, m.LinkCanonical) &&
+		m.LinkTitle == title && m.LinkDesc == desc && bytes.Equal(m.LinkThumb, thumb) {
+		return
+	}
+	if url != "" {
+		m.LinkURL = url
+	}
+	if canonical != "" {
+		m.LinkCanonical = canonical
+	}
+	m.LinkTitle = title
+	m.LinkDesc = desc
+	m.LinkThumb = slices.Clone(thumb)
+	v.linkBitmaps.del(msgID)
+	delete(v.linkThumbBusy, msgID)
+	v.lay.forget(msgID)
+	v.stale = true
+	if v.canvas != nil {
+		logErr("chat layout", v.relayout(false))
+		logErr("chat repaint", v.canvas.Invalidate())
+	}
+}
+
+// DismissPopup closes any open link/phone action popup.
+func (v *ChatView) DismissPopup() {
+	if v.activePopup != nil {
+		v.activePopup.dismiss()
+		v.activePopup = nil
+	}
+}
 
 func (v *ChatView) triggerReply(m store.Message) {
 	if v.onReply != nil && m.Type != "revoked" && m.Type != "unsupported" {
@@ -388,18 +496,23 @@ func (v *ChatView) Focus() { focusOn(v.canvas) }
 // SetChat shows a chat from its newest page (store.GetChatMessages page 0, newest first), scrolled
 // to the end. name is the chat's own name ("" for none).
 func (v *ChatView) SetChat(accountID, chatJID, name string, isGroup bool, firstPage []store.Message) {
+	v.DismissPopup()
 	v.open(accountID, chatJID, firstPage)
 	v.name = name
 	v.lay.reset()
 	v.lay.group = isGroup
 	v.bitmaps.clear()
+	v.linkBitmaps.clear()
 	v.stopAnims()
 	clear(v.requested)
 	clear(v.thumbFiles)
 	clear(v.thumbBusy)
+	clear(v.linkRequested)
+	clear(v.linkThumbBusy)
 	v.gen++
 	v.focus, v.view, v.scroll.off, v.stale = "", 0, 0, true
 	v.selA, v.selB, v.dragging = textMark{}, textMark{}, false
+	v.pressSpan = spanPress{}
 	clear(v.picked)
 	v.pickAnchor = ""
 	v.jumping, v.glow = "", ""
@@ -435,15 +548,24 @@ func (v *ChatView) NoMoreHistory(accountID, chatJID string) {
 // the end. Other chats' messages are ignored, and so are unknown ones older than the loaded messages
 // while older pages remain: they come with their page.
 func (v *ChatView) Upsert(msg store.Message) {
-	old := ""
+	old, oldBody := "", msg.Body
+	var oldThumb []byte
 	if i := v.index(msg.ID); i >= 0 {
-		old = v.msgs[i].MediaPath
+		old, oldBody = v.msgs[i].MediaPath, v.msgs[i].Body
+		oldThumb = v.msgs[i].LinkThumb
 	}
 	if !v.upsert(msg) {
 		return
 	}
 	if msg.MediaPath != "" && msg.MediaPath != old {
 		delete(v.thumbFiles, msg.ID) // made from the old download
+	}
+	if msg.Body != oldBody {
+		delete(v.linkRequested, msg.ID) // an edit may bring a new link to preview
+	}
+	if i := v.index(msg.ID); i >= 0 && (msg.Body != oldBody || !bytes.Equal(oldThumb, v.msgs[i].LinkThumb)) {
+		v.linkBitmaps.del(msg.ID)
+		delete(v.linkThumbBusy, msg.ID)
 	}
 	v.lay.forget(msg.ID)
 	v.stale = true
@@ -499,6 +621,9 @@ func fetchOnSight(id string, auto bool, requested map[string]bool) bool {
 // SetPalette recolours the pane.
 func (v *ChatView) SetPalette(p theme.Palette) error {
 	v.pal = p
+	if v.activePopup != nil {
+		logErr("popup palette", v.activePopup.k.setPalette(p))
+	}
 	return errors.Join(setBg(v.Composite, p.ChatBg), v.header.Invalidate(), v.canvas.Invalidate())
 }
 
@@ -626,7 +751,25 @@ func (v *ChatView) settle() {
 		if _, done := v.thumbFiles[m.ID]; thumb && !done && !v.thumbBusy[m.ID] {
 			v.makeThumb(m.ID, m.MediaPath)
 		}
+		if v.onNeedLinkPreview != nil && needLinkPreviewOnSight(m, v.linkPreviews, v.linkRequested) {
+			v.linkRequested[m.ID] = true
+			v.onNeedLinkPreview(m)
+		}
 	}
+}
+
+// needLinkPreviewOnSight reports whether visible message m should trigger a lazy preview request.
+func needLinkPreviewOnSight(m store.Message, enabled bool, requested map[string]bool) bool {
+	if !enabled || requested[m.ID] {
+		return false
+	}
+	if m.Type != "" && m.Type != "text" {
+		return false
+	}
+	if m.LinkTitle != "" || m.LinkDesc != "" || len(m.LinkThumb) > 0 {
+		return false
+	}
+	return linkify.FirstURL(m.Body) != ""
 }
 
 // onSight is what a message coming into view asks for: its download when it is a photo or a sticker
@@ -741,6 +884,46 @@ func (v *ChatView) decodeThumb(m *store.Message, src string, w, h int) (*image.R
 	return coverImage(bytes.NewReader(info.preview), w, h)
 }
 
+// linkThumbFor returns message m's decoded link preview thumbnail scaled to w x h, or schedules
+// decoding off the UI thread and repaints once ready.
+func (v *ChatView) linkThumbFor(m *store.Message, w, h int) *walk.Bitmap {
+	if len(m.LinkThumb) == 0 || w <= 0 || h <= 0 {
+		return nil
+	}
+	if t, ok := v.linkBitmaps.get(m.ID); ok && t.w == w && t.h == h {
+		return t.bmp
+	}
+	if v.linkThumbBusy[m.ID] {
+		return nil
+	}
+	id := m.ID // m points into v.msgs, which an upsert may shift before the decode ends
+	v.linkThumbBusy[id] = true
+	gen := v.gen
+	raw := slices.Clone(m.LinkThumb)
+	go func() {
+		thumbSlot <- struct{}{}
+		img, err := coverImage(bytes.NewReader(raw), w, h)
+		<-thumbSlot
+		v.canvas.Synchronize(func() {
+			if gen != v.gen || v.canvas.IsDisposed() {
+				return
+			}
+			if i := v.index(id); i < 0 || !bytes.Equal(v.msgs[i].LinkThumb, raw) {
+				return // the preview changed while decoding; the new one is decoded on its own
+			}
+			delete(v.linkThumbBusy, id)
+			var bmp *walk.Bitmap
+			if err == nil {
+				bmp, err = walk.NewBitmapFromImageForDPI(img, v.canvas.DPI())
+			}
+			logErr("link thumbnail of message "+id, err)
+			v.linkBitmaps.put(id, thumbBitmap{bmp: bmp, w: w, h: h})
+			logErr("chat repaint", v.canvas.Invalidate())
+		})
+	}()
+	return nil
+}
+
 // decodeCapped decodes a JPEG or PNG after reading its size: one of more than limit pixels is
 // refused undecoded, so a hostile file cannot make the decoder allocate gigabytes.
 func decodeCapped(r io.ReadSeeker, limit int) (image.Image, error) {
@@ -823,7 +1006,7 @@ func (v *ChatView) describe(i int) string {
 	who := v.senderOf(*m)
 	text, spans, muted := bubbleText(m, b.info, v.dir)
 	if !muted {
-		text, _, _ = formatText(text, spans) // read the words, not *bold*'s stars
+		text, _, _, _, _ = formatBubbleText(text, spans) // read the words, not *bold*'s stars
 	}
 	switch b.kind {
 	case kindImage:
@@ -904,11 +1087,15 @@ func (v *ChatView) key(k walk.Key) bool {
 	return ok
 }
 
+func dragThresholdX() int { return max(4, int(win.GetSystemMetrics(win.SM_CXDRAG))) }
+func dragThresholdY() int { return max(4, int(win.GetSystemMetrics(win.SM_CYDRAG))) }
+
 func (v *ChatView) mouseDown(x, y int, b walk.MouseButton) {
 	if b != walk.LeftButton || v.scroll.press(x, y) {
 		return
 	}
 	v.jumping = ""
+	v.pressSpan = spanPress{}
 	// resolve the message against the view the user saw, then take focus, then act on it
 	i, prev := v.hit(x, y), v.focusIndex()
 	if i >= 0 {
@@ -943,6 +1130,11 @@ func (v *ChatView) mouseDown(x, y int, b walk.MouseButton) {
 	if in(bub.quotedBox, x, y-v.screenY(i)) {
 		v.setSel(textMark{}, textMark{})
 		v.jumpToMessage(m.QuotedID)
+		return
+	}
+	if n == 1 && mods == 0 && in(bub.linkCard, x, y-v.screenY(i)) && bub.linkTargetURL != "" {
+		v.setSel(textMark{}, textMark{})
+		v.pressSpan.beginCard(m.ID, bub, x, y-v.screenY(i))
 		return
 	}
 	// a press on text selects, so a double-click on a caption picks a word and leaves the media be
@@ -996,6 +1188,9 @@ func (v *ChatView) pressText(x, y, n int) {
 	switch n {
 	case 1:
 		v.dragging, v.drag = true, walk.Point{X: x, Y: y}
+		ms := &gdiMeasurer{dpi: v.canvas.DPI(), cdpi: v.cdpi}
+		v.pressSpan.beginSpan(id, v.lay.cache[id], v.lay.lineH, ms, x, y-v.screenY(p.msg))
+		logErr("chat hit test", ms.close())
 	case 2:
 		a, b = wordAt(units, p.off)
 	default:
@@ -1006,17 +1201,131 @@ func (v *ChatView) pressText(x, y, n int) {
 }
 
 func (v *ChatView) mouseMove(x, y int, b walk.MouseButton) {
-	if !v.dragging {
-		return
-	}
 	if b&walk.LeftButton == 0 { // released where the canvas didn't hear it
 		v.dragging = false
+		v.pressSpan = spanPress{}
+		return
+	}
+	if v.pressSpan.active {
+		i := v.index(v.pressSpan.msgID)
+		if i < 0 {
+			v.pressSpan = spanPress{}
+		} else if !v.pressSpan.moved(x, y-v.screenY(i), dragThresholdX(), dragThresholdY()) {
+			return // keep link/phone click candidate clean until pointer crosses drag threshold
+		}
+	}
+	if !v.dragging {
 		return
 	}
 	v.drag = walk.Point{X: x, Y: y}
 	v.extend()
 	if y < 0 || y >= v.view {
 		v.armScroll()
+	}
+}
+
+func (v *ChatView) mouseUp(x, y int, b walk.MouseButton) {
+	if b != walk.LeftButton {
+		return
+	}
+	v.dragging = false
+	if !v.pressSpan.active {
+		return
+	}
+	msgID := v.pressSpan.msgID
+	i := v.hit(x, y)
+	if i < 0 || v.msgs[i].ID != msgID {
+		v.pressSpan = spanPress{}
+		return
+	}
+	_, _, hasSel := v.selection()
+	ms := &gdiMeasurer{dpi: v.canvas.DPI(), cdpi: v.cdpi}
+	target, ok := v.pressSpan.finish(v.lay.cache[msgID], v.lay.lineH, ms, x, y-v.screenY(i), dragThresholdX(), dragThresholdY(), hasSel)
+	logErr("chat hit test", ms.close())
+	if !ok {
+		return
+	}
+	pt := win.POINT{X: int32(x), Y: int32(y)}
+	win.ClientToScreen(v.canvas.Handle(), &pt)
+	v.showSpanPopup(target, walk.Point{X: int(pt.X), Y: int(pt.Y)})
+}
+
+func dispatchUI(sameThread bool, sync func(func()), fn func()) {
+	if sameThread || sync == nil {
+		fn()
+		return
+	}
+	sync(fn)
+}
+
+func runOnUI(w *walk.CustomWidget, fn func()) {
+	if w == nil {
+		fn()
+		return
+	}
+	if w.IsDisposed() {
+		return
+	}
+	h := w.Handle()
+	dispatchUI(h != 0 && win.GetWindowThreadProcessId(h, nil) == windows.GetCurrentThreadId(), w.Synchronize, fn)
+}
+
+func (v *ChatView) showSpanPopup(target spanTarget, screenPt walk.Point) {
+	v.DismissPopup()
+	owner := v.canvas.Form()
+	if owner == nil {
+		return
+	}
+	var model *linkPopupModel
+	if target.kind == linkify.SpanURL {
+		model = newLinkPopupModel(target.raw)
+	} else {
+		model = newPhonePopupModel(target.raw)
+	}
+	lp, err := newLinkPopup(owner, v.pal, screenPt, model)
+	if err != nil {
+		logErr("link popup", err)
+		return
+	}
+	v.activePopup = lp
+	if target.kind == linkify.SpanPhone {
+		if v.onCheckPhone != nil {
+			v.onCheckPhone(target.raw, func(registered bool, display, jid string) {
+				runOnUI(v.canvas, func() {
+					lp.updatePhoneCheck(registered, display, jid)
+				})
+			})
+		} else {
+			lp.updatePhoneCheck(false, "", "")
+		}
+	}
+	opener := win.GetFocus()
+	res := lp.dlg.Run()
+	picked, esc := lp.picked, lp.esc
+	lp.model.close()
+	if v.activePopup == lp {
+		v.activePopup = nil
+	}
+	lp.dlg.Dispose()
+	if esc && opener != 0 {
+		win.SetFocus(opener)
+	}
+	if res != walk.DlgCmdOK || picked == nil {
+		return
+	}
+	switch picked.action {
+	case popupOpenLink:
+		if v.onOpenLink != nil {
+			v.onOpenLink(picked.url)
+		}
+	case popupCopyLink:
+		v.toClipboard(picked.url)
+	case popupChatWith:
+		if v.onOpenPhoneChat != nil {
+			v.onOpenPhoneChat(picked.jid, picked.display)
+		}
+	case popupCopyPhone:
+		v.toClipboard(picked.raw)
 	}
 }
 
@@ -1170,12 +1479,14 @@ func (v *ChatView) copyPicked() bool {
 }
 
 // buildMenu makes the context menu: Copy copies the selected text, else the picked or focused
-// messages; Select picks the focused message.
+// messages; Select picks the focused message. Dynamic items for detected links/phones on the
+// focused message are refreshed in menuAt.
 func (v *ChatView) buildMenu() error {
 	m, err := walk.NewMenu()
 	if err != nil {
 		return err
 	}
+	v.menu = m
 	v.canvas.Disposing().Attach(m.Dispose)
 	for _, it := range []struct {
 		text string
@@ -1203,6 +1514,86 @@ func (v *ChatView) buildMenu() error {
 	return nil
 }
 
+// messageLinkPhoneSpans returns unique detected URLs and phone numbers on bubble b (capped for menus).
+func messageLinkPhoneSpans(b bubble) (urls, phones []string) {
+	const maxItems = 5
+	addUnique := func(dst []string, val string) []string {
+		if val == "" || len(dst) >= maxItems || slices.Contains(dst, val) {
+			return dst
+		}
+		return append(dst, val)
+	}
+	for _, sp := range b.linkSpans {
+		urls = addUnique(urls, string(utf16.Decode(b.units[sp[0]:sp[1]])))
+	}
+	urls = addUnique(urls, b.linkTargetURL)
+	for _, sp := range b.phoneSpans {
+		phones = addUnique(phones, string(utf16.Decode(b.units[sp[0]:sp[1]])))
+	}
+	return urls, phones
+}
+
+func shortMenuLabel(s string, maxRunes int) string {
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	return string(r[:max(1, maxRunes-1)]) + "…"
+}
+
+func (v *ChatView) refreshContextMenu(anchor win.POINT) {
+	if v.menu == nil {
+		return
+	}
+	acts := v.menu.Actions()
+	for _, a := range v.dynActions {
+		_ = acts.Remove(a)
+	}
+	v.dynActions = nil
+	i := v.focusIndex()
+	if i < 0 {
+		return
+	}
+	b := v.lay.cache[v.msgs[i].ID]
+	urls, phones := messageLinkPhoneSpans(b)
+	if len(urls) == 0 && len(phones) == 0 {
+		return
+	}
+	addAction := func(a *walk.Action) {
+		if err := acts.Add(a); err == nil {
+			v.dynActions = append(v.dynActions, a)
+		}
+	}
+	addItem := func(label string, fn func()) {
+		a := walk.NewAction()
+		if err := a.SetText(strings.ReplaceAll(label, "&", "&&")); err != nil {
+			return
+		}
+		a.Triggered().Attach(fn)
+		addAction(a)
+	}
+	addAction(walk.NewSeparatorAction())
+	for _, u := range urls {
+		openLbl, copyLbl := "Open link", "Copy link"
+		if len(urls) > 1 {
+			short := shortMenuLabel(u, 36)
+			openLbl, copyLbl = "Open "+short, "Copy "+short
+		}
+		addItem(openLbl, func() {
+			if v.onOpenLink != nil {
+				v.onOpenLink(u)
+			}
+		})
+		addItem(copyLbl, func() { v.toClipboard(u) })
+	}
+	for _, ph := range phones {
+		addItem("Phone actions: "+ph, func() {
+			v.showSpanPopup(spanTarget{kind: linkify.SpanPhone, raw: ph}, walk.Point{X: int(anchor.X), Y: int(anchor.Y)})
+		})
+		addItem("Copy "+ph, func() { v.toClipboard(ph) })
+	}
+}
+
 // menuAt decides where the context menu asked for at screen point (x, y) opens: at the pointer over a
 // message (which it focuses, dropping picks and selection that don't include it), at the focused
 // message from the keyboard (x and y are -1), nowhere else.
@@ -1217,6 +1608,7 @@ func (v *ChatView) menuAt(x, y int32) (int32, int32, bool) {
 		b := v.lay.cache[v.msgs[i].ID].box
 		pt = win.POINT{X: int32(b.X + b.Width/2), Y: int32(max(0, min(v.view-1, v.screenY(i)+b.Height/2)))}
 		win.ClientToScreen(h, &pt)
+		v.refreshContextMenu(pt)
 		return pt.X, pt.Y, true
 	}
 	win.ScreenToClient(h, &pt)
@@ -1232,6 +1624,7 @@ func (v *ChatView) menuAt(x, y int32) (int32, int32, bool) {
 	if !v.picked[v.msgs[i].ID] {
 		v.setPicks(nil)
 	}
+	v.refreshContextMenu(win.POINT{X: x, Y: y})
 	return x, y, true
 }
 
@@ -1402,6 +1795,22 @@ func (v *ChatView) paintPick(c *walk.Canvas, b bubble, dy int) error {
 
 var cardIcons = map[string]icons.Icon{"document": icons.IconDocument, "video": icons.IconVideo, "audio": icons.IconAudio, "sticker": icons.IconEmoji}
 
+func linkSpanColor(p theme.Palette) walk.Color {
+	if isDark(p) {
+		return theme.Color(p.TickRead)
+	}
+	return walk.RGB(0x02, 0x7e, 0xb5)
+}
+
+func phoneSpanColor(p theme.Palette) walk.Color {
+	if isDark(p) {
+		return theme.Color(p.Accent)
+	}
+	return walk.RGB(0x00, 0x80, 0x69)
+}
+
+const linkTextFormat = walk.TextLeft | walk.TextTop | walk.TextWordbreak | walk.TextEndEllipsis | walk.TextNoPrefix
+
 // paintBubble paints message m's bubble b with its top at canvas y dy, the units sel of its text
 // highlighted as selected; album holds an album's photos, m first.
 func (v *ChatView) paintBubble(c *walk.Canvas, m *store.Message, b bubble, dy int, sel textLine, album []store.Message) error {
@@ -1491,6 +1900,31 @@ func (v *ChatView) paintBubble(c *walk.Canvas, m *store.Message, b bubble, dy in
 			errs = append(errs, icons.Draw(c, icons.IconDownload, dl, secondary))
 		}
 	}
+	if b.linkCard.Width > 0 {
+		card := at(b.linkCard)
+		cardTint := uint32(0x16000000)
+		if isDark(p) {
+			cardTint = 0x33000000
+		}
+		errs = append(errs, icons.FillRoundedARGB(c, card, s(6), cardTint))
+		if b.linkThumb.Width > 0 {
+			tr := at(b.linkThumb)
+			if bmp := v.linkThumbFor(m, tr.Width, tr.Height); bmp != nil {
+				errs = append(errs, c.DrawImageStretchedPixels(bmp, tr))
+			} else {
+				errs = append(errs, icons.FillRoundedARGB(c, tr, s(4), cardTint))
+			}
+		}
+		if b.linkTitle.Width > 0 {
+			errs = append(errs, drawText(c, dpi, b.linkTitleText, namePt, walk.FontBold, theme.Color(p.Text), at(b.linkTitle), linkTextFormat))
+		}
+		if b.linkDesc.Width > 0 {
+			errs = append(errs, drawText(c, dpi, b.linkDescText, metaPt, 0, secondary, at(b.linkDesc), linkTextFormat))
+		}
+		if b.linkDomain.Width > 0 {
+			errs = append(errs, drawText(c, dpi, b.linkDomainText, metaPt, 0, secondary, at(b.linkDomain), leftText))
+		}
+	}
 	if b.text.Width > 0 {
 		_, _, muted := bubbleText(m, b.info, v.dir)
 		color, style := theme.Color(p.Text), walk.FontStyle(0)
@@ -1537,18 +1971,32 @@ func (v *ChatView) paintBubble(c *walk.Canvas, m *store.Message, b bubble, dy in
 				}
 				errs = append(errs, err)
 			}
-			if len(b.mentions) == 0 && b.styles == nil {
+			if len(b.mentions) == 0 && len(b.linkSpans) == 0 && len(b.phoneSpans) == 0 && b.styles == nil {
 				errs = append(errs, drawText(c, dpi, string(utf16.Decode(lineUnits)), bodyPt, style, color, r, walk.TextSingleLine|walk.TextNoPrefix))
-			} else { // runs of one colour (mentions in the accent) and one style
+			} else { // runs of one colour (mentions, links, phones) and one style
 				styles, x := lineStyles(b, ln), getAdv()
+				linkCol, phoneCol := linkSpanColor(p), phoneSpanColor(p)
 				look := func(u int) (walk.Color, walk.FontStyle) {
 					col, st := color, style
 					if styles != nil {
 						st |= styles[u]
 					}
+					pos := ln.start + u
 					for _, sp := range b.mentions {
-						if ln.start+u >= sp[0] && ln.start+u < sp[1] {
+						if pos >= sp[0] && pos < sp[1] {
 							col = theme.Color(p.Accent)
+						}
+					}
+					for _, sp := range b.linkSpans {
+						if pos >= sp[0] && pos < sp[1] {
+							col = linkCol
+							st |= walk.FontUnderline
+						}
+					}
+					for _, sp := range b.phoneSpans {
+						if pos >= sp[0] && pos < sp[1] {
+							col = phoneCol
+							st |= walk.FontUnderline
 						}
 					}
 					return col, st

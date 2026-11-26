@@ -12,6 +12,7 @@ import (
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"google.golang.org/protobuf/proto"
 
+	"wa-go/internal/linkify"
 	"wa-go/internal/store"
 	"wa-go/internal/theme"
 	"wa-go/internal/ui/icons"
@@ -926,5 +927,412 @@ func TestWhatIsFetchedAndThumbnailedOnSight(t *testing.T) {
 		if fetch, thumb := onSight(store.Message{Type: c.typ, MediaPath: c.path}); fetch != c.fetch || thumb != c.thumb {
 			t.Errorf("%s %q: fetch %v thumb %v, want %v %v", c.typ, c.path, fetch, thumb, c.fetch, c.thumb)
 		}
+	}
+}
+
+func TestBubbleLinkPreviewCardAndToggle(t *testing.T) {
+	rich := store.Message{
+		ID:        "rich",
+		Type:      "text",
+		Body:      "check https://www.example.com/docs",
+		SenderJID: alice,
+		LinkURL:   "https://www.example.com/docs",
+		LinkTitle: "Example Docs",
+		LinkDesc:  "Complete documentation for developers",
+		LinkThumb: []byte{0xff, 0xd8, 0xff},
+	}
+	textOnly := store.Message{
+		ID:        "textonly",
+		Type:      "text",
+		Body:      "read https://example.org/post",
+		SenderJID: alice,
+		LinkURL:   "https://example.org/post",
+		LinkTitle: "Example Post",
+		LinkDesc:  "No thumbnail here",
+	}
+	replyWithPreview := store.Message{
+		ID:           "reply",
+		Type:         "text",
+		Body:         "see https://example.com/docs",
+		SenderJID:    alice,
+		QuotedID:     "q1",
+		QuotedSender: bob,
+		QuotedBody:   "orig",
+		LinkURL:      "https://example.com/docs",
+		LinkTitle:    "Example Docs",
+	}
+
+	l := &chatLayout{linkPreviews: true}
+	l.update([]store.Message{rich, textOnly, replyWithPreview}, viewW, 96, &monoMeasurer{})
+
+	br := l.cache["rich"]
+	if br.linkCard.Width == 0 || br.linkCard.Height == 0 {
+		t.Fatalf("rich message linkCard is zero: %+v", br.linkCard)
+	}
+	if br.linkThumb.Width == 0 || br.linkThumb.Height == 0 || !inside(br.linkThumb, br.linkCard) {
+		t.Errorf("rich linkThumb %+v not inside linkCard %+v", br.linkThumb, br.linkCard)
+	}
+	if br.linkTitle.Width == 0 || br.linkDesc.Width == 0 || br.linkDomain.Width == 0 {
+		t.Errorf("rich card text rects missing: title=%+v desc=%+v domain=%+v", br.linkTitle, br.linkDesc, br.linkDomain)
+	}
+	if br.linkTitleText != "Example Docs" || br.linkDescText != "Complete documentation for developers" ||
+		br.linkDomainText != "example.com" || br.linkTargetURL != "https://www.example.com/docs" {
+		t.Errorf("rich card labels = %q / %q / %q / %q", br.linkTitleText, br.linkDescText, br.linkDomainText, br.linkTargetURL)
+	}
+	if !inside(br.linkCard, br.box) || !below(br.text, br.linkCard) {
+		t.Errorf("rich linkCard %+v not inside box %+v or above text %+v", br.linkCard, br.box, br.text)
+	}
+
+	bt := l.cache["textonly"]
+	if bt.linkCard.Width == 0 || bt.linkCard.Height == 0 {
+		t.Fatalf("text-only message linkCard is zero: %+v", bt.linkCard)
+	}
+	if bt.linkThumb != (walk.Rectangle{}) {
+		t.Errorf("text-only message has non-zero linkThumb: %+v", bt.linkThumb)
+	}
+	if !below(bt.text, bt.linkCard) || bt.linkDomainText != "example.org" {
+		t.Errorf("text-only card %+v text %+v domain %q", bt.linkCard, bt.text, bt.linkDomainText)
+	}
+
+	brep := l.cache["reply"]
+	if !below(brep.linkCard, brep.quotedBox) || !below(brep.text, brep.linkCard) {
+		t.Errorf("reply preview card %+v should be below quote %+v and above text %+v", brep.linkCard, brep.quotedBox, brep.text)
+	}
+
+	// SetLinkPreviews(false) collapses linkCard to zero
+	v := &ChatView{
+		linkPreviews:  true,
+		lay:           chatLayout{linkPreviews: true},
+		linkRequested: map[string]bool{},
+		linkThumbBusy: map[string]bool{},
+		linkBitmaps:   newLRU(thumbCacheSize, func(thumbBitmap) {}),
+	}
+	v.open(acctA, alice, []store.Message{rich, textOnly})
+	v.SetLinkPreviews(false)
+	v.lay.update(v.msgs, viewW, 96, &monoMeasurer{})
+	for _, id := range []string{"rich", "textonly"} {
+		b := v.lay.cache[id]
+		if b.linkCard != (walk.Rectangle{}) || b.linkThumb != (walk.Rectangle{}) ||
+			b.linkTitle != (walk.Rectangle{}) || b.linkDesc != (walk.Rectangle{}) || b.linkDomain != (walk.Rectangle{}) {
+			t.Errorf("%s after SetLinkPreviews(false): card geometry not collapsed: %+v", id, b)
+		}
+	}
+}
+
+func TestBubbleInlineLinksAndPhonesWithFormatting(t *testing.T) {
+	msg := store.Message{
+		ID:        "m1",
+		Type:      "text",
+		Body:      "*bold* https://example.com/foo_bar_baz +62 882-0007-83234",
+		SenderJID: alice,
+	}
+	ms := &monoMeasurer{}
+	l := layOut(t, false, msg)
+	b := l.cache["m1"]
+
+	wantShown := "bold https://example.com/foo_bar_baz +62 882-0007-83234"
+	if got := string(utf16.Decode(b.units)); got != wantShown {
+		t.Fatalf("shown = %q, want %q", got, wantShown)
+	}
+	if len(b.linkSpans) != 1 || b.linkSpans[0] != [2]int{5, 36} {
+		t.Fatalf("linkSpans = %v, want [[5 36]]", b.linkSpans)
+	}
+	if len(b.phoneSpans) != 1 || b.phoneSpans[0] != [2]int{37, 55} {
+		t.Fatalf("phoneSpans = %v, want [[37 55]]", b.phoneSpans)
+	}
+	if got := string(utf16.Decode(b.units[b.linkSpans[0][0]:b.linkSpans[0][1]])); got != "https://example.com/foo_bar_baz" {
+		t.Errorf("link span text = %q", got)
+	}
+	if got := string(utf16.Decode(b.units[b.phoneSpans[0][0]:b.phoneSpans[0][1]])); got != "+62 882-0007-83234" {
+		t.Errorf("phone span text = %q", got)
+	}
+	for u := 0; u < 4; u++ {
+		if b.styles[u]&walk.FontBold == 0 {
+			t.Errorf("bold unit %d style = %v, want FontBold", u, b.styles[u])
+		}
+	}
+	for u := b.linkSpans[0][0]; u < b.linkSpans[0][1]; u++ {
+		if b.styles[u]&walk.FontItalic != 0 {
+			t.Fatalf("URL unit %d was italicized (styles[%d]=%v)", u, u, b.styles[u])
+		}
+	}
+
+	// spanAt hits both spans and misses non-span text (7px/char, 20px lineH in monoMeasurer)
+	kind, raw, sp, ok := spanAt(b, l.lineH, ms, b.text.X+5*7+3, b.text.Y+10)
+	if !ok || kind != linkify.SpanURL || raw != "https://example.com/foo_bar_baz" || sp != b.linkSpans[0] {
+		t.Errorf("spanAt URL = (%v, %q, %v, %v)", kind, raw, sp, ok)
+	}
+	kind, raw, sp, ok = spanAt(b, l.lineH, ms, b.text.X+37*7+3, b.text.Y+10)
+	if !ok || kind != linkify.SpanPhone || raw != "+62 882-0007-83234" || sp != b.phoneSpans[0] {
+		t.Errorf("spanAt phone = (%v, %q, %v, %v)", kind, raw, sp, ok)
+	}
+	for _, miss := range [][2]int{
+		{b.text.X + 2, b.text.Y + 10},                // on "bold"
+		{b.text.X + 36*7 + 3, b.text.Y + 10},         // space between URL and phone
+		{b.text.X + b.text.Width + 5, b.text.Y + 10}, // past right edge
+		{b.text.X + 5*7 + 3, b.text.Y - 2},           // above text
+	} {
+		if k, r, _, ok := spanAt(b, l.lineH, ms, miss[0], miss[1]); ok {
+			t.Errorf("spanAt(%d, %d) unexpectedly hit (%v, %q)", miss[0], miss[1], k, r)
+		}
+	}
+
+	// Surrogate pair emoji before formatting & URL preserves UTF-16 offsets and locks _x_
+	emojiMsg := store.Message{
+		ID:        "m2",
+		Type:      "text",
+		Body:      "😀 *hi* https://example.com/_x_",
+		SenderJID: alice,
+	}
+	l2 := layOut(t, false, emojiMsg)
+	b2 := l2.cache["m2"]
+	if len(b2.linkSpans) != 1 || b2.linkSpans[0] != [2]int{6, 29} {
+		t.Fatalf("emoji linkSpans = %v, want [[6 29]]", b2.linkSpans)
+	}
+	for u := b2.linkSpans[0][0]; u < b2.linkSpans[0][1]; u++ {
+		if b2.styles[u]&walk.FontItalic != 0 {
+			t.Errorf("emoji URL unit %d italicized", u)
+		}
+	}
+}
+
+func TestClickVsDragOnLink(t *testing.T) {
+	msg := store.Message{
+		ID:        "m1",
+		Type:      "text",
+		Body:      "visit https://example.com/foo now",
+		SenderJID: alice,
+		LinkURL:   "https://example.com/foo",
+		LinkTitle: "Example",
+	}
+	ms := &monoMeasurer{}
+	l := &chatLayout{linkPreviews: true}
+	l.update([]store.Message{msg}, viewW, 96, ms)
+	b := l.cache["m1"]
+
+	urlX := b.text.X + 6*7 + 3
+	urlY := b.text.Y + 10
+
+	var opened []string
+	// 1. Down + up within drag threshold opens link callback (no selection)
+	var tr spanPress
+	if !tr.beginSpan(msg.ID, b, l.lineH, ms, urlX, urlY) {
+		t.Fatal("beginSpan missed URL")
+	}
+	if crossed := tr.moved(urlX+2, urlY+1, 4, 4); crossed {
+		t.Fatal("small jitter within threshold treated as drag")
+	}
+	target, ok := tr.finish(b, l.lineH, ms, urlX+2, urlY+1, 4, 4, false)
+	if !ok || target.kind != linkify.SpanURL || target.raw != "https://example.com/foo" {
+		t.Fatalf("within-threshold release = (%+v, %v), want SpanURL", target, ok)
+	}
+	opened = append(opened, target.raw)
+	if len(opened) != 1 || opened[0] != "https://example.com/foo" {
+		t.Errorf("opened = %v", opened)
+	}
+
+	// 2. Down + drag past threshold + up selects text without firing link click
+	opened = nil
+	if !tr.beginSpan(msg.ID, b, l.lineH, ms, urlX, urlY) {
+		t.Fatal("beginSpan missed URL on drag test")
+	}
+	if crossed := tr.moved(urlX+20, urlY, 4, 4); !crossed {
+		t.Fatal("drag beyond threshold did not cross")
+	}
+	if _, ok := tr.finish(b, l.lineH, ms, urlX+20, urlY, 4, 4, true); ok {
+		t.Error("drag release unexpectedly fired link click")
+	}
+	// Even if pointer moves back within threshold before mouseUp, crossed drag stays a drag
+	if !tr.beginSpan(msg.ID, b, l.lineH, ms, urlX, urlY) {
+		t.Fatal("beginSpan missed URL on drag-and-return test")
+	}
+	tr.moved(urlX+20, urlY, 4, 4)
+	if _, ok := tr.finish(b, l.lineH, ms, urlX+1, urlY, 4, 4, false); ok {
+		t.Error("dragged-then-returned release unexpectedly fired link click")
+	}
+	if len(opened) != 0 {
+		t.Errorf("drag fired link callbacks: %v", opened)
+	}
+
+	// 3. Single-click inside linkCard triggers link target; dragging inside linkCard does not
+	cardX, cardY := b.linkCard.X+10, b.linkCard.Y+10
+	if !tr.beginCard(msg.ID, b, cardX, cardY) {
+		t.Fatal("beginCard missed linkCard")
+	}
+	if target, ok := tr.finish(b, l.lineH, ms, cardX+1, cardY+1, 4, 4, false); !ok || target.kind != linkify.SpanURL || target.raw != "https://example.com/foo" {
+		t.Errorf("card click = (%+v, %v)", target, ok)
+	}
+	if !tr.beginCard(msg.ID, b, cardX, cardY) {
+		t.Fatal("beginCard missed linkCard for drag")
+	}
+	tr.moved(cardX+20, cardY, 4, 4)
+	if _, ok := tr.finish(b, l.lineH, ms, cardX+20, cardY, 4, 4, false); ok {
+		t.Error("drag on linkCard fired link click")
+	}
+}
+
+func TestNeedLinkPreviewOnSightAndSpanColors(t *testing.T) {
+	req := map[string]bool{}
+	mURL := store.Message{ID: "u1", Type: "text", Body: "see https://example.com"}
+	mWithTitle := store.Message{ID: "u2", Type: "text", Body: "see https://example.com", LinkTitle: "Already"}
+	mNoURL := store.Message{ID: "u3", Type: "text", Body: "hello world"}
+	mMedia := store.Message{ID: "u4", Type: "image", Body: "https://example.com"}
+
+	if needLinkPreviewOnSight(mURL, false, req) {
+		t.Error("requested preview when disabled")
+	}
+	if !needLinkPreviewOnSight(mURL, true, req) {
+		t.Error("did not request preview for visible URL message")
+	}
+	req[mURL.ID] = true
+	if needLinkPreviewOnSight(mURL, true, req) {
+		t.Error("requested preview twice for same message")
+	}
+	if needLinkPreviewOnSight(mWithTitle, true, req) {
+		t.Error("requested preview when LinkTitle already present")
+	}
+	if needLinkPreviewOnSight(mNoURL, true, req) {
+		t.Error("requested preview when message has no URL")
+	}
+	if needLinkPreviewOnSight(mMedia, true, req) {
+		t.Error("requested preview for non-text message")
+	}
+
+	dark := theme.GetPalette(theme.ThemeDark)
+	light := theme.GetPalette(theme.ThemeLight)
+	if linkSpanColor(dark) != theme.Color(dark.TickRead) {
+		t.Errorf("dark link color = %v, want TickRead", linkSpanColor(dark))
+	}
+	if linkSpanColor(light) == theme.Color(light.TickRead) {
+		t.Errorf("light link color should be darkened for contrast, got %v", linkSpanColor(light))
+	}
+}
+
+func TestApplyLinkPreviewAndUpsertPreservation(t *testing.T) {
+	v := &ChatView{
+		linkPreviews:  true,
+		lay:           chatLayout{linkPreviews: true},
+		linkRequested: map[string]bool{},
+		linkThumbBusy: map[string]bool{},
+		linkBitmaps:   newLRU(thumbCacheSize, func(thumbBitmap) {}),
+	}
+	orig := store.Message{ID: "m1", AccountID: acctA, ChatJID: alice, Type: "text", Body: "see https://example.com", Status: store.StatusSent, Timestamp: 10}
+	v.open(acctA, alice, []store.Message{orig})
+
+	v.ApplyLinkPreview("m1", "https://example.com", "https://example.com/canon", "Title", "Desc", []byte{1, 2, 3})
+	got := v.msgs[0]
+	if got.LinkTitle != "Title" || got.LinkDesc != "Desc" || got.LinkCanonical != "https://example.com/canon" || len(got.LinkThumb) != 3 {
+		t.Fatalf("after ApplyLinkPreview: %+v", got)
+	}
+
+	// Receipt update without Link* fields must preserve preview metadata
+	receipt := orig
+	receipt.Status = store.StatusRead
+	if !v.upsert(receipt) {
+		t.Fatal("receipt upsert failed")
+	}
+	got = v.msgs[0]
+	if got.Status != store.StatusRead || got.LinkTitle != "Title" || got.LinkDesc != "Desc" || len(got.LinkThumb) != 3 {
+		t.Fatalf("receipt wiped link preview: %+v", got)
+	}
+
+	// Context menu link/phone extraction
+	l := &chatLayout{linkPreviews: true}
+	l.update([]store.Message{{
+		ID:        "m2",
+		Type:      "text",
+		Body:      "visit https://example.com or call +62 812-3456-7890",
+		LinkURL:   "https://example.com",
+		LinkTitle: "Example",
+	}}, viewW, 96, &monoMeasurer{})
+	urls, phones := messageLinkPhoneSpans(l.cache["m2"])
+	if !slices.Equal(urls, []string{"https://example.com"}) || !slices.Equal(phones, []string{"+62 812-3456-7890"}) {
+		t.Errorf("messageLinkPhoneSpans = urls=%v phones=%v", urls, phones)
+	}
+}
+
+func TestLinkCardTargetMustBeInBody(t *testing.T) {
+	msgs := []store.Message{
+		{ID: "spoof", Type: "text", Body: "see https://good.example/a", SenderJID: alice,
+			LinkURL: "https://evil.example/", LinkTitle: "Good"},
+		{ID: "bare", Type: "text", Body: "visit Example.com/x today", SenderJID: alice,
+			LinkURL: "example.com/x", LinkTitle: "Bare"},
+		{ID: "none", Type: "text", Body: "no link here", SenderJID: alice,
+			LinkURL: "https://evil.example/", LinkCanonical: "https://evil.example/c", LinkTitle: "Evil"},
+	}
+	l := &chatLayout{linkPreviews: true}
+	l.update(msgs, viewW, 96, &monoMeasurer{})
+
+	if got := l.cache["spoof"].linkTargetURL; got != "https://good.example/a" {
+		t.Errorf("spoofed MatchedText: target %q, want the body's URL", got)
+	}
+	if urls, _ := messageLinkPhoneSpans(l.cache["spoof"]); slices.Contains(urls, "https://evil.example/") {
+		t.Errorf("context menu offers a URL not in the body: %v", urls)
+	}
+	if got := l.cache["bare"].linkTargetURL; got != "example.com/x" {
+		t.Errorf("bare-domain MatchedText in body: target %q, want it kept", got)
+	}
+	b := l.cache["none"]
+	if b.linkTargetURL != "" {
+		t.Errorf("no URL in body: target %q, want none", b.linkTargetURL)
+	}
+	if b.linkCard.Width == 0 {
+		t.Fatal("the card is still shown")
+	}
+	if (&spanPress{}).beginCard("none", b, b.linkCard.X+1, b.linkCard.Y+1) {
+		t.Error("a card with no target in the body must not be clickable")
+	}
+	if urls, _ := messageLinkPhoneSpans(b); len(urls) != 0 {
+		t.Errorf("context menu offers %v for a body without links", urls)
+	}
+}
+
+func TestUpsertDropsLinkPreviewWhenBodyChanges(t *testing.T) {
+	v := &ChatView{
+		linkPreviews:  true,
+		lay:           chatLayout{linkPreviews: true},
+		linkRequested: map[string]bool{},
+		linkThumbBusy: map[string]bool{},
+		linkBitmaps:   newLRU(thumbCacheSize, func(thumbBitmap) {}),
+	}
+	orig := store.Message{ID: "m1", AccountID: acctA, ChatJID: alice, Type: "text", Body: "see https://old.example",
+		Timestamp: 10, LinkURL: "https://old.example", LinkTitle: "Old", LinkThumb: []byte{1}}
+	v.open(acctA, alice, []store.Message{orig})
+
+	edited := orig
+	edited.Body, edited.LinkURL, edited.LinkTitle, edited.LinkThumb = "see https://new.example", "", "", nil
+	v.upsert(edited)
+	if got := v.msgs[0]; got.LinkURL != "" || got.LinkTitle != "" || len(got.LinkThumb) != 0 {
+		t.Fatalf("edit kept the old preview: %+v", got)
+	}
+
+	// A late preview for the old URL must not land on the edited body.
+	v.ApplyLinkPreview("m1", "https://old.example", "", "Old", "", nil)
+	if got := v.msgs[0]; got.LinkTitle != "" {
+		t.Fatalf("stale preview applied to edited message: %+v", got)
+	}
+
+	revoked := edited
+	revoked.Body, revoked.Type = "", "revoked"
+	v.upsert(revoked)
+	if got := v.msgs[0]; got.LinkTitle != "" || got.LinkURL != "" {
+		t.Fatalf("revoke kept preview data: %+v", got)
+	}
+}
+
+func TestRetryLinkPreviewsForgetsDeclinedRequests(t *testing.T) {
+	v := &ChatView{
+		linkPreviews:  true,
+		lay:           chatLayout{linkPreviews: true},
+		linkRequested: map[string]bool{},
+		linkThumbBusy: map[string]bool{},
+		linkBitmaps:   newLRU(thumbCacheSize, func(thumbBitmap) {}),
+	}
+	m := store.Message{ID: "m1", AccountID: acctA, ChatJID: alice, Type: "text", Body: "see https://example.com", Timestamp: 1}
+	v.open(acctA, alice, []store.Message{m})
+	v.linkRequested[m.ID] = true // asked while hidden; the app declined
+	v.RetryLinkPreviews()
+	if !needLinkPreviewOnSight(m, v.linkPreviews, v.linkRequested) {
+		t.Fatal("after RetryLinkPreviews a message still lacking a preview is asked for again")
 	}
 }

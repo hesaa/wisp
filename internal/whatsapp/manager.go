@@ -106,6 +106,20 @@ type GroupDetails struct {
 	Members     []Member
 }
 
+// LinkPreview carries link preview metadata attached to an outgoing text message.
+type LinkPreview struct {
+	MatchedText, CanonicalURL, Title, Description string
+	Thumb                                         []byte
+}
+
+// PhoneStatus reports whether a phone number is registered on WhatsApp and its canonical JID.
+type PhoneStatus struct {
+	Registered bool
+	JID        string
+}
+
+const maxPhoneCache = 4096
+
 // msgStore is the part of *store.DB the manager writes to.
 type msgStore interface {
 	InsertMessagesBatch([]store.Message) error
@@ -116,7 +130,7 @@ type msgStore interface {
 	ChatExpiration(accountID, chatJID string) (int64, error)
 	UpdateMessageStatus(accountID, chatJID string, ids []string, status string) error
 	MarkChatReadUntil(accountID, chatJID string, until int64) error
-	ReviseMessage(accountID, chatJID, id, msgType, body string) (bool, error)
+	ReviseMessage(accountID, chatJID, id, msgType, body string, link store.LinkPreview) (bool, error)
 	MessageSender(accountID, chatJID, id string) (string, error)
 	SetMediaPath(accountID, chatJID, id, path string) error
 	UpsertPeople(accountID string, people []store.Person) error
@@ -147,6 +161,9 @@ type Manager struct {
 	peopleMu sync.RWMutex
 	people   map[string]store.Person // key: accountID + " " + jid
 	members  map[string][]string     // group participants, key: accountID + " " + group jid; guarded by peopleMu
+
+	phoneMu    sync.Mutex
+	phoneCache map[string]PhoneStatus // key: accountID + "\x00" + phone
 }
 
 // New opens (creating if needed) the whatsmeow session database at sessionPath, which holds every
@@ -163,7 +180,8 @@ func New(ctx context.Context, sessionPath string, db *store.DB, cache *media.Cac
 	}
 	return &Manager{store: db, media: cache, container: container, accounts: map[string]waClient{},
 		connect: (*whatsmeow.Client).Connect, groupsAsked: map[string]bool{}, groupSlots: make(chan struct{}, 2),
-		people: map[string]store.Person{}, members: map[string][]string{}}, nil
+		people: map[string]store.Person{}, members: map[string][]string{},
+		phoneCache: map[string]PhoneStatus{}}, nil
 }
 
 // Start registers a client for every saved device and returns: Accounts lists them at once, while
@@ -239,10 +257,21 @@ func (m *Manager) add(id string, cli waClient) {
 // remove unregisters id unless a newer client (a re-pairing) has replaced cli.
 func (m *Manager) remove(id string, cli waClient) {
 	m.mu.Lock()
-	if m.accounts[id] == cli {
+	removed := m.accounts[id] == cli
+	if removed {
 		delete(m.accounts, id)
 	}
 	m.mu.Unlock()
+	if removed {
+		prefix := id + "\x00"
+		m.phoneMu.Lock()
+		for k := range m.phoneCache {
+			if strings.HasPrefix(k, prefix) {
+				delete(m.phoneCache, k)
+			}
+		}
+		m.phoneMu.Unlock()
+	}
 }
 
 func (m *Manager) client(id string) (waClient, error) {
@@ -262,6 +291,12 @@ var mentionAll = regexp.MustCompile(`(?i)(?:^|\s)@(?:all|everyone)\b`)
 // stored message it answers. mentions are the JIDs text mentions (as @<user part>); in a group,
 // @all or @everyone adds every participant.
 func (m *Manager) SendText(ctx context.Context, accountID, chatJID, text string, reply *store.Message, mentions []string) (store.Message, error) {
+	return m.SendTextWithPreview(ctx, accountID, chatJID, text, reply, mentions, nil)
+}
+
+// SendTextWithPreview behaves like SendText and, when preview is non-nil, sends text as an
+// ExtendedTextMessage carrying the link preview metadata and persists it on the stored message.
+func (m *Manager) SendTextWithPreview(ctx context.Context, accountID, chatJID, text string, reply *store.Message, mentions []string, preview *LinkPreview) (store.Message, error) {
 	cli, err := m.client(accountID)
 	if err != nil {
 		return store.Message{}, err
@@ -277,7 +312,30 @@ func (m *Manager) SendText(ctx context.Context, accountID, chatJID, text string,
 		}
 		mentions = append(slices.Clone(mentions), all...)
 	}
-	msg := &waE2E.Message{Conversation: proto.String(text)}
+	var msg *waE2E.Message
+	var linkCanonical string
+	if preview != nil {
+		etm := &waE2E.ExtendedTextMessage{
+			Text:        proto.String(text),
+			PreviewType: waE2E.ExtendedTextMessage_NONE.Enum(),
+		}
+		if matched := cmp.Or(preview.MatchedText, preview.CanonicalURL); matched != "" {
+			etm.MatchedText = proto.String(matched)
+		}
+		if preview.Title != "" {
+			etm.Title = proto.String(preview.Title)
+		}
+		if preview.Description != "" {
+			etm.Description = proto.String(preview.Description)
+		}
+		if len(preview.Thumb) > 0 {
+			etm.JPEGThumbnail = slices.Clone(preview.Thumb)
+		}
+		msg = &waE2E.Message{ExtendedTextMessage: etm}
+		linkCanonical = preview.CanonicalURL
+	} else {
+		msg = &waE2E.Message{Conversation: proto.String(text)}
+	}
 	if len(mentions) > 0 {
 		seen := map[string]bool{}
 		ci := contextOf(msg)
@@ -289,7 +347,79 @@ func (m *Manager) SendText(ctx context.Context, accountID, chatJID, text string,
 		}
 	}
 	quote(msg, reply)
-	return m.send(ctx, cli, accountID, chat, msg, "")
+	return m.send(ctx, cli, accountID, chat, msg, "", linkCanonical)
+}
+
+// CheckPhones checks whether each phone number (in international format with leading "+") is
+// registered on WhatsApp for accountID, caching results in memory for the session.
+func (m *Manager) CheckPhones(ctx context.Context, accountID string, phones []string) (map[string]PhoneStatus, error) {
+	cli, err := m.client(accountID)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]PhoneStatus, len(phones))
+	var missing []string
+	seenMissing := make(map[string]bool, len(phones))
+
+	m.phoneMu.Lock()
+	for _, phone := range phones {
+		if phone == "" {
+			continue
+		}
+		if st, ok := m.phoneCache[accountID+"\x00"+phone]; ok {
+			out[phone] = st
+			continue
+		}
+		if !seenMissing[phone] {
+			seenMissing[phone] = true
+			missing = append(missing, phone)
+		}
+	}
+	m.phoneMu.Unlock()
+
+	if len(missing) == 0 {
+		return out, nil
+	}
+
+	resps, err := cli.IsOnWhatsApp(ctx, missing)
+	if err != nil {
+		return nil, fmt.Errorf("whatsapp: check phones: %w", err)
+	}
+
+	fetched := make(map[string]PhoneStatus, len(resps))
+	for _, r := range resps {
+		var st PhoneStatus
+		if r.IsIn {
+			st.Registered = true
+			// a phone-number JID, never an LID: chats are keyed by number (pnSource)
+			switch {
+			case r.PhoneNumber.Server == types.DefaultUserServer && r.PhoneNumber.User != "":
+				st.JID = r.PhoneNumber.ToNonAD().String()
+			case r.JID.Server == types.DefaultUserServer && r.JID.User != "":
+				st.JID = r.JID.ToNonAD().String()
+			case strings.TrimPrefix(r.Query, "+") != "":
+				st.JID = types.NewJID(strings.TrimPrefix(r.Query, "+"), types.DefaultUserServer).String()
+			}
+		}
+		if r.Query != "" {
+			fetched[r.Query] = st
+			out[r.Query] = st
+		}
+	}
+
+	m.phoneMu.Lock()
+	if m.phoneCache == nil {
+		m.phoneCache = make(map[string]PhoneStatus)
+	}
+	if len(m.phoneCache)+len(fetched) > maxPhoneCache {
+		clear(m.phoneCache)
+	}
+	for phone, st := range fetched {
+		m.phoneCache[accountID+"\x00"+phone] = st
+	}
+	m.phoneMu.Unlock()
+
+	return out, nil
 }
 
 // GroupParticipants returns the JIDs of the group's participants, from memory once the group was
@@ -353,7 +483,7 @@ func (m *Manager) SendMedia(ctx context.Context, accountID, chatJID, path, capti
 		}
 	}
 	quote(msg, reply)
-	return m.send(ctx, cli, accountID, chat, msg, cached)
+	return m.send(ctx, cli, accountID, chat, msg, cached, "")
 }
 
 // SendGIF sends the MP4 at mp4Path to chatJID as a GIF: a video the recipient's app loops silently.
@@ -383,7 +513,7 @@ func (m *Manager) SendGIF(ctx context.Context, accountID, chatJID, mp4Path strin
 		vm.Height = proto.Uint32(uint32(h))
 	}
 	msg := &waE2E.Message{VideoMessage: vm}
-	return m.send(ctx, cli, accountID, chat, msg, cached)
+	return m.send(ctx, cli, accountID, chat, msg, cached, "")
 }
 
 // ProfilePicture queries the profile picture of jid. It reports ok false with nil error
@@ -642,7 +772,7 @@ func (m *Manager) SetTyping(ctx context.Context, accountID, chatJID string, comp
 
 // send sends msg and stores it as sent; mediaPath is the cached copy of its attachment, if any. In a
 // chat with disappearing messages on, msg disappears too, here and for everyone.
-func (m *Manager) send(ctx context.Context, cli waClient, accountID string, chat types.JID, msg *waE2E.Message, mediaPath string) (store.Message, error) {
+func (m *Manager) send(ctx context.Context, cli waClient, accountID string, chat types.JID, msg *waE2E.Message, mediaPath, linkCanonical string) (store.Message, error) {
 	exp, err := m.store.ChatExpiration(accountID, chat.String())
 	if err != nil {
 		return store.Message{}, err
@@ -664,6 +794,9 @@ func (m *Manager) send(ctx context.Context, cli waClient, accountID string, chat
 	}
 	if err == nil {
 		sm.MediaPath = mediaPath
+		if linkCanonical != "" {
+			sm.LinkCanonical = linkCanonical
+		}
 		err = m.persist(sm)
 	}
 	if err != nil {

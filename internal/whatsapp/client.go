@@ -29,6 +29,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
+	"wa-go/internal/linkify"
 	"wa-go/internal/store"
 )
 
@@ -70,6 +71,7 @@ type waClient interface {
 	GetGroupInfo(ctx context.Context, jid types.JID) (*types.GroupInfo, error)
 	GetProfilePictureInfo(ctx context.Context, jid types.JID, params *whatsmeow.GetProfilePictureParams) (*types.ProfilePictureInfo, error)
 	GetUserInfo(ctx context.Context, jids []types.JID) (map[types.JID]types.UserInfo, error)
+	IsOnWhatsApp(ctx context.Context, phones []string) ([]types.IsOnWhatsAppResponse, error)
 }
 
 // liveClient adds the device-store lookups to a real client.
@@ -527,13 +529,14 @@ func (m *Manager) revise(ctx context.Context, id string, cli waClient, info type
 		return nil // REVOKE is the zero value: never infer it from a missing type
 	}
 	var typ, body string
+	var link store.LinkPreview // a revoke, or an edit without one, drops the old preview
 	switch pm.GetType() {
 	case waE2E.ProtocolMessage_MESSAGE_EDIT:
 		t, b, _, skip := content(pm.GetEditedMessage())
 		if skip || t == TypeUnsupported {
 			return nil
 		}
-		body = b
+		body, link = b, linkPreviewOf(unwrap(pm.GetEditedMessage()))
 		log.Printf("whatsapp [%s]: revise message_edit id=%s target_key=%s new_body=%q", id, info.ID, pm.GetKey().GetID(), body)
 	case waE2E.ProtocolMessage_REVOKE:
 		typ, body = TypeRevoked, revokedBody
@@ -545,7 +548,7 @@ func (m *Manager) revise(ctx context.Context, id string, cli waClient, info type
 	if ok, err := m.isAuthor(ctx, id, cli, info, chat, target); err != nil || !ok {
 		return err
 	}
-	changed, err := m.store.ReviseMessage(id, chat, target, typ, body)
+	changed, err := m.store.ReviseMessage(id, chat, target, typ, body, link)
 	if err == nil && changed {
 		m.emit(RevisedEvent{AccountID: id, ChatJID: chat, ID: target})
 	}
@@ -790,7 +793,23 @@ func toStoreMessage(id string, info types.MessageInfo, m *waE2E.Message) (msg st
 			return msg, false, fmt.Errorf("whatsapp: marshal media of %s: %w", msg.ID, err)
 		}
 	}
+	link := linkPreviewOf(m)
+	msg.LinkURL, msg.LinkTitle, msg.LinkDesc, msg.LinkThumb = link.URL, link.Title, link.Desc, link.Thumb
 	return msg, true, nil
+}
+
+// linkPreviewOf is the link preview an (unwrapped) message carries, its text sanitized; zero for none.
+func linkPreviewOf(m *waE2E.Message) (p store.LinkPreview) {
+	etm := m.GetExtendedTextMessage()
+	if etm.GetMatchedText() == "" && etm.GetTitle() == "" && etm.GetDescription() == "" && len(etm.GetJPEGThumbnail()) == 0 {
+		return p
+	}
+	p.URL = cmp.Or(etm.GetMatchedText(), linkify.FirstURL(etm.GetText()))
+	p.Title, p.Desc = linkify.SanitizePreview(etm.GetTitle(), etm.GetDescription())
+	if thumb := etm.GetJPEGThumbnail(); len(thumb) > 0 {
+		p.Thumb = slices.Clone(thumb)
+	}
+	return p
 }
 
 // creditQuote names the sender of the message msg quotes by the key senders are stored under: as the

@@ -526,6 +526,35 @@ func TestSetting_MCPEnabledDefaultAndSave(t *testing.T) {
 	}
 }
 
+func TestSetting_LinkPreviewsDefaultAndSave(t *testing.T) {
+	h := newSettingsHarness(t)
+	if v, err := Setting(h.db, "", KeyLinkPreviews); v != "true" || err != nil {
+		t.Fatalf("default %q %v, want true", v, err)
+	}
+	if err := h.db.SetSetting("", KeyLinkPreviews, "false"); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := Setting(h.db, "", KeyLinkPreviews); v != "false" || err != nil {
+		t.Fatalf("saved %q %v, want false", v, err)
+	}
+	vals, err := h.ctl.values("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vals[KeyLinkPreviews] != "false" {
+		t.Fatalf("values[%q] = %q, want false", KeyLinkPreviews, vals[KeyLinkPreviews])
+	}
+	if err := h.global(KeyLinkPreviews, "true"); err != nil {
+		t.Fatal(err)
+	}
+	if v := h.stored(t, "", KeyLinkPreviews); v != "true" {
+		t.Fatalf("stored %q, want true", v)
+	}
+	if !slices.Equal(h.changed, []string{KeyLinkPreviews}) {
+		t.Fatalf("changed callbacks %v, want [%s]", h.changed, KeyLinkPreviews)
+	}
+}
+
 func TestMCPBinaryPathAndSnippet(t *testing.T) {
 	got := mcpBinaryPath(func() (string, error) {
 		return filepath.Join(`C:\Program Files\Wisp`, "wisp.exe"), nil

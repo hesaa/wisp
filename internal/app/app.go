@@ -20,6 +20,8 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"golang.org/x/sys/windows"
 
+	"wa-go/internal/linkify"
+	"wa-go/internal/linkpreview"
 	"wa-go/internal/lock"
 	"wa-go/internal/mcp"
 	"wa-go/internal/media"
@@ -38,6 +40,8 @@ type Backend interface {
 	Pair(ctx context.Context) (<-chan whatsmeow.QRChannelItem, error)
 	Contacts(ctx context.Context, accountID string) ([]whatsapp.Contact, error)
 	SendText(ctx context.Context, accountID, chatJID, text string, reply *store.Message, mentions []string) (store.Message, error)
+	SendTextWithPreview(ctx context.Context, accountID, chatJID, text string, reply *store.Message, mentions []string, preview *whatsapp.LinkPreview) (store.Message, error)
+	CheckPhones(ctx context.Context, accountID string, phones []string) (map[string]whatsapp.PhoneStatus, error)
 	SendMedia(ctx context.Context, accountID, chatJID, path, caption string, reply *store.Message) (store.Message, error)
 	SendGIF(ctx context.Context, accountID, chatJID, mp4Path string, preview []byte, w, h int) (store.Message, error)
 	SetTyping(ctx context.Context, accountID, chatJID string, composing bool) error
@@ -64,7 +68,7 @@ const (
 
 // globalKeys are the app-global settings kept in memory (account "" of the settings table).
 var globalKeys = []string{ui.KeyGhostTyping, ui.KeyAppearOffline, ui.KeyAutoDownloadImages, ui.KeyGiphyAPIKey,
-	ui.KeyProxy, ui.KeyNotify, ui.KeyNotifyPrivate, ui.KeyNotifySound, ui.KeyNotifySoundName, ui.KeyTheme, ui.KeyLockPIN, ui.KeyLockTimeout, ui.KeyMCPEnabled}
+	ui.KeyProxy, ui.KeyNotify, ui.KeyNotifyPrivate, ui.KeyNotifySound, ui.KeyNotifySoundName, ui.KeyTheme, ui.KeyLockPIN, ui.KeyLockTimeout, ui.KeyMCPEnabled, ui.KeyLinkPreviews}
 
 // App is the running main window.
 type App struct {
@@ -79,6 +83,10 @@ type App struct {
 	typingQ  chan func(context.Context) error // typing updates, sent one at a time in order
 	bg       context.Context                  // ends at Exit: queued typing is skipped, calls under way stop
 	stopBG   context.CancelFunc
+
+	linkFetch *linkpreview.Fetcher
+	fetchLink func(ctx context.Context, url string) (linkpreview.Result, error) // linkFetch.Fetch; faked in tests
+	linkWait  map[string][]func(store.LinkPreview)                              // previews being looked up, by URL: who waits for each
 
 	mw    *walk.MainWindow
 	icon  *walk.Icon
@@ -147,6 +155,7 @@ func New(db *store.DB, cache *media.Cache, builtinGIFKey string) (*App, error) {
 		logErr("read setting "+k, err) // the default stands in
 		a.cfg[k] = v
 	}
+	a.setLinkProxy(a.cfg[ui.KeyProxy])
 	a.avatars = ui.NewAvatars(cache)
 	ui.SetAvatars(a.avatars)
 	a.avatarQ = newAvatarQueue()
@@ -309,6 +318,23 @@ func (a *App) build() error {
 	a.link.OnCancel(func() { a.adding = false; a.showPage() })
 	a.showChatPane(false)
 	a.chat.SetAutoDownload(a.cfg[ui.KeyAutoDownloadImages] == "true")
+	a.applyLinkPreviews()
+	a.chat.OnOpenLink(a.openLink)
+	a.chat.OnCheckPhone(a.resolvePhone)
+	a.chat.OnOpenPhoneChat(func(jid, _ string) { a.openChat(a.v.active, jid, "") }) // names resolve as for any chat
+	a.chat.OnNeedLinkPreview(func(m store.Message) {
+		link := linkify.FirstURL(m.Body)
+		a.needPreview(link, false, func(p store.LinkPreview) {
+			if a.v.loaded && a.v.open == (chatRef{m.AccountID, m.ChatJID}) { // IDs repeat across accounts
+				a.chat.ApplyLinkPreview(m.ID, link, p.Canonical, p.Title, p.Desc, p.Thumb)
+			}
+		})
+	})
+	a.bar.OnNeedLinkPreview(func(link string) {
+		a.needPreview(link, true, func(p store.LinkPreview) {
+			a.bar.SetLinkPreview(link, &ui.ComposerLinkPreview{URL: link, Canonical: p.Canonical, Title: p.Title, Desc: p.Desc, Thumb: p.Thumb})
+		})
+	})
 
 	a.rail.Model().OnActiveChanged(a.accountChanged)
 	a.rail.OnAddAccount(a.pair)
@@ -493,6 +519,7 @@ func (a *App) restore() {
 	}
 	win.SetForegroundWindow(h)
 	a.showPage() // pairing resumes
+	a.retryLinkPreviews()
 	if a.page == pageLock {
 		a.lockPage.Focus()
 	}
@@ -538,6 +565,13 @@ func (a *App) fetchAllowed() bool {
 	return fetchAllowed(visible, a.minimized, a.locked)
 }
 
+// retryLinkPreviews asks again for the previews the chat requested while fetching was not allowed.
+func (a *App) retryLinkPreviews() {
+	if a.chat != nil && a.fetchAllowed() {
+		a.chat.RetryLinkPreviews()
+	}
+}
+
 func (a *App) dir(acct string) *ui.Directory {
 	if a.v.dirs != nil {
 		return a.v.dirs[acct]
@@ -554,6 +588,7 @@ func (a *App) sizeChanged() {
 			trimMemory()
 		} else {
 			a.onRestored()
+			a.retryLinkPreviews()
 		}
 		a.showPage() // pairing stops while minimised
 	}
@@ -645,6 +680,32 @@ func (a *App) applyTheme(mode theme.ThemeMode) {
 	logErr("title bar", theme.ApplyTitleBar(uintptr(a.mw.Handle()), theme.Resolve(mode) == theme.ThemeDark))
 }
 
+// applyLinkPreviews pushes the Link previews setting to the chat view and the input bar.
+func (a *App) applyLinkPreviews() {
+	on := a.cfg[ui.KeyLinkPreviews] != "false"
+	a.chat.SetLinkPreviews(on)
+	a.bar.SetLinkPreviewsEnabled(on)
+}
+
+// setLinkProxy routes link previews through proxy. A proxy the fetcher cannot use fails closed (no
+// direct fetch) until Settings fixes it.
+func (a *App) setLinkProxy(proxy string) {
+	var err error
+	if a.linkFetch != nil {
+		err = a.linkFetch.SetProxy(proxy)
+	} else {
+		a.linkFetch, err = linkpreview.NewFetcher(proxy)
+	}
+	if err != nil {
+		logErr("link previews proxy", err)
+		a.fetchLink = func(context.Context, string) (linkpreview.Result, error) {
+			return linkpreview.Result{}, errors.New("link previews: no usable proxy")
+		}
+		return
+	}
+	a.fetchLink = a.linkFetch.Fetch
+}
+
 // settingChanged re-reads an app-global setting saved in Settings and applies it. Values are never
 // logged: they include the GIPHY key and proxy passwords.
 func (a *App) settingChanged(key string) {
@@ -658,6 +719,9 @@ func (a *App) settingChanged(key string) {
 	case ui.KeyProxy:
 		logErr("proxy", a.mgr.SetProxy(v))
 		ui.SetGIFProxy(v)
+		a.setLinkProxy(v)
+	case ui.KeyLinkPreviews:
+		a.applyLinkPreviews()
 	case ui.KeyAppearOffline:
 		a.sendPresence(true)
 	case ui.KeyAutoDownloadImages:
@@ -838,6 +902,9 @@ func (a *App) lockNow() {
 	}
 	a.hiddenAt = time.Time{}
 	endMenu.Call() // an open context menu could still Copy behind the lock
+	if a.chat != nil {
+		a.chat.DismissPopup() // a link or phone popup too
+	}
 	if a.mw != nil {
 		if !a.resetting {
 			closeModals(a.mw.Handle()) // Settings, New chat, the status viewer, their dialogs
@@ -879,6 +946,7 @@ func (a *App) unlock(pin string) {
 			a.reloadList(a.v.active)
 		}
 		a.refreshAccounts()
+		a.retryLinkPreviews()
 		return
 	}
 	now := time.Now()

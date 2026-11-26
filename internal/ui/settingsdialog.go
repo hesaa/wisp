@@ -403,8 +403,13 @@ func (d *settingsDialog) buildChats(pg *walk.Composite) error {
 	if err != nil {
 		return err
 	}
+	linkPreviews, err := d.newToggle(pg, "Link previews", "Show preview cards for links and fetch previews while typing.", "true", "false")
+	if err != nil {
+		return err
+	}
 	d.bind(secChats, KeyGhostTyping, ghost)
 	d.bind(secChats, KeyAppearOffline, offline)
+	d.bind(secChats, KeyLinkPreviews, linkPreviews)
 	_, err = d.newLabel(pg, "These apply to this PC only; your phone is unaffected.", 9, 0, toneSecondary, 20)
 	return err
 }

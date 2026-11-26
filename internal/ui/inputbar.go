@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"bytes"
 	"cmp"
 	"errors"
 	"slices"
@@ -12,6 +13,7 @@ import (
 	"github.com/lxn/walk"
 	"github.com/lxn/win"
 
+	"wa-go/internal/linkify"
 	"wa-go/internal/store"
 	"wa-go/internal/theme"
 	"wa-go/internal/ui/icons"
@@ -25,12 +27,27 @@ const (
 	inputMaxLines = 5  // the box grows to this many lines, then scrolls
 	replyBannerH  = 42 // the "Replying to" banner over the box, with its gap
 	replyCloseW   = 28 // the banner's × at its right
+	linkBannerH   = 58 // the link preview banner over the box, with its gap
+	linkThumbSize = 44 // square thumbnail inside the link preview banner
 	mentionRowH   = 32 // a row of the mention list over the box
 	mentionRows   = 5  // rows the list shows at most; it scrolls with the highlight
 )
 
 // typingIdle is how long after the last edit typing counts as paused.
 const typingIdle = 5 * time.Second
+
+// linkDebounce is how long after the first URL changes before requesting a link preview.
+const linkDebounce = 400 * time.Millisecond
+
+// ComposerLinkPreview holds metadata shown in the composer's link preview banner and sent
+// alongside the outgoing message.
+type ComposerLinkPreview struct {
+	URL       string
+	Canonical string
+	Title     string
+	Desc      string
+	Thumb     []byte
+}
 
 // InputBar is the composer under the chat: Emoji, GIF and Attach buttons, a multi-line message box
 // that grows to five lines and then scrolls, and the Send button, disabled while the box is blank.
@@ -50,10 +67,15 @@ type InputBar struct {
 	dragging                    bool // the box's thumb is being dragged, from dragY with dragFirst the top line
 	dragY, dragFirst            int
 	wheelRem                    int                // wheel delta (x3) not yet a whole line: touchpads send less than a notch
-	banner, list                *walk.CustomWidget // inside field over the box: pending reply, mention list
-	height                      int                // the bar's height, 1/96 inch
-	listH                       int                // the mention list's height, 1/96 inch; 0: hidden
-	canSend                     bool               // the box holds more than whitespace
+	banner, linkBanner, list    *walk.CustomWidget // inside field over the box: pending reply, link preview, mention list
+	linkThumbBmp                *walk.Bitmap
+	linkThumbW, linkThumbH      int
+	linkThumbRaw                []byte
+	linkThumbGen                int
+	linkThumbBusy               bool
+	height                      int  // the bar's height, 1/96 inch
+	listH                       int  // the mention list's height, 1/96 inch; 0: hidden
+	canSend                     bool // the box holds more than whitespace
 	gifs                        *giphy
 	gifKey                      func() string
 	popup                       *walk.Dialog                                       // the open popup, nil for none
@@ -78,6 +100,8 @@ func NewInputBar(parent walk.Container, p theme.Palette, gifKey func() string) (
 		return time.AfterFunc(d, func() { b.Synchronize(f) }).Stop
 	}
 	b.typing.after = b.after
+	b.link.after = b.after
+	b.link.onChange = b.syncLinkBanner
 	if err := b.build(); err != nil {
 		comp.Dispose()
 		return nil, err
@@ -113,11 +137,19 @@ func (b *InputBar) build() error {
 	if b.banner, err = newCanvas(b.field, b.paintBanner); err != nil {
 		return err
 	}
-	b.list.SetVisible(false)
-	b.banner.SetVisible(false)
-	if err := b.banner.SetMinMaxSize(walk.Size{Height: replyBannerH}, walk.Size{Height: replyBannerH}); err != nil {
+	if b.linkBanner, err = newCanvas(b.field, b.paintLinkBanner); err != nil {
 		return err
 	}
+	b.list.SetVisible(false)
+	b.banner.SetVisible(false)
+	b.linkBanner.SetVisible(false)
+	if err := errors.Join(
+		b.banner.SetMinMaxSize(walk.Size{Height: replyBannerH}, walk.Size{Height: replyBannerH}),
+		b.linkBanner.SetMinMaxSize(walk.Size{Height: linkBannerH}, walk.Size{Height: linkBannerH}),
+	); err != nil {
+		return err
+	}
+	b.linkBanner.Disposing().Attach(b.disposeLinkThumb)
 	b.list.MouseDown().Attach(func(_, y int, btn walk.MouseButton) {
 		if i := b.mentionTop() + y/b.list.IntFrom96DPI(mentionRowH); btn == walk.LeftButton && i < len(b.picker.items) {
 			b.picker.sel = i
@@ -127,6 +159,12 @@ func (b *InputBar) build() error {
 	b.banner.MouseDown().Attach(func(x, _ int, btn walk.MouseButton) {
 		if btn == walk.LeftButton && x >= b.banner.ClientBoundsPixels().Width-b.banner.IntFrom96DPI(replyCloseW) {
 			b.ClearReply()
+		}
+		focusOn(b.edit)
+	})
+	b.linkBanner.MouseDown().Attach(func(x, _ int, btn walk.MouseButton) {
+		if btn == walk.LeftButton && linkBannerCloseHit(x, b.linkBanner.ClientBoundsPixels().Width, b.linkBanner.DPI()) {
+			b.DismissLinkPreview()
 		}
 		focusOn(b.edit)
 	})
@@ -172,14 +210,37 @@ func (b *InputBar) OnAttach(fn func(files []Attachment, done func())) { b.onAtta
 // OnDraft sets the handler for draft text changes when the user edits text in the box.
 func (b *InputBar) OnDraft(fn func(text string)) { b.onDraft = fn }
 
-// Reset empties the box for another chat and drops its pending reply and mention list. Call it
-// before switching: it may fire OnTyping(false) for the chat being left.
+// SetLinkPreviewsEnabled turns composer link preview requests and banner display on or off.
+func (b *InputBar) SetLinkPreviewsEnabled(enabled bool) {
+	var text string
+	if b.box != nil && b.noticeText == "" {
+		text = b.box.Text()
+	}
+	b.link.setEnabled(enabled, text)
+}
+
+// OnNeedLinkPreview sets the handler called after debounce when a new first URL appears in the box.
+func (b *InputBar) OnNeedLinkPreview(fn func(url string)) { b.link.onNeed = fn }
+
+// SetLinkPreview supplies fetched metadata for url; stale or dismissed URLs are ignored.
+func (b *InputBar) SetLinkPreview(url string, p *ComposerLinkPreview) { b.link.setPreview(url, p) }
+
+// ActiveLinkPreview returns the currently active (non-dismissed) link preview, or nil for none.
+func (b *InputBar) ActiveLinkPreview() *ComposerLinkPreview { return b.link.activePreview() }
+
+// DismissLinkPreview hides the active link preview banner and suppresses re-fetching the same URL
+// until the first URL changes or the composer resets.
+func (b *InputBar) DismissLinkPreview() { b.link.dismiss() }
+
+// Reset empties the box for another chat and drops its pending reply, link preview, and mention list.
+// Call it before switching: it may fire OnTyping(false) for the chat being left.
 func (b *InputBar) Reset() {
 	b.suppressDraft = true
 	defer func() { b.suppressDraft = false }()
 	b.composer.reset()
 	b.banner.SetVisible(false)
 	b.showMentions()
+	b.syncLinkBanner()
 	b.fit()
 }
 
@@ -204,6 +265,8 @@ func (b *InputBar) SetReadOnlyNotice(notice string) {
 	b.sendBtn.SetVisible(!isReadOnly)
 	if isReadOnly {
 		b.banner.SetVisible(false)
+		b.linkBanner.SetVisible(false)
+		b.link.reset()
 		b.list.SetVisible(false)
 		if b.edit != nil {
 			b.suppressDraft = true
@@ -332,7 +395,16 @@ func (b *InputBar) completeMention() {
 // taken. Shift+Enter always breaks the line.
 func (b *InputBar) boxKey(k walk.Key, act bool) bool {
 	if len(b.picker.items) == 0 {
-		if k != walk.KeyEscape || b.reply == nil {
+		if k != walk.KeyEscape {
+			return false
+		}
+		if b.ActiveLinkPreview() != nil {
+			if act {
+				b.DismissLinkPreview()
+			}
+			return true
+		}
+		if b.reply == nil {
 			return false
 		}
 		if _, typed := outgoingText(b.edit.Text()); typed {
@@ -435,6 +507,150 @@ func (b *InputBar) paintBanner(c *walk.Canvas, _ walk.Rectangle) error {
 		drawText(c, dpi, "×", 13, 0, theme.Color(p.TextSecondary), walk.Rectangle{X: r.Width - s(replyCloseW), Width: s(replyCloseW), Height: s(replyBannerH - 6)}, centerText))
 }
 
+func (b *InputBar) paintLinkBanner(c *walk.Canvas, _ walk.Rectangle) error {
+	p, r, dpi := b.pal, b.linkBanner.ClientBoundsPixels(), b.linkBanner.DPI()
+	s := scaler(dpi)
+	bg, err := brushFor(p.Sidebar)
+	if err != nil {
+		return err
+	}
+	ap := b.link.active
+	if err := c.FillRectanglePixels(bg, r); err != nil || ap == nil {
+		return err
+	}
+	card := walk.Rectangle{Width: r.Width, Height: s(linkBannerH - 6)}
+	errs := []error{icons.FillRounded(c, card, s(6), theme.Color(p.Header))}
+
+	textX := s(10)
+	if len(ap.Thumb) > 0 {
+		ts := s(linkThumbSize)
+		tr := walk.Rectangle{X: s(6), Y: (card.Height - ts) / 2, Width: ts, Height: ts}
+		if bmp := b.linkThumbFor(ap.Thumb, tr.Width, tr.Height); bmp != nil {
+			errs = append(errs, c.DrawImageStretchedPixels(bmp, tr))
+		} else {
+			placeholder := uint32(0x16000000)
+			if isDark(p) {
+				placeholder = 0x26ffffff
+			}
+			errs = append(errs, icons.FillRoundedARGB(c, tr, s(4), placeholder))
+		}
+		textX = tr.X + tr.Width + s(10)
+	}
+
+	closeRect := walk.Rectangle{X: r.Width - s(replyCloseW), Width: s(replyCloseW), Height: card.Height}
+	closeIcon := square(closeRect.X+closeRect.Width/2, closeRect.Y+closeRect.Height/2, s(14))
+	errs = append(errs, icons.Draw(c, icons.IconClose, closeIcon, theme.Color(p.TextSecondary)))
+
+	textW := max(0, closeRect.X-textX-s(4))
+	type linkLine struct {
+		text  string
+		pt    int
+		style walk.FontStyle
+		color walk.Color
+	}
+	var lines []linkLine
+	if title := singleLineSpace(ap.Title); title != "" {
+		lines = append(lines, linkLine{title, namePt, walk.FontBold, theme.Color(p.Text)})
+	}
+	if desc := singleLineSpace(ap.Desc); desc != "" {
+		lines = append(lines, linkLine{desc, metaPt, 0, theme.Color(p.TextSecondary)})
+	}
+	if domain := linkify.DisplayDomain(cmp.Or(ap.Canonical, ap.URL)); domain != "" {
+		lines = append(lines, linkLine{domain, metaPt, 0, theme.Color(p.TextSecondary)})
+	}
+	if len(lines) > 0 && textW > 0 {
+		lineH := s(16)
+		y := max(s(2), (card.Height-len(lines)*lineH)/2)
+		for _, ln := range lines {
+			errs = append(errs, drawText(c, dpi, ln.text, ln.pt, ln.style, ln.color,
+				walk.Rectangle{X: textX, Y: y, Width: textW, Height: lineH}, leftText))
+			y += lineH
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (b *InputBar) syncLinkBanner() {
+	ap := b.link.active
+	if ap == nil || !bytes.Equal(ap.Thumb, b.linkThumbRaw) {
+		b.disposeLinkThumb()
+	}
+	if b.linkBanner == nil {
+		return
+	}
+	vis := ap != nil && b.noticeText == ""
+	b.linkBanner.SetVisible(vis)
+	if vis {
+		logErr("link banner repaint", b.linkBanner.Invalidate())
+	}
+	b.fit()
+}
+
+func (b *InputBar) disposeLinkThumb() {
+	b.linkThumbGen++
+	b.linkThumbBusy = false
+	b.linkThumbRaw = nil
+	b.linkThumbW, b.linkThumbH = 0, 0
+	if b.linkThumbBmp != nil {
+		b.linkThumbBmp.Dispose()
+		b.linkThumbBmp = nil
+	}
+}
+
+func (b *InputBar) linkThumbFor(raw []byte, w, h int) *walk.Bitmap {
+	if len(raw) == 0 || w <= 0 || h <= 0 || b.linkBanner == nil {
+		return nil
+	}
+	if b.linkThumbW == w && b.linkThumbH == h && bytes.Equal(raw, b.linkThumbRaw) {
+		return b.linkThumbBmp
+	}
+	if b.linkThumbBusy {
+		return nil
+	}
+	b.linkThumbBusy = true
+	gen := b.linkThumbGen
+	rawCopy := slices.Clone(raw)
+	go func() {
+		img, err := coverImage(bytes.NewReader(rawCopy), w, h)
+		b.Synchronize(func() {
+			if gen != b.linkThumbGen || b.linkBanner == nil || b.linkBanner.IsDisposed() {
+				return
+			}
+			b.linkThumbBusy = false
+			var bmp *walk.Bitmap
+			if err == nil {
+				bmp, err = walk.NewBitmapFromImageForDPI(img, b.linkBanner.DPI())
+			}
+			logErr("composer link thumb", err)
+			if b.linkThumbBmp != nil {
+				b.linkThumbBmp.Dispose()
+			}
+			b.linkThumbBmp = bmp
+			b.linkThumbRaw = rawCopy
+			b.linkThumbW, b.linkThumbH = w, h
+			if bmp != nil {
+				logErr("link banner repaint", b.linkBanner.Invalidate())
+			}
+		})
+	}()
+	return nil
+}
+
+func linkBannerCloseHit(x, width, dpi int) bool {
+	return x >= width-walk.IntFrom96DPI(replyCloseW, dpi)
+}
+
+func composerBannerOverHeight(replyVisible, linkVisible bool, mentionCount int) int {
+	over := min(mentionCount, mentionRows) * mentionRowH
+	if replyVisible {
+		over += replyBannerH
+	}
+	if linkVisible {
+		over += linkBannerH
+	}
+	return over
+}
+
 // Restore puts back text that failed to send, unless the box holds a new draft; no typing signal
 // fires.
 func (b *InputBar) Restore(text string) { b.composer.restore(text) }
@@ -481,7 +697,7 @@ func (b *InputBar) SetPalette(p theme.Palette) error {
 	b.edit.SetTextColor(theme.Color(p.Text))
 	errs := []error{
 		setBg(b.Composite, p.Header), setBg(b.field, p.Sidebar), setBg(b.edit, p.Sidebar),
-		b.banner.Invalidate(), b.list.Invalidate(), b.emoji.Invalidate(), b.gif.Invalidate(), b.attach.Invalidate(), b.sendBtn.Invalidate(),
+		b.banner.Invalidate(), b.linkBanner.Invalidate(), b.list.Invalidate(), b.emoji.Invalidate(), b.gif.Invalidate(), b.attach.Invalidate(), b.sendBtn.Invalidate(),
 	}
 	if b.notice != nil {
 		errs = append(errs, b.notice.Invalidate())
@@ -584,16 +800,16 @@ func (b *InputBar) fit() {
 		}
 		return
 	}
+	if b.edit == nil {
+		return
+	}
 	b.setBoxMargin()
 	n := int(b.edit.SendMessage(win.EM_GETLINECOUNT, 0, 0))
 	lh := 18
 	if px := lineHeight(b.edit.Handle()); px > 0 {
 		lh = walk.IntTo96DPI(px, b.edit.DPI()) + 1 // rounded up: a clipped last line would scroll
 	}
-	over := min(len(b.picker.items), mentionRows) * mentionRowH // what sits over the box
-	if b.reply != nil {
-		over += replyBannerH
-	}
+	over := composerBannerOverHeight(b.reply != nil, b.link.active != nil, len(b.picker.items)) // what sits over the box
 	if h := max(barButton, max(1, min(n, inputMaxLines))*lh+2*fieldPadY+over) + 2*barPadY; h != b.height {
 		b.height = h
 		logErr("input bar height", b.SetMinMaxSize(walk.Size{Height: h}, walk.Size{Height: h}))
@@ -647,17 +863,20 @@ type textBox interface {
 type composer struct {
 	box         textBox
 	typing      typingSignal
+	link        composerLinkState
 	onSend      func(text string)
+	sending     bool
 	reply       *store.Message // the message the next one replies to; nil for none
 	replyAuthor string         // its sender's display name
 	picker      mentionPicker
 }
 
-// reset empties the box and drops the pending reply and the group's members, for another chat.
+// reset empties the box and drops the pending reply, link preview, and the group's members, for another chat.
 func (c *composer) reset() {
 	c.typing.stop()
 	logErr("clear input", c.box.SetText(""))
 	c.clearReply()
+	c.link.reset()
 	c.picker = mentionPicker{}
 }
 
@@ -672,13 +891,18 @@ func (c *composer) replyTarget() (store.Message, bool) {
 	return *c.reply, true
 }
 
-// send sends the box's text, trimmed, and empties the box; blank text stays. It reports whether
-// anything was sent.
+// send sends the box's text, trimmed, and empties the box; blank text stays. It keeps the active
+// link preview readable while onSend runs, then resets it. It reports whether anything was sent.
 func (c *composer) send() bool {
 	text, ok := outgoingText(c.box.Text())
 	if !ok {
 		return false
 	}
+	c.sending = true
+	defer func() {
+		c.sending = false
+		c.link.reset()
+	}()
 	logErr("clear input", c.box.SetText(""))
 	c.typing.stop()
 	if c.onSend != nil {
@@ -714,11 +938,155 @@ func (c *composer) setDraft(text string) {
 
 // edited follows a change of the box's text: typing goes on, or stops once the box is blank.
 func (c *composer) edited() {
-	if _, ok := outgoingText(c.box.Text()); ok {
+	text := c.box.Text()
+	if _, ok := outgoingText(text); ok {
 		c.typing.edited()
 	} else {
 		c.typing.stop()
 	}
+	if !c.sending {
+		c.link.edited(text)
+	}
+}
+
+// composerLinkState tracks debounced link preview fetching, user dismissal, and stale-result filtering.
+type composerLinkState struct {
+	after        func(d time.Duration, f func()) (stop func() bool)
+	onNeed       func(url string)
+	onChange     func()
+	disabled     bool
+	previewURL   string
+	requestedURL string
+	dismissedURL string
+	active       *ComposerLinkPreview
+	cancel       func() bool
+	gen          int
+}
+
+func (l *composerLinkState) notify() {
+	if l.onChange != nil {
+		l.onChange()
+	}
+}
+
+func (l *composerLinkState) clearTimer() {
+	l.gen++
+	if l.cancel != nil {
+		l.cancel()
+		l.cancel = nil
+	}
+}
+
+func (l *composerLinkState) clearActive() {
+	if l.active == nil {
+		return
+	}
+	l.active = nil
+	l.notify()
+}
+
+func (l *composerLinkState) schedule(url string) {
+	l.clearTimer()
+	if l.after == nil {
+		return
+	}
+	gen := l.gen
+	l.cancel = l.after(linkDebounce, func() {
+		if gen != l.gen || l.disabled || l.previewURL != url || url == l.dismissedURL {
+			return
+		}
+		l.cancel = nil
+		l.requestedURL = url
+		if l.onNeed != nil {
+			l.onNeed(url)
+		}
+	})
+}
+
+func (l *composerLinkState) edited(text string) {
+	url := linkify.FirstURL(text)
+	if url == "" {
+		l.previewURL = ""
+		l.requestedURL = ""
+		l.dismissedURL = "" // the draft no longer has the link: dismissal ends (spec §8)
+		l.clearTimer()
+		l.clearActive()
+		return
+	}
+	if url != l.dismissedURL {
+		l.dismissedURL = ""
+	}
+	if l.disabled || url == l.dismissedURL {
+		l.previewURL = url
+		l.clearTimer()
+		l.clearActive()
+		return
+	}
+	if url == l.previewURL && (l.cancel != nil || l.requestedURL == url || (l.active != nil && l.active.URL == url)) {
+		return
+	}
+	l.previewURL = url
+	l.requestedURL = ""
+	l.clearActive()
+	l.schedule(url)
+}
+
+func (l *composerLinkState) setEnabled(enabled bool, currentText string) {
+	if l.disabled == !enabled {
+		return
+	}
+	l.disabled = !enabled
+	if l.disabled {
+		l.clearTimer()
+		l.requestedURL = ""
+		l.clearActive()
+		return
+	}
+	if currentText != "" {
+		l.edited(currentText)
+	}
+}
+
+func (l *composerLinkState) setPreview(url string, p *ComposerLinkPreview) {
+	if l.disabled || url == "" || url != l.previewURL || url == l.dismissedURL {
+		return
+	}
+	if p == nil || (p.Title == "" && p.Desc == "" && len(p.Thumb) == 0) {
+		l.clearActive()
+		return
+	}
+	cp := *p
+	cp.URL = cmp.Or(cp.URL, url)
+	cp.Thumb = slices.Clone(p.Thumb)
+	l.requestedURL = url
+	l.clearTimer()
+	l.active = &cp
+	l.notify()
+}
+
+func (l *composerLinkState) activePreview() *ComposerLinkPreview {
+	if l.disabled || l.active == nil {
+		return nil
+	}
+	cp := *l.active
+	cp.Thumb = slices.Clone(l.active.Thumb)
+	return &cp
+}
+
+func (l *composerLinkState) dismiss() {
+	if l.previewURL != "" {
+		l.dismissedURL = l.previewURL
+	}
+	l.clearTimer()
+	l.clearActive()
+}
+
+func (l *composerLinkState) reset() {
+	l.clearTimer()
+	l.previewURL = ""
+	l.requestedURL = ""
+	l.dismissedURL = ""
+	l.clearActive()
 }
 
 // typingSignal turns edits into typing signals: composing on the first edit after a pause, paused

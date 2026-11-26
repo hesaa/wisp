@@ -401,3 +401,241 @@ func TestPickedMentionWinsOverANamesake(t *testing.T) {
 		t.Fatalf("typed name sent %q", wire)
 	}
 }
+
+func newTestInputBarWithBox(box textBox, ft *fakeTimers) *InputBar {
+	typingFT := &fakeTimers{}
+	b := &InputBar{
+		composer: composer{
+			box:    box,
+			typing: typingSignal{after: typingFT.after},
+			link:   composerLinkState{after: ft.after},
+		},
+	}
+	return b
+}
+
+func TestComposerLinkPreviewDebounceAndDismiss(t *testing.T) {
+	ft := &fakeTimers{}
+	box := &echoBox{}
+	b := newTestInputBarWithBox(box, ft)
+	box.onSet = b.composer.edited
+
+	var requested []string
+	b.OnNeedLinkPreview(func(url string) {
+		requested = append(requested, url)
+	})
+
+	// 1. Typing "check https://example.com" schedules one onNeedLinkPreview after debounce.
+	box.SetText("check https://e")
+	box.SetText("check https://example.com")
+	if len(requested) != 0 {
+		t.Fatalf("requested before debounce = %v, want none", requested)
+	}
+	// Further edits keeping the same first URL do not re-schedule or duplicate.
+	box.SetText("check https://example.com and more")
+	if ft.live() != 1 {
+		t.Fatalf("live debounce timers = %d, want 1", ft.live())
+	}
+	// Fire all pending timers (stale ones are cancelled, latest fires once).
+	for _, tm := range ft.timers {
+		if !tm.stopped {
+			tm.stopped = true
+			tm.f()
+		}
+	}
+	if !slices.Equal(requested, []string{"https://example.com"}) {
+		t.Fatalf("after debounce requested = %v, want [https://example.com]", requested)
+	}
+
+	// 2. SetLinkPreview shows the preview; dismissing clears active preview.
+	b.SetLinkPreview("https://example.com", &ComposerLinkPreview{
+		URL:   "https://example.com",
+		Title: "Example Domain",
+		Desc:  "Example description",
+	})
+	got := b.ActiveLinkPreview()
+	if got == nil || got.Title != "Example Domain" || got.URL != "https://example.com" {
+		t.Fatalf("ActiveLinkPreview() = %+v, want Example Domain", got)
+	}
+	b.DismissLinkPreview()
+	if b.ActiveLinkPreview() != nil {
+		t.Fatalf("after DismissLinkPreview(), ActiveLinkPreview() = %+v, want nil", b.ActiveLinkPreview())
+	}
+
+	// 3. Further edits keeping "https://example.com" as first URL do NOT re-request or re-show.
+	box.SetText("check https://example.com still here")
+	for _, tm := range ft.timers {
+		if !tm.stopped {
+			tm.stopped = true
+			tm.f()
+		}
+	}
+	if !slices.Equal(requested, []string{"https://example.com"}) {
+		t.Fatalf("after dismissed edit requested = %v, want only [https://example.com]", requested)
+	}
+	b.SetLinkPreview("https://example.com", &ComposerLinkPreview{
+		URL:   "https://example.com",
+		Title: "Should stay dismissed",
+	})
+	if b.ActiveLinkPreview() != nil {
+		t.Fatalf("dismissed preview re-appeared: %+v", b.ActiveLinkPreview())
+	}
+
+	// Changing URL to "https://other.dev" clears dismissal and fetches the new URL.
+	box.SetText("check https://other.dev instead")
+	for _, tm := range ft.timers {
+		if !tm.stopped {
+			tm.stopped = true
+			tm.f()
+		}
+	}
+	if !slices.Equal(requested, []string{"https://example.com", "https://other.dev"}) {
+		t.Fatalf("after URL change requested = %v, want [https://example.com https://other.dev]", requested)
+	}
+
+	// 4. Stale SetLinkPreview after text changed or Reset is ignored.
+	b.SetLinkPreview("https://old.dev", &ComposerLinkPreview{
+		URL:   "https://old.dev",
+		Title: "Stale",
+	})
+	if b.ActiveLinkPreview() != nil {
+		t.Fatalf("stale SetLinkPreview after URL change was accepted: %+v", b.ActiveLinkPreview())
+	}
+	b.SetLinkPreview("https://other.dev", &ComposerLinkPreview{
+		URL:   "https://other.dev",
+		Title: "Other Dev",
+	})
+	if b.ActiveLinkPreview() == nil || b.ActiveLinkPreview().Title != "Other Dev" {
+		t.Fatalf("expected Other Dev active preview, got %+v", b.ActiveLinkPreview())
+	}
+	b.composer.reset()
+	if b.ActiveLinkPreview() != nil {
+		t.Fatalf("after reset ActiveLinkPreview() = %+v, want nil", b.ActiveLinkPreview())
+	}
+	b.SetLinkPreview("https://other.dev", &ComposerLinkPreview{
+		URL:   "https://other.dev",
+		Title: "Stale After Reset",
+	})
+	if b.ActiveLinkPreview() != nil {
+		t.Fatalf("stale SetLinkPreview after reset was accepted: %+v", b.ActiveLinkPreview())
+	}
+
+	// 5. SetLinkPreviewsEnabled(false) hides open banner and stops firing onNeedLinkPreview.
+	box.SetText("see https://enabled.dev")
+	for _, tm := range ft.timers {
+		if !tm.stopped {
+			tm.stopped = true
+			tm.f()
+		}
+	}
+	b.SetLinkPreview("https://enabled.dev", &ComposerLinkPreview{
+		URL:   "https://enabled.dev",
+		Title: "Enabled",
+	})
+	if b.ActiveLinkPreview() == nil {
+		t.Fatal("expected active preview before disabling")
+	}
+	b.SetLinkPreviewsEnabled(false)
+	if b.ActiveLinkPreview() != nil {
+		t.Fatalf("after SetLinkPreviewsEnabled(false), ActiveLinkPreview() = %+v, want nil", b.ActiveLinkPreview())
+	}
+	countBefore := len(requested)
+	box.SetText("now https://disabled.dev")
+	for _, tm := range ft.timers {
+		if !tm.stopped {
+			tm.stopped = true
+			tm.f()
+		}
+	}
+	if len(requested) != countBefore {
+		t.Fatalf("onNeedLinkPreview fired while disabled: %v", requested)
+	}
+}
+
+func TestComposerLinkPreviewSendSnapshotAndReplyIndependence(t *testing.T) {
+	ft := &fakeTimers{}
+	box := &echoBox{}
+	b := newTestInputBarWithBox(box, ft)
+	box.onSet = b.composer.edited
+
+	b.composer.setReply(store.Message{ID: "m1", Body: "hi"}, "Alice")
+	box.SetText("check https://example.com")
+	b.SetLinkPreview("https://example.com", &ComposerLinkPreview{
+		URL:       "https://example.com",
+		Canonical: "https://example.com/home",
+		Title:     "Example",
+		Desc:      "Desc",
+	})
+
+	var sentText string
+	var sentPreview *ComposerLinkPreview
+	var replyStillPresent bool
+	b.OnSend(func(text string) {
+		sentText = text
+		sentPreview = b.ActiveLinkPreview()
+		_, replyStillPresent = b.ReplyTarget()
+	})
+	if !b.composer.send() {
+		t.Fatal("send() returned false")
+	}
+	if sentText != "check https://example.com" {
+		t.Fatalf("sentText = %q, want %q", sentText, "check https://example.com")
+	}
+	if sentPreview == nil || sentPreview.Canonical != "https://example.com/home" || sentPreview.Title != "Example" {
+		t.Fatalf("ActiveLinkPreview inside OnSend = %+v, want Example", sentPreview)
+	}
+	if !replyStillPresent {
+		t.Fatal("reply target was cleared before/independently of link preview")
+	}
+	if b.ActiveLinkPreview() != nil {
+		t.Fatalf("ActiveLinkPreview after send = %+v, want nil", b.ActiveLinkPreview())
+	}
+}
+
+func TestComposerLinkBannerLayoutAndHitTest(t *testing.T) {
+	if got := composerBannerOverHeight(false, false, 0); got != 0 {
+		t.Fatalf("no banners height = %d, want 0", got)
+	}
+	if got := composerBannerOverHeight(true, false, 0); got != replyBannerH {
+		t.Fatalf("reply only height = %d, want %d", got, replyBannerH)
+	}
+	if got := composerBannerOverHeight(false, true, 0); got != linkBannerH {
+		t.Fatalf("link only height = %d, want %d", got, linkBannerH)
+	}
+	if got := composerBannerOverHeight(true, true, 2); got != replyBannerH+linkBannerH+2*mentionRowH {
+		t.Fatalf("reply+link+mentions height = %d, want %d", got, replyBannerH+linkBannerH+2*mentionRowH)
+	}
+	if !linkBannerCloseHit(380, 400, 96) {
+		t.Error("expected click inside right close strip to hit")
+	}
+	if linkBannerCloseHit(100, 400, 96) {
+		t.Error("expected click outside right close strip not to hit")
+	}
+}
+
+func TestComposerLinkDismissalEndsWhenDraftCleared(t *testing.T) {
+	ft := &fakeTimers{}
+	box := &echoBox{}
+	b := newTestInputBarWithBox(box, ft)
+	box.onSet = b.composer.edited
+	var requested []string
+	b.OnNeedLinkPreview(func(url string) { requested = append(requested, url) })
+	fire := func() {
+		for _, tm := range ft.timers {
+			if !tm.stopped {
+				tm.stopped = true
+				tm.f()
+			}
+		}
+	}
+
+	box.SetText("https://example.com")
+	fire()
+	b.DismissLinkPreview()
+	box.SetText("") // the draft is cleared: dismissal ends (spec §8)
+	box.SetText("https://example.com")
+	fire()
+	if !slices.Equal(requested, []string{"https://example.com", "https://example.com"}) {
+		t.Fatalf("requested = %v, want the URL asked again after the draft was cleared", requested)
+	}
+}

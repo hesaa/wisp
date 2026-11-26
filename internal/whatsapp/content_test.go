@@ -1,15 +1,20 @@
 package whatsapp
 
 import (
+	"bytes"
 	"context"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 
+	"wa-go/internal/linkify"
 	"wa-go/internal/store"
 )
 
@@ -118,5 +123,116 @@ func TestRefetchUnsupportedRunsOncePerAccount(t *testing.T) {
 	m.refetchUnsupported(ctx, acctA, pc, 0)
 	if len(pc.asked) != 1 || pc.asked[0].anchor.Chat.String() != alice.String() {
 		t.Fatalf("asked %+v", pc.asked)
+	}
+}
+
+func TestToStoreMessageExtractsLinkPreview(t *testing.T) {
+	info := types.MessageInfo{
+		MessageSource: types.MessageSource{Chat: alice, Sender: alice},
+		ID:            "m-link-1",
+		Timestamp:     time.Unix(1700000000, 0),
+	}
+	thumb := []byte{0xff, 0xd8, 0xff, 0xe0}
+
+	// Full ExtendedTextMessage preview metadata (wrapped in EphemeralMessage to verify unwrap).
+	wrapped := &waE2E.Message{
+		EphemeralMessage: &waE2E.FutureProofMessage{
+			Message: &waE2E.Message{
+				ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+					Text:          proto.String("check https://example.com"),
+					MatchedText:   proto.String("https://example.com"),
+					Title:         proto.String("Example Domain"),
+					Description:   proto.String("Summary text"),
+					JPEGThumbnail: thumb,
+				},
+			},
+		},
+	}
+	got, ok, err := toStoreMessage(acctA, info, wrapped)
+	if err != nil || !ok {
+		t.Fatalf("toStoreMessage(wrapped): ok=%v err=%v", ok, err)
+	}
+	if got.LinkURL != "https://example.com" || got.LinkTitle != "Example Domain" ||
+		got.LinkDesc != "Summary text" || !bytes.Equal(got.LinkThumb, thumb) {
+		t.Fatalf("got link fields = (%q, %q, %q, %x)", got.LinkURL, got.LinkTitle, got.LinkDesc, got.LinkThumb)
+	}
+
+	// Sender-controlled title/description are sanitized and clamped at extraction.
+	hostile := &waE2E.Message{
+		ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+			Text:        proto.String("see https://x.example"),
+			Title:       proto.String("Bad\xff\n\n  title" + strings.Repeat("t", 5000)),
+			Description: proto.String(strings.Repeat("d ", 5000)),
+		},
+	}
+	got, ok, err = toStoreMessage(acctA, info, hostile)
+	if err != nil || !ok {
+		t.Fatalf("toStoreMessage(hostile): ok=%v err=%v", ok, err)
+	}
+	if !strings.HasPrefix(got.LinkTitle, "Bad� title") || !utf8.ValidString(got.LinkTitle) ||
+		utf8.RuneCountInString(got.LinkTitle) > linkify.MaxPreviewTitleRunes ||
+		utf8.RuneCountInString(got.LinkDesc) > linkify.MaxPreviewDescRunes {
+		t.Fatalf("hostile preview not sanitized: title %d runes %q..., desc %d runes",
+			utf8.RuneCountInString(got.LinkTitle), got.LinkTitle[:min(len(got.LinkTitle), 20)], utf8.RuneCountInString(got.LinkDesc))
+	}
+
+	// Falls back LinkURL to linkify.FirstURL when MatchedText is empty.
+	noMatched := &waE2E.Message{
+		ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+			Text:  proto.String("see https://fallback.dev/path for details"),
+			Title: proto.String("Fallback Title"),
+		},
+	}
+	got, ok, err = toStoreMessage(acctA, info, noMatched)
+	if err != nil || !ok {
+		t.Fatalf("toStoreMessage(noMatched): ok=%v err=%v", ok, err)
+	}
+	if got.LinkURL != "https://fallback.dev/path" || got.LinkTitle != "Fallback Title" {
+		t.Fatalf("fallback LinkURL = %q, Title = %q", got.LinkURL, got.LinkTitle)
+	}
+
+	// Plain ExtendedTextMessage (e.g. reply with URL in text) without preview metadata leaves Link* empty.
+	plainReply := &waE2E.Message{
+		ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+			Text:        proto.String("replying about https://plain.example"),
+			ContextInfo: &waE2E.ContextInfo{StanzaID: proto.String("q1")},
+		},
+	}
+	got, ok, err = toStoreMessage(acctA, info, plainReply)
+	if err != nil || !ok {
+		t.Fatalf("toStoreMessage(plainReply): ok=%v err=%v", ok, err)
+	}
+	if got.LinkURL != "" || got.LinkTitle != "" || got.LinkDesc != "" || len(got.LinkThumb) != 0 {
+		t.Fatalf("expected empty Link* for non-preview ExtendedTextMessage, got %+v", got)
+	}
+}
+
+func TestEditCarriesItsOwnLinkPreview(t *testing.T) {
+	m, db := newTestManager(t)
+	fa := &fakeClient{}
+	m.add(acctA, fa)
+	orig := store.Message{ID: "e1", ChatJID: alice.String(), AccountID: acctA, SenderJID: alice.String(), Timestamp: 1,
+		Type: TypeText, Body: "see https://old.example", Status: store.StatusReceived,
+		LinkURL: "https://old.example", LinkTitle: "Old", LinkThumb: []byte{1}}
+	if err := db.InsertMessagesBatch([]store.Message{orig}); err != nil {
+		t.Fatal(err)
+	}
+	e := incoming(alice, "p1", "")
+	e.Message = &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+		Type: waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(), Key: &waCommon.MessageKey{ID: proto.String("e1")},
+		EditedMessage: &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+			Text: proto.String("see https://new.example"), MatchedText: proto.String("https://new.example"),
+			Title: proto.String("New\n title"),
+		}},
+	}}
+	if err := m.handleEvent(ctx, acctA, fa, e); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := db.GetMessage(acctA, alice.String(), "e1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Body != "see https://new.example" || got.LinkURL != "https://new.example" || got.LinkTitle != "New title" || len(got.LinkThumb) != 0 {
+		t.Fatalf("edited message: %+v", got)
 	}
 }

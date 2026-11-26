@@ -8,7 +8,7 @@ import (
 
 var allIcons = []Icon{IconChat, IconStatus, IconSettings, IconSearch, IconAttach, IconEmoji, IconSend, IconDoubleCheck,
 	IconAdd, IconNewChat, IconCheck, IconDocument, IconDownload, IconVideo, IconAudio, IconGIF,
-	IconPlay, IconPause, IconChevronLeft, IconChevronRight, IconClose}
+	IconPlay, IconPause, IconChevronLeft, IconChevronRight, IconClose, IconCopy, IconExternal}
 
 func TestFillCapsule(t *testing.T) {
 	bmp, err := walk.NewBitmapForDPI(walk.Size{Width: 40, Height: 20}, 96)
