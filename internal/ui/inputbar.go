@@ -1008,6 +1008,7 @@ func (l *composerLinkState) edited(text string) {
 	if url == "" {
 		l.previewURL = ""
 		l.requestedURL = ""
+		l.dismissedURL = "" // the draft no longer has the link: dismissal ends (spec §8)
 		l.clearTimer()
 		l.clearActive()
 		return

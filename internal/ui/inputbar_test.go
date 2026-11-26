@@ -612,3 +612,30 @@ func TestComposerLinkBannerLayoutAndHitTest(t *testing.T) {
 		t.Error("expected click outside right close strip not to hit")
 	}
 }
+
+func TestComposerLinkDismissalEndsWhenDraftCleared(t *testing.T) {
+	ft := &fakeTimers{}
+	box := &echoBox{}
+	b := newTestInputBarWithBox(box, ft)
+	box.onSet = b.composer.edited
+	var requested []string
+	b.OnNeedLinkPreview(func(url string) { requested = append(requested, url) })
+	fire := func() {
+		for _, tm := range ft.timers {
+			if !tm.stopped {
+				tm.stopped = true
+				tm.f()
+			}
+		}
+	}
+
+	box.SetText("https://example.com")
+	fire()
+	b.DismissLinkPreview()
+	box.SetText("") // the draft is cleared: dismissal ends (spec §8)
+	box.SetText("https://example.com")
+	fire()
+	if !slices.Equal(requested, []string{"https://example.com", "https://example.com"}) {
+		t.Fatalf("requested = %v, want the URL asked again after the draft was cleared", requested)
+	}
+}
