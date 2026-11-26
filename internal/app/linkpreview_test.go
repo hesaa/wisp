@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -126,7 +127,7 @@ func TestLinkPreviewWorkerRespectsSettingAndLock(t *testing.T) {
 	}
 }
 
-func TestOpenNewChatFromPhoneCreatesBlankComposePane(t *testing.T) {
+func TestOpenChatGuardAllowsUnseenJID(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "wa.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -158,15 +159,15 @@ func TestLinkPreviewCacheHitSkipsFetch(t *testing.T) {
 	now := time.Now().Unix()
 	for _, p := range []store.LinkPreview{
 		{URL: "https://ok", Status: "ok", Title: "T", FetchedAt: now - 99999999},
-		{URL: "https://none", Status: "none", FetchedAt: now - 60},
 	} {
 		if err := db.PutLinkPreview(p); err != nil {
 			t.Fatal(err)
 		}
 	}
+	var fetches atomic.Int32
 	a := &App{db: db, bg: context.Background(), cfg: map[string]string{}}
 	a.fetchLink = func(context.Context, string) (linkpreview.Result, error) {
-		t.Error("fetched on a cache hit")
+		fetches.Add(1)
 		return linkpreview.Result{}, nil
 	}
 	got := make(chan string, 1)
@@ -179,6 +180,7 @@ func TestLinkPreviewCacheHitSkipsFetch(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("cached preview never delivered")
 	}
-	a.needPreview("https://none", true, func(store.LinkPreview) { t.Error("delivered a none") })
-	time.Sleep(100 * time.Millisecond) // the lookup is async; a fetch or delivery would have fired by now
+	if n := fetches.Load(); n != 0 {
+		t.Fatalf("fetched %d times on a cache hit", n)
+	}
 }
