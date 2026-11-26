@@ -391,10 +391,14 @@ func (m *Manager) CheckPhones(ctx context.Context, accountID string, phones []st
 		var st PhoneStatus
 		if r.IsIn {
 			st.Registered = true
-			if r.PhoneNumber.Server == types.DefaultUserServer && r.PhoneNumber.User != "" {
+			// a phone-number JID, never an LID: chats are keyed by number (pnSource)
+			switch {
+			case r.PhoneNumber.Server == types.DefaultUserServer && r.PhoneNumber.User != "":
 				st.JID = r.PhoneNumber.ToNonAD().String()
-			} else if !r.JID.IsEmpty() {
+			case r.JID.Server == types.DefaultUserServer && r.JID.User != "":
 				st.JID = r.JID.ToNonAD().String()
+			case strings.TrimPrefix(r.Query, "+") != "":
+				st.JID = types.NewJID(strings.TrimPrefix(r.Query, "+"), types.DefaultUserServer).String()
 			}
 		}
 		if r.Query != "" {

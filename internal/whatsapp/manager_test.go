@@ -1651,6 +1651,7 @@ func TestCheckPhonesCachesSessionResults(t *testing.T) {
 			"+6283333333333": {Query: "+6283333333333", IsIn: true, JID: alice},
 			"+6289999999999": {Query: "+6289999999999", IsIn: false},
 			"+6284444444444": {Query: "+6284444444444", IsIn: true, JID: lid, PhoneNumber: bob},
+			"+6286666666666": {Query: "+6286666666666", IsIn: true, JID: types.NewJID("777", types.HiddenUserServer)},
 		},
 	}
 	fb := &fakeClient{
@@ -1661,9 +1662,12 @@ func TestCheckPhonesCachesSessionResults(t *testing.T) {
 	m.add(acctA, fa)
 	m.add(acctB, fb)
 
-	got, err := m.CheckPhones(ctx, acctA, []string{"+6283333333333", "+6289999999999", "+6284444444444"})
+	got, err := m.CheckPhones(ctx, acctA, []string{"+6283333333333", "+6289999999999", "+6284444444444", "+6286666666666"})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if got["+6286666666666"] != (PhoneStatus{Registered: true, JID: "6286666666666@s.whatsapp.net"}) {
+		t.Fatalf("+6286666666666 (LID only) = %+v, want the number's own JID", got["+6286666666666"])
 	}
 	if got["+6283333333333"] != (PhoneStatus{Registered: true, JID: alice.String()}) {
 		t.Fatalf("+6283333333333 = %+v", got["+6283333333333"])
