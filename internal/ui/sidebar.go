@@ -159,6 +159,7 @@ func (m *SidebarModel) ApplyMessage(msg store.Message) bool {
 	}
 	if msg.Timestamp >= c.LastMessageTS { // a late older message doesn't replace the snippet
 		c.LastMessageTS, c.Snippet = msg.Timestamp, msg.Body
+		c.LastType, c.LastSender, c.LastFromMe, c.LastMeta = msg.Type, msg.SenderJID, msg.FromMe, msg.MediaMeta
 	}
 	if !msg.FromMe && msg.Status != store.StatusRead {
 		c.Unread++

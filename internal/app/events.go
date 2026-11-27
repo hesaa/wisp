@@ -31,6 +31,7 @@ func (a *App) handle(evt any) {
 		a.reload(chatRef{e.AccountID, e.ChatJID}, e.IDs)
 	case whatsapp.RevisedEvent:
 		a.reload(chatRef{e.AccountID, e.ChatJID}, []string{e.ID})
+		a.reloadList(e.AccountID) // the edited or deleted message may be the chat's snippet
 	case whatsapp.ChatNamedEvent:
 		a.chat.Rename(e.AccountID, e.ChatJID, e.Name)
 	case whatsapp.PeopleEvent:

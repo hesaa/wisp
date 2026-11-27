@@ -86,6 +86,11 @@ func TestFromMeDoesNotBumpUnread(t *testing.T) {
 	if top := m.Rows()[0]; top.JID != group || top.Unread != 0 || top.Snippet != "ok" {
 		t.Fatalf("top row %+v", top)
 	}
+	// the next incoming message replaces who sent the last one, so the row stops saying "You:"
+	m.ApplyMessage(store.Message{AccountID: acctA, ChatJID: group, Timestamp: 401, Body: "lah", Type: "text", SenderJID: "6285649861869@s.whatsapp.net", Status: store.StatusReceived})
+	if top := m.Rows()[0]; top.LastFromMe || top.LastSender != "6285649861869@s.whatsapp.net" || top.LastType != "text" {
+		t.Fatalf("top row after incoming %+v", top)
+	}
 }
 
 func chatEqual(a, b store.Chat) bool {
