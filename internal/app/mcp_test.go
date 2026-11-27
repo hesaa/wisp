@@ -20,15 +20,18 @@ import (
 type mcpStubBackend struct {
 	Backend
 	accounts []string
+	replies  []*store.Message // reply passed to each send, in order
 }
 
 func (b *mcpStubBackend) Accounts() []string { return b.accounts }
 
-func (b *mcpStubBackend) SendText(context.Context, string, string, string, *store.Message, []string) (store.Message, error) {
+func (b *mcpStubBackend) SendText(_ context.Context, _, _, _ string, reply *store.Message, _ []string) (store.Message, error) {
+	b.replies = append(b.replies, reply)
 	return store.Message{}, nil
 }
 
-func (b *mcpStubBackend) SendMedia(context.Context, string, string, string, string, *store.Message) (store.Message, error) {
+func (b *mcpStubBackend) SendMedia(_ context.Context, _, _, _, _ string, reply *store.Message) (store.Message, error) {
+	b.replies = append(b.replies, reply)
 	return store.Message{}, nil
 }
 
@@ -163,5 +166,88 @@ func TestAppMCPBridge_LifecycleAndAppLockIndependence(t *testing.T) {
 	}
 	if _, err := os.Stat(infoPath); !os.IsNotExist(err) {
 		t.Fatalf("info file %q still present after stopMCPBridge: %v", infoPath, err)
+	}
+}
+
+// TestAppMCPBridge_ReplyTo drives prepare_send/confirm_send with reply_to through the app's real
+// bridge and store: the quoted message reaches the backend send, a foreign-chat id is refused.
+func TestAppMCPBridge_ReplyTo(t *testing.T) {
+	const (
+		chat  = "6281111111111@s.whatsapp.net"
+		other = "6282222222222@s.whatsapp.net"
+	)
+	db, err := store.Open(filepath.Join(t.TempDir(), "wa.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	for _, m := range []store.Message{
+		{ID: "q1", AccountID: acctA, ChatJID: chat, SenderJID: chat, Timestamp: 1, Type: "text", Body: "quote me"},
+		{ID: "x1", AccountID: acctA, ChatJID: other, SenderJID: other, Timestamp: 2, Type: "text", Body: "elsewhere"},
+	} {
+		if _, err := db.InsertMessage(m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.SetSetting("", ui.KeyMCPEnabled, "true"); err != nil {
+		t.Fatal(err)
+	}
+	be := &mcpStubBackend{accounts: []string{acctA}}
+	infoPath := filepath.Join(t.TempDir(), "Wisp", "mcp.json")
+	a := &App{db: db, mgr: be, cfg: map[string]string{}, mcpInfoPath: infoPath}
+	t.Cleanup(func() { a.stopMCPBridge() })
+	a.syncMCPBridge()
+	if a.mcpBridge == nil {
+		t.Fatal("bridge did not start")
+	}
+
+	raw, err := os.ReadFile(infoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var info mcp.BridgeInfo
+	if err := json.Unmarshal(raw, &info); err != nil {
+		t.Fatal(err)
+	}
+	call := func(name string, args map[string]any) mcp.ToolResult {
+		t.Helper()
+		body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+			"params": map[string]any{"name": name, "arguments": args}})
+		req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/rpc", info.Port), strings.NewReader(string(body)))
+		req.Header.Set("Authorization", "Bearer "+info.Token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var out struct {
+			Result mcp.ToolResult `json:"result"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatal(err)
+		}
+		return out.Result
+	}
+
+	res := call("prepare_send", map[string]any{"recipient": chat, "text": "hi", "reply_to": "x1"})
+	if !res.IsError || !strings.Contains(res.Content[0].Text, "not found in chat") {
+		t.Fatalf("foreign-chat reply_to accepted: %+v", res)
+	}
+
+	res = call("prepare_send", map[string]any{"recipient": chat, "text": "hi", "reply_to": "q1"})
+	if res.IsError || !strings.Contains(res.Content[0].Text, "quote me") {
+		t.Fatalf("prepare_send: %+v", res)
+	}
+	var prep struct {
+		ConfirmToken string `json:"confirm_token"`
+	}
+	if err := json.Unmarshal([]byte(res.Content[0].Text), &prep); err != nil {
+		t.Fatal(err)
+	}
+	if res = call("confirm_send", map[string]any{"confirm_token": prep.ConfirmToken}); res.IsError {
+		t.Fatalf("confirm_send: %+v", res)
+	}
+	if len(be.replies) != 1 || be.replies[0] == nil || be.replies[0].ID != "q1" || be.replies[0].ChatJID != chat {
+		t.Fatalf("backend got replies %+v, want q1 from %s", be.replies, chat)
 	}
 }

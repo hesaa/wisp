@@ -61,6 +61,7 @@ type sendTextCall struct {
 	accountID string
 	chatJID   string
 	text      string
+	reply     *store.Message
 }
 
 type sendMediaCall struct {
@@ -68,6 +69,7 @@ type sendMediaCall struct {
 	chatJID   string
 	path      string
 	caption   string
+	reply     *store.Message
 }
 
 type fakeSender struct {
@@ -89,11 +91,11 @@ func (f *fakeSender) Accounts() []string {
 	return slices.Clone(f.accounts)
 }
 
-func (f *fakeSender) SendText(_ context.Context, accountID, chatJID, text string, _ *store.Message, _ []string) (store.Message, error) {
+func (f *fakeSender) SendText(_ context.Context, accountID, chatJID, text string, reply *store.Message, _ []string) (store.Message, error) {
 	if f.sendErr != nil {
 		return store.Message{}, f.sendErr
 	}
-	f.textCalls = append(f.textCalls, sendTextCall{accountID: accountID, chatJID: chatJID, text: text})
+	f.textCalls = append(f.textCalls, sendTextCall{accountID: accountID, chatJID: chatJID, text: text, reply: reply})
 	return store.Message{
 		ID:        "sent-text-1",
 		AccountID: accountID,
@@ -106,11 +108,11 @@ func (f *fakeSender) SendText(_ context.Context, accountID, chatJID, text string
 	}, nil
 }
 
-func (f *fakeSender) SendMedia(_ context.Context, accountID, chatJID, path, caption string, _ *store.Message) (store.Message, error) {
+func (f *fakeSender) SendMedia(_ context.Context, accountID, chatJID, path, caption string, reply *store.Message) (store.Message, error) {
 	if f.sendErr != nil {
 		return store.Message{}, f.sendErr
 	}
-	f.mediaCalls = append(f.mediaCalls, sendMediaCall{accountID: accountID, chatJID: chatJID, path: path, caption: caption})
+	f.mediaCalls = append(f.mediaCalls, sendMediaCall{accountID: accountID, chatJID: chatJID, path: path, caption: caption, reply: reply})
 	return store.Message{
 		ID:        "sent-media-1",
 		AccountID: accountID,
@@ -704,5 +706,80 @@ func TestViewImage(t *testing.T) {
 		if res := call(id); !res.IsError {
 			t.Fatalf("%s: expected error, got %+v", id, res)
 		}
+	}
+}
+
+func TestPrepareAndConfirmSend_ReplyTo(t *testing.T) {
+	const (
+		group = "120363000111@g.us"
+		other = "120363000222@g.us"
+		alice = "15550001111@s.whatsapp.net"
+	)
+	report := filepath.Join(t.TempDir(), "report.txt")
+	if err := os.WriteFile(report, []byte("report"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	quoted := store.Message{ID: "q1", AccountID: "acct1", ChatJID: group, SenderJID: alice, Type: "text", Body: "Can you send the report?"}
+	st := &fakeStore{
+		chats:  map[string][]store.Chat{"acct1": {{JID: group, Name: "Group Foo"}, {JID: other, Name: "Other"}}},
+		people: map[string][]store.Person{"acct1": {{JID: alice, FullName: "Alice"}}},
+		messages: map[string]map[string][]store.Message{"acct1": {
+			group: {quoted},
+			other: {{ID: "x1", AccountID: "acct1", ChatJID: other, Type: "text", Body: "elsewhere"}},
+		}},
+	}
+	wa := &fakeSender{accounts: []string{"acct1"}}
+	svc := NewService(st, wa)
+
+	type prepOut struct {
+		ConfirmToken string `json:"confirm_token"`
+		ReplyTo      *struct {
+			MessageID  string `json:"message_id"`
+			SenderName string `json:"sender_name"`
+			Snippet    string `json:"snippet"`
+		} `json:"reply_to"`
+	}
+	prepareConfirm := func(args map[string]any) prepOut {
+		t.Helper()
+		var prep prepOut
+		if res := callJSON(t, svc, "prepare_send", args, &prep); res.IsError {
+			t.Fatalf("prepare_send(%v): %s", args, res.Content[0].Text)
+		}
+		if res := callJSON(t, svc, "confirm_send", map[string]any{"confirm_token": prep.ConfirmToken}, nil); res.IsError {
+			t.Fatalf("confirm_send: %s", res.Content[0].Text)
+		}
+		return prep
+	}
+
+	// Text reply: preview names the quote, confirm sends it quoted.
+	prep := prepareConfirm(map[string]any{"recipient": group, "text": "Here it is", "reply_to": "q1"})
+	if prep.ReplyTo == nil || prep.ReplyTo.MessageID != "q1" || prep.ReplyTo.SenderName != "Alice" || prep.ReplyTo.Snippet != quoted.Body {
+		t.Fatalf("preview reply_to = %+v", prep.ReplyTo)
+	}
+	if c := wa.textCalls[0]; c.reply == nil || c.reply.ID != "q1" || c.reply.SenderJID != alice {
+		t.Fatalf("text sent with reply %+v", c.reply)
+	}
+
+	// Media reply goes out quoted too.
+	prepareConfirm(map[string]any{"recipient": group, "media_path": report, "reply_to": "q1"})
+	if c := wa.mediaCalls[0]; c.reply == nil || c.reply.ID != "q1" {
+		t.Fatalf("media sent with reply %+v", c.reply)
+	}
+
+	// No reply_to: unchanged, unquoted send and no reply_to in the preview.
+	prep = prepareConfirm(map[string]any{"recipient": group, "text": "plain"})
+	if prep.ReplyTo != nil || wa.textCalls[1].reply != nil {
+		t.Fatalf("plain send quoted: preview %+v, reply %+v", prep.ReplyTo, wa.textCalls[1].reply)
+	}
+
+	// Unknown id, and an id from another chat, are rejected without staging anything.
+	for _, id := range []string{"nope", "x1"} {
+		res := callJSON(t, svc, "prepare_send", map[string]any{"recipient": group, "text": "hi", "reply_to": id}, nil)
+		if !res.IsError || !strings.Contains(res.Content[0].Text, "not found in chat "+group) {
+			t.Fatalf("reply_to %q: want not-found error, got %+v", id, res)
+		}
+	}
+	if len(svc.pending) != 0 {
+		t.Fatalf("rejected prepare left %d pending sends", len(svc.pending))
 	}
 }

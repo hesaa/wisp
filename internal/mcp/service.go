@@ -87,6 +87,7 @@ type pendingSend struct {
 	Text      string
 	MediaPath string
 	Caption   string
+	Reply     *store.Message // quoted message; nil: not a reply
 	ExpiresAt time.Time
 }
 
@@ -188,7 +189,7 @@ func (s *Service) Tools() []ToolDef {
 		},
 		{
 			Name:        "prepare_send",
-			Description: "Stage a text or media message for sending. Resolves recipient and returns a short-lived confirm_token or an ambiguous candidate list without sending.",
+			Description: "Stage a text or media message for sending, optionally as a quoted reply (reply_to). Resolves recipient and returns a short-lived confirm_token or an ambiguous candidate list without sending.",
 			InputSchema: map[string]any{
 				"type":     "object",
 				"required": []string{"recipient"},
@@ -208,6 +209,10 @@ func (s *Service) Tools() []ToolDef {
 					"caption": map[string]any{
 						"type":        "string",
 						"description": "Optional caption when sending media_path.",
+					},
+					"reply_to": map[string]any{
+						"type":        "string",
+						"description": "Optional ID of a message in the recipient's chat to quote (the id field from get_chat_history); the message is sent as a reply to it.",
 					},
 					"account": map[string]any{
 						"type":        "string",
@@ -470,6 +475,7 @@ func (s *Service) callPrepareSend(raw json.RawMessage) ToolResult {
 		MediaPath string `json:"media_path"`
 		Caption   string `json:"caption"`
 		Account   string `json:"account"`
+		ReplyTo   string `json:"reply_to"`
 	}
 	if err := unmarshalArgs(raw, &args); err != nil {
 		return errResult("invalid arguments: " + err.Error())
@@ -515,6 +521,24 @@ func (s *Service) callPrepareSend(raw json.RawMessage) ToolResult {
 		})
 	}
 
+	var (
+		reply      *store.Message
+		replyQuote map[string]any
+	)
+	if id := strings.TrimSpace(args.ReplyTo); id != "" {
+		m, ok, err := s.st.GetMessage(match.Account, match.JID, id)
+		if err != nil {
+			return errResult(fmt.Sprintf("load reply_to message: %v", err))
+		}
+		if !ok {
+			return errResult(fmt.Sprintf("reply_to message %q not found in chat %s (account %s); use a message id from get_chat_history for this chat", id, match.JID, match.Account))
+		}
+		reply = &m
+		if replyQuote, err = s.quotePreview(match.Account, m); err != nil {
+			return errResult(err.Error())
+		}
+	}
+
 	token, err := randomHexToken(16)
 	if err != nil {
 		return errResult(fmt.Sprintf("generate confirmation token: %v", err))
@@ -528,6 +552,7 @@ func (s *Service) callPrepareSend(raw json.RawMessage) ToolResult {
 		Text:      args.Text,
 		MediaPath: mediaPath,
 		Caption:   caption,
+		Reply:     reply,
 		ExpiresAt: expiresAt,
 	}
 
@@ -558,6 +583,9 @@ func (s *Service) callPrepareSend(raw json.RawMessage) ToolResult {
 		}
 	} else {
 		resp["text"] = args.Text
+	}
+	if replyQuote != nil {
+		resp["reply_to"] = replyQuote
 	}
 	return jsonResult(resp)
 }
@@ -593,9 +621,9 @@ func (s *Service) callConfirmSend(ctx context.Context, raw json.RawMessage) Tool
 		err  error
 	)
 	if pending.MediaPath != "" {
-		sent, err = s.wa.SendMedia(ctx, pending.Account, pending.ChatJID, pending.MediaPath, pending.Caption, nil)
+		sent, err = s.wa.SendMedia(ctx, pending.Account, pending.ChatJID, pending.MediaPath, pending.Caption, pending.Reply)
 	} else {
-		sent, err = s.wa.SendText(ctx, pending.Account, pending.ChatJID, pending.Text, nil, nil)
+		sent, err = s.wa.SendText(ctx, pending.Account, pending.ChatJID, pending.Text, pending.Reply, nil)
 	}
 	if err != nil {
 		return errResult(fmt.Sprintf("send failed: %v", err))
@@ -614,6 +642,27 @@ func (s *Service) callConfirmSend(ctx context.Context, raw json.RawMessage) Tool
 		"type":       sent.Type,
 		"body":       sent.Body,
 	})
+}
+
+// quotePreview describes the quoted message m for the prepare_send preview: who wrote it and what it says.
+func (s *Service) quotePreview(account string, m store.Message) (map[string]any, error) {
+	people, err := s.st.People(account)
+	if err != nil {
+		return nil, fmt.Errorf("load contacts: %v", err)
+	}
+	_, _, caption := extractMediaMeta(m)
+	snippet := []rune(cmp.Or(caption, m.Body, "["+m.Type+"]"))
+	if len(snippet) > 120 {
+		snippet = append(snippet[:120], '…')
+	}
+	return map[string]any{
+		"message_id":  m.ID,
+		"sender_jid":  m.SenderJID,
+		"sender_name": resolveSenderName(m, buildPersonNameMap(people)),
+		"from_me":     m.FromMe,
+		"type":        m.Type,
+		"snippet":     string(snippet),
+	}, nil
 }
 
 func (s *Service) targetAccounts(requested string) ([]string, error) {
